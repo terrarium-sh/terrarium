@@ -363,11 +363,13 @@ fn assert_agent_control_reply(
     mut control: terra_platform::local_socket::LocalStream,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
-    use terra_protocol::{AgentService, ControlReply, ControlRequest, encode_frame, read_frame};
+    use terra_protocol::{
+        AgentService, SessionControlReply, SessionControlRequest, encode_frame, read_frame,
+    };
 
     control.write_all(&encode_frame(&AgentService::SessionControl)?)?;
-    control.write_all(&encode_frame(&ControlRequest::List)?)?;
-    let control_reply = read_frame::<ControlReply>(&mut control).map_err(|error| {
+    control.write_all(&encode_frame(&SessionControlRequest::List)?)?;
+    let control_reply = read_frame::<SessionControlReply>(&mut control).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!("reading session-control reply: {error}"),
@@ -375,7 +377,7 @@ fn assert_agent_control_reply(
     })?;
     assert_eq!(
         control_reply,
-        Some(ControlReply::Done),
+        Some(SessionControlReply::Clients(Vec::new())),
         "empty session has no attached clients"
     );
     Ok(())
@@ -1829,7 +1831,9 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
         .status()
         .unwrap();
     assert!(status.success(), "compile static TX probe: {status}");
-    for (mode, net, idle_count, marker) in [("sockets", Net::Tsi, 40, "NETWORK_TX_IDLE_READS_OK")] {
+    for (mode, net, idle_count, marker) in
+        [("sockets", Net::Brokered, 40, "NETWORK_TX_IDLE_READS_OK")]
+    {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let backend = start_network_broker(

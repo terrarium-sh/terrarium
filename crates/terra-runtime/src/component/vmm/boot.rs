@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use terra_protocol::packed_image::{ChunkCache, PackedImage};
+use terra_protocol::packed_image::PackedImage;
 use wasmtime::component::Component;
 
 use crate::box_runtime::BoxRuntime;
@@ -139,8 +139,7 @@ fn describe_read_error(error: &std::io::Error) -> wasmtime::Error {
 fn apply_plan(
     plan: &exports::terra::boot::boot::Plan,
     ram: &GuestRam,
-    kernel: &PackedImage<'_>,
-    cache: &mut ChunkCache,
+    kernel: &mut PackedImage<'_>,
 ) -> wasmtime::Result<BootEntry> {
     validate_plan(plan, ram, kernel.image_bytes())?;
     let mut buffer = vec![0; usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES)?];
@@ -150,7 +149,7 @@ fn apply_plan(
             let len = (segment.file_length - copied).min(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES);
             let piece = &mut buffer[..usize::try_from(len)?];
             kernel
-                .read_at(segment.source_offset + copied, piece, cache)
+                .read_at(segment.source_offset + copied, piece)
                 .map_err(|error| describe_read_error(&error))?;
             write_boot_bytes(ram, segment.guest_address + copied, piece)?;
             copied += len;
@@ -171,7 +170,7 @@ impl BoxRuntime {
         component: &Component,
         config: &MachineConfig,
         ram: GuestRam,
-        kernel: PackedImage<'static>,
+        mut kernel: PackedImage<'static>,
         command_line: &str,
     ) -> wasmtime::Result<BootEntry> {
         let kernel_bytes = kernel.image_bytes();
@@ -184,10 +183,9 @@ impl BoxRuntime {
             command_line.len() <= MAX_BOOT_COMMAND_LINE_BYTES,
             "kernel command line exceeds boot limit"
         );
-        let mut cache = ChunkCache::new(&kernel);
         let mut prefix = vec![0; usize::try_from(kernel_bytes)?.min(MAX_BOOT_KERNEL_PREFIX_BYTES)];
         kernel
-            .read_at(0, &mut prefix, &mut cache)
+            .read_at(0, &mut prefix)
             .map_err(|error| describe_read_error(&error))?;
         let mut boot_store = self.new_child(BootHost);
         let linker = wasmtime::component::Linker::new(self.store.engine());
@@ -208,7 +206,7 @@ impl BoxRuntime {
         .await??;
         let plan = plan.map_err(|error| wasmtime::Error::msg(format!("Wasm boot: {error:?}")))?;
         drop(boot_store);
-        apply_plan(&plan, &ram, &kernel, &mut cache)
+        apply_plan(&plan, &ram, &mut kernel)
     }
 }
 
@@ -328,8 +326,7 @@ mod tests {
         ram: &GuestRam,
         kernel: &[u8],
     ) -> wasmtime::Result<BootEntry> {
-        let image = kernel_image(kernel);
-        apply_plan(plan, ram, &image, &mut ChunkCache::new(&image))
+        apply_plan(plan, ram, &mut kernel_image(kernel))
     }
 
     fn plan() -> exports::terra::boot::boot::Plan {
@@ -448,15 +445,16 @@ mod tests {
         let kernel: Vec<u8> = (0..=255).cycle().take(chunk + 64).collect();
         let mut chunk_index = 0;
         let packed = pack(&kernel, GuestImage::Kernel, |bytes| {
-            let mut bytes = bytes.to_vec();
-            if chunk_index == 1 {
-                bytes[0] ^= 1;
-            }
+            let is_corrupt = chunk_index == 1;
             chunk_index += 1;
-            compress_fast(&bytes)
+            if is_corrupt {
+                Ok(vec![0xff; 16])
+            } else {
+                compress_fast(bytes)
+            }
         })
         .unwrap();
-        let image = PackedImage::parse(&packed, GuestImage::Kernel).unwrap();
+        let mut image = PackedImage::parse(&packed, GuestImage::Kernel).unwrap();
         let ram = GuestRam::new(4096).unwrap();
         let mut plan = plan();
         plan.kernel_segments = vec![
@@ -474,7 +472,7 @@ mod tests {
             },
         ];
         plan.entry = 100;
-        assert!(apply_plan(&plan, &ram, &image, &mut ChunkCache::new(&image)).is_err());
+        assert!(apply_plan(&plan, &ram, &mut image).is_err());
         assert_eq!(
             BoundedMemory::new(&ram).read(100, 4).unwrap(),
             [8, 9, 10, 11]

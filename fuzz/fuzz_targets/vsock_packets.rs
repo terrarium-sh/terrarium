@@ -1,30 +1,32 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use terra_protocol::vsock::{
+    AGENT_PORT, AGENT_UPSTREAM_BYTES, CONTROL_PORT, GUEST_CID, HOST_CID, MAX_NETWORK_SOCKETS,
+    MAX_QUEUED_REPLY_BYTES, PUBLICATION_HOST_PORTS, TCP_PORT, UDP_PORT,
+};
 use terra_vsock_device::{
-    AGENT_RX_ALLOC, AGENT_VSOCK_PORT, CONTROL_VSOCK_PORT, GUEST_CID, HOST_CID, MAX_NETWORK_SOCKETS,
-    MAX_QUEUED_REPLIES, MAX_QUEUED_REPLY_BYTES, PUBLICATION_HOST_PORTS, TCP_VSOCK_PORT,
-    UDP_VSOCK_PORT, VSOCK_HEADER_BYTES, VsockHeader, VsockSwitch,
+    MAX_QUEUED_REPLIES, MAX_REJECTED_RESETS, VSOCK_HEADER_BYTES, VsockHeader, VsockSwitch,
 };
 
 /// Guest request for one endpoint class: agent, control, TCP, or UDP.
 fn request(class: u8) -> VsockHeader {
     let (src_port, dst_port) = match class % 4 {
-        0 => (AGENT_VSOCK_PORT, AGENT_VSOCK_PORT),
-        1 => (CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT),
-        2 => (7000, TCP_VSOCK_PORT),
-        _ => (7000, UDP_VSOCK_PORT),
+        0 => (AGENT_PORT, AGENT_PORT),
+        1 => (CONTROL_PORT, CONTROL_PORT),
+        2 => (7000, TCP_PORT),
+        _ => (7000, UDP_PORT),
     };
     VsockHeader {
-        src_cid: GUEST_CID,
-        dst_cid: HOST_CID,
+        src_cid: GUEST_CID.into(),
+        dst_cid: HOST_CID.into(),
         src_port,
         dst_port,
         len: 0,
         type_: 1,
         op: 1,
         flags: 0,
-        buf_alloc: AGENT_RX_ALLOC,
+        buf_alloc: AGENT_UPSTREAM_BYTES,
         fwd_cnt: 0,
     }
 }
@@ -98,7 +100,8 @@ fuzz_target!(|bytes: &[u8]| {
         );
         assert!(switch.network_socket_count() <= MAX_NETWORK_SOCKETS);
         assert!(
-            switch.pending_reply_count() <= (2 + MAX_NETWORK_SOCKETS) * MAX_QUEUED_REPLIES + 32
+            switch.pending_reply_count()
+                <= (2 + MAX_NETWORK_SOCKETS) * MAX_QUEUED_REPLIES + MAX_REJECTED_RESETS
         );
         let replies = switch.take_replies_up_to(3, usize::from(selector));
         assert!(

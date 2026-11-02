@@ -2,15 +2,13 @@ use std::io::Read;
 use terra_protocol::{SyncEntry, SyncEntryKind, SyncReply, encode_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(super) fn entry(path: &str, kind: SyncEntryKind, target: Option<&str>) -> SyncEntry {
+pub(super) fn entry(path: &str, kind: SyncEntryKind) -> SyncEntry {
     SyncEntry {
         relative_path: path.into(),
         kind,
-        size: 0,
         mode: 0o755,
         mtime_secs: 100,
         mtime_nanos: 0,
-        link_target: target.map(str::to_owned),
     }
 }
 

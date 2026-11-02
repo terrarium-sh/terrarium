@@ -6,16 +6,13 @@ use super::{
 };
 use crate::terra::network::broker;
 use futures_util::{
-    FutureExt as _,
-    future::{Either, select},
+    future,
     lock::Mutex,
-    stream::{FuturesUnordered, StreamExt as _},
+    stream::{self, TryStreamExt as _},
 };
 use terra_protocol::application::OPEN_TIMEOUT_SECS;
-use terra_protocol::dns;
-use terra_protocol::network_control::{
-    AgentControl, DnsPayload, DnsTransport, FrontendControl, MAX_DNS_QUERIES,
-};
+use terra_protocol::dns::{self, DnsTransport};
+use terra_protocol::network_control::{DnsQuery, DnsResult, FrontendControl, MAX_DNS_QUERIES};
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::ConnectionId;
 
@@ -24,56 +21,39 @@ pub(super) async fn serve(connection: ConnectionId) {
     disable_networking();
 }
 
+/// Answers the agent's connection with Ready, then up to [`MAX_DNS_QUERIES`] queries at once.
 async fn run(connection: ConnectionId) -> Result<(), SocketError> {
     run_before_deadline(OPEN_TIMEOUT_SECS, async {
-        if read_message(connection).await? != Some(AgentControl::Hello) {
-            return Err(SocketError::Protocol);
-        }
         mark_control_ready();
         deliver_opening(connection, message_bytes(&FrontendControl::Ready)?).await
     })
     .await??;
     let writer = Mutex::new(());
-    let mut queries = FuturesUnordered::new();
-    loop {
-        let next = if queries.len() < MAX_DNS_QUERIES {
-            Either::Left(read_message::<AgentControl>(connection).boxed_local())
-        } else {
-            Either::Right(std::future::pending().boxed_local())
-        };
-        let completed = if queries.is_empty() {
-            Either::Right(std::future::pending().boxed_local())
-        } else {
-            Either::Left(queries.next())
-        };
-        let event = match select(next, completed).await {
-            Either::Left((frame, _)) => Either::Left(frame?),
-            Either::Right((completed, _)) => Either::Right(completed),
-        };
-        match event {
-            Either::Left(Some(AgentControl::DnsQuery(DnsPayload {
-                id,
-                transport,
-                bytes,
-            }))) => {
-                let writer = &writer;
-                queries.push(async move {
-                    let bytes = resolve(transport, &bytes).await;
-                    let _guard = writer.lock().await;
-                    let result = FrontendControl::DnsResult(DnsPayload {
-                        id,
-                        transport,
-                        bytes,
-                    });
-                    deliver_bytes(connection, message_bytes(&result)?).await
-                });
-            }
-            Either::Left(Some(AgentControl::Hello)) => return Err(SocketError::Protocol),
-            Either::Left(None) => return Ok(()),
-            Either::Right(Some(result)) => result?,
-            Either::Right(None) => {}
-        }
-    }
+    stream::unfold((), |()| async move {
+        read_message::<DnsQuery>(connection)
+            .await
+            .transpose()
+            .map(|query| (query, ()))
+    })
+    .map_ok(|query| answer(connection, &writer, query))
+    .try_buffer_unordered(MAX_DNS_QUERIES)
+    .try_for_each(future::ok)
+    .await
+}
+
+/// Resolves `query` and delivers its result whole; `writer` keeps results from interleaving.
+async fn answer(
+    connection: ConnectionId,
+    writer: &Mutex<()>,
+    query: DnsQuery,
+) -> Result<(), SocketError> {
+    let bytes = resolve(query.transport, &query.bytes).await;
+    let result = message_bytes(&FrontendControl::DnsResult(DnsResult {
+        id: query.id,
+        bytes,
+    }))?;
+    let _guard = writer.lock().await;
+    deliver_bytes(connection, result).await
 }
 
 async fn resolve(transport: DnsTransport, query: &[u8]) -> Vec<u8> {

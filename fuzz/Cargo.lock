@@ -2038,7 +2038,6 @@ dependencies = [
 name = "terra-protocol"
 version = "0.0.1"
 dependencies = [
- "crc32fast",
  "futures-util",
  "lz4_flex",
  "postcard",

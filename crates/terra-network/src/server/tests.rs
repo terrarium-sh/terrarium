@@ -10,10 +10,10 @@ use socket2::SockRef;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use terra_policy::config::{Network, StaticDnsRecord};
-use terra_protocol::application::{TcpKeepalive, TcpOpenOptions};
+use terra_protocol::application::{MAX_NETWORK_DATAGRAM_BYTES, TcpKeepalive, TcpOpenOptions};
 use terra_protocol::network::{
-    DatagramBatch, DatagramHeader, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAM_BYTES,
-    MAX_NETWORK_DATAGRAMS, SendFailure,
+    DatagramBatch, DatagramHeader, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS,
+    SendFailure,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -829,7 +829,7 @@ fn bound_resource(publication_grant: Option<u32>) -> UdpResource {
         ),
         ipv6: None,
         peers: UdpPeers::shared(if publication_grant.is_some() {
-            crate::MAX_UDP_PUBLICATION_PEERS
+            terra_protocol::network::MAX_UDP_PUBLICATION_PEERS
         } else {
             crate::MAX_UDP_OUTBOUND_PEERS
         }),
@@ -848,7 +848,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     let udp = UdpResource {
         ipv4: None,
         ipv6: None,
-        peers: UdpPeers::shared(crate::MAX_UDP_PUBLICATION_PEERS),
+        peers: UdpPeers::shared(terra_protocol::network::MAX_UDP_PUBLICATION_PEERS),
         publication_grant: Some(1),
         receiving: Arc::default(),
     };
@@ -857,7 +857,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     let second = SocketAddr::from((Ipv4Addr::LOCALHOST, 2));
     let nearly_expired = UDP_PEER_TTL.checked_sub(Duration::from_secs(1)).unwrap();
     assert!(!udp.authorize_send(&policy, first));
-    for port in 1..=u16::try_from(crate::MAX_UDP_PUBLICATION_PEERS).unwrap() {
+    for port in 1..=u16::try_from(terra_protocol::network::MAX_UDP_PUBLICATION_PEERS).unwrap() {
         udp.remember_peer(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     }
     tokio::time::advance(nearly_expired).await;
@@ -870,7 +870,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     assert!(!udp.knows_peer(second));
     assert_eq!(
         udp.peers.lock().unwrap().remembered.len(),
-        crate::MAX_UDP_PUBLICATION_PEERS
+        terra_protocol::network::MAX_UDP_PUBLICATION_PEERS
     );
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(udp.knows_peer(first));

@@ -5,38 +5,7 @@ static struct sockaddr_in6 ipv4_peer(u32 address, u16 port) {
     ipv6_addr_set_v4mapped(htonl(address), &peer.sin6_addr);
     return peer;
 }
-static bool udp_receive_ready(struct terra_tsi_socket *state, struct socket *socket) {
-    return terra_udp_receive_ready(state, socket);
-}
-static int connect_native_after_lock(struct socket *socket, struct sockaddr *peer, int peer_length,
-                                     int flags) {
-    return terra_connect_locked(socket, peer, peer_length, flags);
-}
-static int receive_stream_once(struct socket *socket, struct msghdr *message, size_t length, int flags) {
-    return terra_recv_stream(terra_socket_state(socket), socket, message, length, flags);
-}
-static int receive_native_once(struct socket *socket, struct msghdr *message, size_t length, int flags) {
-    return terra_recv_native_datagram(terra_socket_state(socket), socket, message, length, flags);
-}
-static int receive_error_queue(struct socket *socket, struct msghdr *message, size_t length, int flags) {
-    return terra_recv_error_queue(terra_socket_state(socket), socket, message, length, flags);
-}
 static struct sk_buff *queue_datagram(struct sk_buff_head *queue, u8 peer, unsigned int length, u16 segment);
-static void resume_external_receive(struct terra_tsi_socket *state, bool datagram) {
-    if (datagram) {
-        struct sk_buff *skb = queue_datagram(&state->datagrams, 1, 0, 0);
-        terra_consume_datagram(state, skb, 0);
-    }
-}
-static int deliver_datagram(struct terra_tsi_socket *state, struct sk_buff *datagram, struct msghdr *message,
-                            size_t length, int flags) {
-    return terra_deliver_datagram(state, datagram, message, length, flags);
-}
-static int resume_receive_config(struct socket *socket, int error, int level, int option) {
-    if (!error)
-        terra_apply_option(terra_socket_state(socket), socket, level, option);
-    return error;
-}
 static int check_udp_send_validation(struct sock *sk, struct msghdr *message, size_t length) {
     u16 segment;
     return terra_udp_send_segment(sk, message, length, &segment);
@@ -78,10 +47,35 @@ static void peer_checks(void) {
 }
 
 static void error_checks(void) {
-    assert(terra_decode_error(1) == -EACCES && terra_decode_error(10) == -ECONNREFUSED);
-    assert(terra_decode_error(11) == -ECONNRESET && terra_decode_error(19) == -ENETDOWN);
-    assert(terra_decode_error(20) == -EPROTO && terra_decode_error(21) == -EPROTO &&
+    assert(terra_decode_error(1) == -EACCES && terra_decode_error(6) == -ECONNREFUSED);
+    assert(terra_decode_error(7) == -ECONNRESET && terra_decode_error(14) == -ENETDOWN);
+    assert(terra_decode_error(15) == -EPROTO && terra_decode_error(16) == -EPROTO &&
            terra_decode_error(0) == -EPROTO);
+}
+
+/* The field order and bytes crates/terra-protocol pins in tcp_opening_pins_layout_and_rejects_forged_fields. */
+static void tcp_open_field_checks(void) {
+    u8 fields[TERRA_TCP_OPEN_FIELDS_BYTES];
+    const u8 pinned[] = {3, 0, 9, 0, 60, 0, 15, 0};
+    static_assert(sizeof(pinned) == TERRA_TCP_OPEN_FIELDS_BYTES, "pinned layout");
+    memset(fields, 0xff, sizeof(fields));
+    terra_put_tcp_open_fields(fields, true, true, 9, 60, 15);
+    assert(!memcmp(fields, pinned, sizeof(pinned)));
+    const u8 keepalive_only[] = {2, 0, 9, 0, 60, 0, 15, 0};
+    terra_put_tcp_open_fields(fields, false, true, 9, 60, 15);
+    assert(!memcmp(fields, keepalive_only, sizeof(keepalive_only)));
+    memset(fields, 0, sizeof(fields));
+    terra_put_tcp_open_fields(fields, true, false, 9, 60, 15);
+    const u8 urgent_only[] = {1, 0, 0, 0, 0, 0, 0, 0};
+    assert(!memcmp(fields, urgent_only, sizeof(urgent_only)));
+    terra_put_tcp_open_fields(fields, false, true, 0, 40000, -5);
+    assert(get_unaligned_le16(fields + 2) == 1 &&
+           get_unaligned_le16(fields + 4) == TERRA_MAX_KEEPALIVE_SECS &&
+           get_unaligned_le16(fields + 6) == 1);
+    terra_put_tcp_open_fields(fields, false, true, 200, 1, TERRA_MAX_KEEPALIVE_SECS);
+    assert(get_unaligned_le16(fields + 2) == TERRA_MAX_KEEPALIVE_PROBES &&
+           get_unaligned_le16(fields + 4) == 1 &&
+           get_unaligned_le16(fields + 6) == TERRA_MAX_KEEPALIVE_SECS);
 }
 
 static void opening_checks(void) {
@@ -95,7 +89,7 @@ static void opening_checks(void) {
     }
     put_unaligned_le16(1, opened + 8);
     assert(terra_decode_opened(opened) == -EACCES);
-    put_unaligned_le16(21, opened + 8);
+    put_unaligned_le16(16, opened + 8);
     assert(terra_decode_opened(opened) == -EPROTO);
     struct terra_tsi_socket state = {0};
     state.connecting = true;
@@ -147,7 +141,7 @@ static int deliver(struct terra_tsi_socket *state, size_t length, int flags, uns
     gro_cmsgs = 0;
     gro_segment = 0;
     skb_get(datagram);
-    int result = deliver_datagram(state, datagram, &message, length, flags);
+    int result = terra_deliver_datagram(state, datagram, &message, length, flags);
     kfree_skb(datagram);
     if (message_flags)
         *message_flags = message.msg_flags;
@@ -193,9 +187,9 @@ static void udp_gro_checks(void) {
     assert(deliver(&state, 1000, 0, &flags) == 1000 && (flags & MSG_TRUNC) && !state.datagrams.qlen);
     queue_datagram(&state.datagrams, 6, 1200, 0);
     assert(deliver(&state, 1000, MSG_TRUNC, NULL) == 1200 && !state.datagrams.qlen);
-    for (int i = 0; i < TERRA_UDP_MAX_SEGMENTS + 2; i++)
+    for (int i = 0; i < TERRA_MAX_DATAGRAM_SEGMENTS + 2; i++)
         queue_datagram(&state.datagrams, 7, 10, 0);
-    assert(deliver(&state, 65536, 0, NULL) == 10 * TERRA_UDP_MAX_SEGMENTS && gro_segment == 10 &&
+    assert(deliver(&state, 65536, 0, NULL) == 10 * TERRA_MAX_DATAGRAM_SEGMENTS && gro_segment == 10 &&
            state.datagrams.qlen == 2);
     clear_datagrams(&state.datagrams);
     for (int i = 0; i < 4; i++)
@@ -222,11 +216,8 @@ static void check_udp_resume(struct terra_tsi_socket *state, bool needed) {
     terra_resume_udp(state);
     assert(state->udp_work.queued == (needed ? 1 : 0));
     state->udp_work.queued = 0;
-    resume_external_receive(state, true);
+    terra_consume_datagram(state, queue_datagram(&state->datagrams, 1, 0, 0), 0);
     assert(state->udp_work.queued == (needed ? 1 : 0));
-    state->udp_work.queued = 0;
-    resume_external_receive(state, false);
-    assert(!state->udp_work.queued);
     const int results[] = {0, 1, -EFAULT, -EAGAIN};
     for (unsigned int i = 0; i < ARRAY_SIZE(results); i++) {
         native_result = results[i];
@@ -234,12 +225,12 @@ static void check_udp_resume(struct terra_tsi_socket *state, bool needed) {
         for (unsigned int f = 0; f < ARRAY_SIZE(flags); f++) {
             native_receive_calls = 0;
             state->udp_work.queued = 0;
-            assert(receive_native_once(&outer, &message, 0, flags[f]) == native_result);
+            assert(terra_recv_native_datagram(terra_socket_state(&outer), &outer, &message, 0, flags[f]) == native_result);
             assert(native_receive_calls == 1 && native_receive_flags == (flags[f] | MSG_DONTWAIT));
             assert(state->udp_work.queued == (needed ? 1 : 0));
             native_receive_calls = 0;
             state->udp_work.queued = 0;
-            assert(receive_error_queue(&outer, &message, 0, flags[f] | MSG_ERRQUEUE) == native_result);
+            assert(terra_recv_error_queue(terra_socket_state(&outer), &outer, &message, 0, flags[f] | MSG_ERRQUEUE) == native_result);
             assert(native_receive_calls == 1 && native_receive_flags == (flags[f] | MSG_ERRQUEUE));
             assert(state->udp_work.queued == (needed ? 1 : 0));
         }
@@ -247,15 +238,12 @@ static void check_udp_resume(struct terra_tsi_socket *state, bool needed) {
     const int options[][2] = {{SOL_SOCKET, SO_RCVBUF}, {SOL_IP, IP_RECVERR}, {SOL_IPV6, IPV6_RECVERR}};
     for (unsigned int i = 0; i < ARRAY_SIZE(options); i++) {
         state->udp_work.queued = 0;
-        assert(!resume_receive_config(&outer, 0, options[i][0], options[i][1]));
+        terra_apply_option(terra_socket_state(&outer), &outer, options[i][0], options[i][1]);
         assert(state->udp_work.queued == (needed ? 1 : 0));
-        state->udp_work.queued = 0;
-        assert(resume_receive_config(&outer, -EFAULT, options[i][0], options[i][1]) == -EFAULT);
-        assert(!state->udp_work.queued);
     }
     state->udp_work.queued = 0;
-    assert(!resume_receive_config(&outer, 0, SOL_SOCKET, SO_SNDBUF));
-    assert(!resume_receive_config(&outer, 0, SOL_IP, IP_TTL));
+    terra_apply_option(terra_socket_state(&outer), &outer, SOL_SOCKET, SO_SNDBUF);
+    terra_apply_option(terra_socket_state(&outer), &outer, SOL_IP, IP_TTL);
     assert(!state->udp_work.queued);
 }
 static void udp_resume_checks(void) {
@@ -291,30 +279,29 @@ static void udp_resume_checks(void) {
     carrier_available = TERRA_HEADER_BYTES;
     state.udp_work.queued = 0;
     terra_resume_udp(&state);
-    resume_external_receive(&state, true);
+    terra_consume_datagram(&state, queue_datagram(&state.datagrams, 1, 0, 0), 0);
     assert(!state.udp_work.queued);
     struct socket native_socket = {.sk = &outer, .type = SOCK_DGRAM};
     struct msghdr message = {0};
     native_result = -EFAULT;
     native_receive_calls = 0;
-    assert(receive_error_queue(&native_socket, &message, 0, MSG_ERRQUEUE | MSG_DONTWAIT) == -EFAULT);
+    assert(terra_recv_error_queue(terra_socket_state(&native_socket), &native_socket, &message, 0, MSG_ERRQUEUE | MSG_DONTWAIT) == -EFAULT);
     assert(native_receive_calls == 1 && native_receive_flags == (MSG_ERRQUEUE | MSG_DONTWAIT));
     assert(!state.udp_work.queued);
-    assert(!resume_receive_config(&native_socket, 0, SOL_SOCKET, SO_RCVBUF));
+    terra_apply_option(terra_socket_state(&native_socket), &native_socket, SOL_SOCKET, SO_RCVBUF);
     assert(!state.udp_work.queued);
 }
 
 static size_t datagram_frame(u8 *frame, const struct sockaddr_in6 *peer, size_t length, u16 segment,
                              u16 reserved) {
     terra_frame_header(frame, TERRA_OP_UDP_DATAGRAM,
-                       TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + length);
+                       TERRA_UDP_FRAME_OVERHEAD_BYTES - TERRA_HEADER_BYTES + length);
     assert(!terra_encode_peer(frame + TERRA_HEADER_BYTES, peer));
     put_unaligned_le16(segment, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES);
     put_unaligned_le16(reserved, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + 2);
     for (size_t index = 0; index < length; index++)
-        frame[TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + index] =
-            index % 251;
-    return TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + length;
+        frame[TERRA_UDP_FRAME_OVERHEAD_BYTES + index] = index % 251;
+    return TERRA_UDP_FRAME_OVERHEAD_BYTES + length;
 }
 
 /* Datagram frames queue as one skb carrying their segment size (0 for one datagram); malformed ones retire
@@ -322,14 +309,14 @@ static size_t datagram_frame(u8 *frame, const struct sockaddr_in6 *peer, size_t 
  * leaves the frame on the carrier, while an empty queue waives only the byte cap. */
 static void udp_segmented_receive_checks(struct terra_tsi_socket *state,
                                          const struct sockaddr_in6 *peer) {
-    size_t length = datagram_frame(carrier, peer, TERRA_UDP_RUN_BYTES, 1024, 0);
+    size_t length = datagram_frame(carrier, peer, TERRA_MAX_UDP_RUN_BYTES, 1024, 0);
     carrier_available = length;
-    assert(length == TERRA_UDP_CARRIER_BYTES && terra_receive_udp_frame(state) &&
+    assert(length == TERRA_MAX_FRAME_BYTES && terra_receive_udp_frame(state) &&
            state->datagrams.qlen == 1 && !carrier_available);
     struct sk_buff *queued = state->datagrams.first;
-    assert(terra_datagram_bytes(queued) == TERRA_UDP_RUN_BYTES && terra_datagram_segment(queued) == 1024);
+    assert(terra_datagram_bytes(queued) == TERRA_MAX_UDP_RUN_BYTES && terra_datagram_segment(queued) == 1024);
     assert(skb_byte(queued, 5000) == 5000 % 251 &&
-           skb_byte(queued, queued->len - 1) == (TERRA_UDP_RUN_BYTES - 1) % 251);
+           skb_byte(queued, queued->len - 1) == (TERRA_MAX_UDP_RUN_BYTES - 1) % 251);
     length = datagram_frame(carrier, peer, 2500, 1000, 0);
     carrier_available = length;
     state->sk->sk_rcvbuf = 1000;
@@ -353,16 +340,16 @@ static void udp_segmented_receive_checks(struct terra_tsi_socket *state,
     skb_allocation_fails = false;
     assert(terra_receive_udp_frame(state) && state->datagrams.qlen == 1);
     clear_datagrams(&state->datagrams);
-    carrier_available = datagram_frame(carrier, peer, TERRA_UDP_DATAGRAM, 0, 0);
+    carrier_available = datagram_frame(carrier, peer, TERRA_MAX_NETWORK_DATAGRAM_BYTES, 0, 0);
     assert(terra_receive_udp_frame(state) && state->datagrams.qlen == 1 &&
            !TERRA_DATAGRAM_CB(state->datagrams.first)->segment);
-    assert(terra_datagram_segment(state->datagrams.first) == TERRA_UDP_DATAGRAM);
+    assert(terra_datagram_segment(state->datagrams.first) == TERRA_MAX_NETWORK_DATAGRAM_BYTES);
     clear_datagrams(&state->datagrams);
     const struct {
         size_t length;
         u16 segment, reserved;
-    } malformed[] = {{TERRA_UDP_DATAGRAM + 1, 0, 0},
-                     {2500, TERRA_UDP_DATAGRAM + 1, 0},
+    } malformed[] = {{TERRA_MAX_NETWORK_DATAGRAM_BYTES + 1, 0, 0},
+                     {2500, TERRA_MAX_NETWORK_DATAGRAM_BYTES + 1, 0},
                      {1000, 1000, 0},
                      {999, 1000, 0},
                      {65, 1, 0},
@@ -377,7 +364,7 @@ static void udp_segmented_receive_checks(struct terra_tsi_socket *state,
     }
     datagram_frame(carrier, peer, 1, 1, 0);
     carrier_available = TERRA_HEADER_BYTES;
-    put_unaligned_le32(TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + TERRA_UDP_RUN_BYTES + 1,
+    put_unaligned_le32(TERRA_UDP_FRAME_OVERHEAD_BYTES - TERRA_HEADER_BYTES + TERRA_MAX_UDP_RUN_BYTES + 1,
                        carrier + 4);
     assert(!terra_receive_udp_frame(state) && state->udp_failed == -EPROTO);
     state->udp_failed = 0;
@@ -389,40 +376,40 @@ static void udp_checks(void) {
     struct vsock_sock transport = {.sk.sk_state = TCP_ESTABLISHED, .trans = &capacity};
     struct sock outer = {.sk_data_ready = decoded_data_ready, .sk_rcvbuf = 1 << 20};
     struct socket socket = {.sk = &transport.sk};
-    u8 outgoing[4124];
+    u8 outgoing[TERRA_UDP_FRAME_BYTES];
     struct terra_tsi_socket state = {.sk = &outer, .stream = &socket, .udp_frame = outgoing, .wait = 123};
     struct sockaddr_in6 peer = ipv4_peer(0xcb007101, 80);
-    u8 frame[33] = {0};
-    terra_frame_header(frame, TERRA_OP_UDP_DATAGRAM, 25);
-    assert(!terra_encode_peer(frame + 8, &peer));
-    frame[32] = 'D';
-    memcpy(carrier, frame, 33);
+    u8 frame[TERRA_UDP_FRAME_OVERHEAD_BYTES + 1] = {0};
+    terra_frame_header(frame, TERRA_OP_UDP_DATAGRAM, sizeof(frame) - TERRA_HEADER_BYTES);
+    assert(!terra_encode_peer(frame + TERRA_HEADER_BYTES, &peer));
+    frame[TERRA_UDP_FRAME_OVERHEAD_BYTES] = 'D';
+    memcpy(carrier, frame, sizeof(frame));
     carrier_available = 10;
     assert(!terra_receive_udp_frame(&state) && !state.udp_failed && carrier_available == 10);
     int before_delivery_wakes = wakes;
     int before_data_wakes = decoded_data_wakes;
-    carrier_available = 33;
+    carrier_available = sizeof(frame);
     assert(terra_receive_udp_frame(&state) && state.datagrams.qlen == 1);
     assert(decoded_data_wakes == before_data_wakes + 1 && wakes == before_delivery_wakes);
     assert(state.datagrams.first->len == 1 && skb_byte(state.datagrams.first, 0) == 'D');
     assert(terra_datagram_bytes(state.datagrams.first) == 1 &&
            !TERRA_DATAGRAM_CB(state.datagrams.first)->segment);
     clear_datagrams(&state.datagrams);
-    memcpy(carrier, frame, 33);
-    memcpy(carrier + 33, frame, 33);
-    carrier_available = 66;
+    memcpy(carrier, frame, sizeof(frame));
+    memcpy(carrier + sizeof(frame), frame, sizeof(frame));
+    carrier_available = 2 * sizeof(frame);
     assert(terra_receive_udp_frame(&state) && terra_receive_udp_frame(&state) && state.datagrams.qlen == 2);
     assert(decoded_data_wakes == before_data_wakes + 3 && wakes == before_delivery_wakes);
     assert(!terra_receive_udp_frame(&state) && !state.udp_failed);
     clear_datagrams(&state.datagrams);
     outer.sk_shutdown = RCV_SHUTDOWN;
-    memcpy(carrier, frame, 33);
-    carrier_available = 33;
+    memcpy(carrier, frame, sizeof(frame));
+    carrier_available = sizeof(frame);
     assert(terra_receive_udp_frame(&state) && !state.datagrams.qlen);
     assert(decoded_data_wakes == before_data_wakes + 3 && wakes == before_delivery_wakes);
     outer.sk_shutdown = 0;
-    for (unsigned int available = 0; available < 33; available++) {
-        memcpy(carrier, frame, 33);
+    for (unsigned int available = 0; available < sizeof(frame); available++) {
+        memcpy(carrier, frame, sizeof(frame));
         carrier_available = available;
         transport.peer_shutdown = SEND_SHUTDOWN;
         assert(!terra_receive_udp_frame(&state));
@@ -431,12 +418,12 @@ static void udp_checks(void) {
         outer.sk_err = 0;
     }
     transport.peer_shutdown = 0;
-    terra_frame_header(frame, TERRA_OP_UDP_ERROR, 24);
-    put_unaligned_le16(1, frame + 8);
-    put_unaligned_le16(0, frame + 10);
-    assert(!terra_encode_peer(frame + 12, &peer));
-    memcpy(carrier, frame, 32);
-    carrier_available = 32;
+    terra_frame_header(frame, TERRA_OP_UDP_ERROR, TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES);
+    put_unaligned_le16(1, frame + TERRA_HEADER_BYTES);
+    put_unaligned_le16(0, frame + TERRA_HEADER_BYTES + 2);
+    assert(!terra_encode_peer(frame + TERRA_HEADER_BYTES + TERRA_STATUS_BYTES, &peer));
+    memcpy(carrier, frame, TERRA_HEADER_BYTES + TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES);
+    carrier_available = TERRA_HEADER_BYTES + TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES;
     int before_queued_error_wakes = wakes;
     assert(terra_receive_udp_frame(&state) && outer.sk_err == EACCES && queued_errors == 1);
     assert(wakes == before_queued_error_wakes + 1);
@@ -458,13 +445,13 @@ static void udp_checks(void) {
     message.msg_iter.bytes = (const u8 *)"abc";
     assert(terra_send_udp(&state, &peer, &message, 3, 0, false) == 3 && sends == 1 &&
            waits == 3);
-    assert(get_unaligned_le16(carrier) == TERRA_OP_UDP_SEND && get_unaligned_le32(carrier + 4) == 27 &&
-           !memcmp(carrier + 32, "abc", 3));
-    assert(!get_unaligned_le32(carrier + 28));
-    terra_frame_header(frame, TERRA_OP_UDP_ERROR, 24);
-    put_unaligned_le16(21, frame + 8);
-    memcpy(carrier, frame, 32);
-    carrier_available = 32;
+    assert(get_unaligned_le16(carrier) == TERRA_OP_UDP_SEND && get_unaligned_le32(carrier + 4) == TERRA_UDP_FRAME_OVERHEAD_BYTES - TERRA_HEADER_BYTES + 3 &&
+           !memcmp(carrier + TERRA_UDP_FRAME_OVERHEAD_BYTES, "abc", 3));
+    assert(!get_unaligned_le32(carrier + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES));
+    terra_frame_header(frame, TERRA_OP_UDP_ERROR, TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES);
+    put_unaligned_le16(16, frame + TERRA_HEADER_BYTES);
+    memcpy(carrier, frame, TERRA_HEADER_BYTES + TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES);
+    carrier_available = TERRA_HEADER_BYTES + TERRA_STATUS_BYTES + TERRA_ENDPOINT_BYTES;
     int before_error_wakes = wakes;
     assert(!terra_receive_udp_frame(&state) && state.udp_failed == -EPROTO);
     state.udp_failed = 0;
@@ -483,9 +470,9 @@ static void udp_control_checks(void) {
     assert(!check_udp_send_validation(&sk, &message, 64 * 1200));
     assert(check_udp_send_validation(&sk, &message, 64 * 1200 + 1) == -EINVAL);
     sk.udp.gso_size = 0;
-    assert(!check_udp_send_validation(&sk, &message, TERRA_UDP_DATAGRAM));
-    assert(check_udp_send_validation(&sk, &message, TERRA_UDP_DATAGRAM + 1) == -EMSGSIZE);
-    sk.udp.gso_size = TERRA_UDP_DATAGRAM + 1;
+    assert(!check_udp_send_validation(&sk, &message, TERRA_MAX_NETWORK_DATAGRAM_BYTES));
+    assert(check_udp_send_validation(&sk, &message, TERRA_MAX_NETWORK_DATAGRAM_BYTES + 1) == -EMSGSIZE);
+    sk.udp.gso_size = TERRA_MAX_NETWORK_DATAGRAM_BYTES + 1;
     assert(check_udp_send_validation(&sk, &message, 1) == -EINVAL);
     sk.udp.gso_size = 1200;
     message.msg_control = control.bytes;
@@ -496,7 +483,7 @@ static void udp_control_checks(void) {
     entry->cmsg_type = UDP_SEGMENT;
     entry->cmsg_len = CMSG_LEN(sizeof(u16));
     message.msg_controllen = CMSG_SPACE(sizeof(u16));
-    const u16 invalid_segments[] = {0, TERRA_UDP_DATAGRAM + 1};
+    const u16 invalid_segments[] = {0, TERRA_MAX_NETWORK_DATAGRAM_BYTES + 1};
     for (unsigned int i = 0; i < ARRAY_SIZE(invalid_segments); i++) {
         memcpy(CMSG_DATA(entry), &invalid_segments[i], sizeof(u16));
         assert(terra_udp_control(&sk, &message, &segment) == -EINVAL);
@@ -597,11 +584,11 @@ static void udp_receive_shutdown_checks(void) {
     struct socket socket = {.sk = &sk};
     struct terra_tsi_socket state = {.sk = &sk, .native_ops = &native};
     carrier_poll_mask = 0;
-    assert(!udp_receive_ready(&state, &socket));
+    assert(!terra_udp_receive_ready(&state, &socket));
     sk.sk_shutdown = SEND_SHUTDOWN;
-    assert(!udp_receive_ready(&state, &socket));
+    assert(!terra_udp_receive_ready(&state, &socket));
     sk.sk_shutdown = RCV_SHUTDOWN;
-    assert(udp_receive_ready(&state, &socket));
+    assert(terra_udp_receive_ready(&state, &socket));
 }
 static int native_listen_result, native_listens, native_connects;
 static struct terra_tsi_socket *selecting_state;
@@ -645,12 +632,12 @@ static void listen_selection_checks(void) {
     select_lock_error = 0;
     selecting_state = &state;
     select_lock_hook = finish_listen_before_connect_lock;
-    assert(connect_native_after_lock(&socket, &peer, sizeof(peer), 0) == -EISCONN);
+    assert(terra_connect_locked(&socket, &peer, sizeof(peer), 0) == -EISCONN);
     assert(native_connects == 1 && state.mode == TERRA_SOCKET_NATIVE && !state.select_mutex.locked);
 }
 
 static size_t udp_frame_length(size_t length) {
-    return TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + length;
+    return TERRA_UDP_FRAME_OVERHEAD_BYTES + length;
 }
 
 /* Every send is one UDP_SEND frame; its segment field is set only when a GSO payload spans several datagrams.
@@ -695,8 +682,8 @@ static void udp_gso_checks(void) {
                  {2401, 1000},
                  {8193, 4096},
                  {64, 1},
-                 {exact_buffer_payload, TERRA_UDP_DATAGRAM / 2},
-                 {exact_buffer_payload + 1, TERRA_UDP_DATAGRAM / 2}};
+                 {exact_buffer_payload, TERRA_MAX_NETWORK_DATAGRAM_BYTES / 2},
+                 {exact_buffer_payload + 1, TERRA_MAX_NETWORK_DATAGRAM_BYTES / 2}};
     for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
         struct msghdr message = {.msg_iter.bytes = payload};
         carrier_space = 10000;
@@ -914,7 +901,7 @@ static void peek_mirror_checks(void) {
     state.connecting = true;
     assert(!terra_set_peek_off(&outer, 5) && outer.sk_peek_off == 5 && carrier_sock.sk_peek_off == -1);
     carrier_sock.sk_state = TCP_ESTABLISHED;
-    state.opening_offset = TERRA_TCP_OPEN_BYTES;
+    state.opening_offset = TERRA_TCP_OPEN_FRAME_BYTES;
     u8 opened[TERRA_HEADER_BYTES + TERRA_STATUS_BYTES] = {0x01, 0x01, 0, 0, TERRA_STATUS_BYTES};
     memcpy(state.opened, opened, sizeof(opened));
     state.opened_length = sizeof(opened) - 1;
@@ -927,18 +914,19 @@ static void peek_mirror_checks(void) {
     assert(!terra_set_peek_off(&outer, 0) && !carrier_sock.sk_peek_off && !outer.sk_peek_off &&
            !carrier_sock.locked);
     struct msghdr message = {0};
-    assert(receive_stream_once(&original, &message, 2, MSG_PEEK) == 2);
+    assert(terra_recv_stream(terra_socket_state(&original), &original, &message, 2, MSG_PEEK) == 2);
     assert(carrier_sock.sk_peek_off == 11 && outer.sk_peek_off == 11 && !state.select_mutex.locked);
     assert(!terra_set_peek_off(&outer, -1) && carrier_sock.sk_peek_off == -1 && outer.sk_peek_off == -1);
     state.mode = 0;
     native_result = 3;
-    assert(receive_stream_once(&original, &message, 3, 0) == 3);
+    assert(terra_recv_stream(terra_socket_state(&original), &original, &message, 3, 0) == 3);
     assert(carrier_sock.sk_peek_off == -1 && outer.sk_peek_off == -1);
     peek_locked_carrier = NULL;
 }
 int main(void) {
     peer_checks();
     error_checks();
+    tcp_open_field_checks();
     opening_checks();
     udp_resume_checks();
     udp_checks();

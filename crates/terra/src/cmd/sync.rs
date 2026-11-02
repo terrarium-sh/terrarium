@@ -24,8 +24,15 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use terra_protocol::{AgentService, RootStatus, SyncDirection, SyncReply, SyncRequest};
+use terra_protocol::{AgentService, RootStatus, SyncReply, SyncRequest};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Which way a sync copies, with the root of the host side.
+#[derive(Debug, Clone, Copy)]
+enum SyncDirection<'a> {
+    HostToGuest { source: &'a Path },
+    GuestToHost { target: &'a Path },
+}
 
 /// Synchronize a file or directory tree between the host and a running box.
 pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Result<ExitCode> {
@@ -53,7 +60,13 @@ pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Res
             sync_guest_to_host(&mut stream, &guest, &host, args).await
         }
     }
-    .map_err(|error| anyhow::anyhow!(crate::render::escape_printable(&format!("{error:#}"))))
+    .map_err(|error| as_one_line(&error))
+}
+
+/// A sync error as one escaped line. Guest names, link targets and messages fill its text, and
+/// `render_error` keeps line breaks, so a guest string could otherwise print a line of its own.
+fn as_one_line(error: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(crate::render::escape_printable(&format!("{error:#}")))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -86,18 +99,7 @@ async fn sync_host_to_guest(
         anyhow::bail!("--delete is valid only when synchronizing a directory");
     }
 
-    send_request(
-        stream,
-        &SyncRequest::BeginSession {
-            guest_root: dst_path_str.clone(),
-        },
-    )
-    .await?;
-
-    let initial_root_status = match read_reply(stream).await? {
-        SyncReply::SessionReady { root_status } => root_status,
-        other => anyhow::bail!("expected SessionReady, got {other:?}"),
-    };
+    let initial_root_status = begin_session(stream, dst_path_str).await?;
 
     if dst_has_trailing
         && matches!(
@@ -109,11 +111,7 @@ async fn sync_host_to_guest(
     }
 
     let is_dir_sync = src_meta.is_dir();
-    let src_name = src_path
-        .file_name()
-        .unwrap_or(std::ffi::OsStr::new(""))
-        .to_str()
-        .context("source name is not valid UTF-8")?;
+    let src_name = file_name_str(src_path, "source")?;
 
     let effective_guest_root = resolve_placement(
         SourcePlacement {
@@ -128,24 +126,10 @@ async fn sync_host_to_guest(
         },
     );
 
-    let mut effective_root_status = initial_root_status;
-    if effective_guest_root != *dst_path_str {
-        send_request(
-            stream,
-            &SyncRequest::BeginSession {
-                guest_root: effective_guest_root.clone(),
-            },
-        )
-        .await?;
-        match read_reply(stream).await? {
-            SyncReply::SessionReady { root_status } => effective_root_status = root_status,
-            other => anyhow::bail!("expected SessionReady on re-root, got {other:?}"),
-        }
-    }
-    let single_file_name = if is_dir_sync {
-        None
+    let effective_root_status = if effective_guest_root == *dst_path_str {
+        initial_root_status
     } else {
-        Some(src_name.to_string())
+        begin_session(stream, &effective_guest_root).await?
     };
 
     let source_entries = if is_dir_sync {
@@ -162,19 +146,15 @@ async fn sync_host_to_guest(
         &target_entries,
         args.checksum,
         args.delete,
-        SyncDirection::HostToGuest,
+        SyncDirection::HostToGuest { source: src_path },
         stream,
-        Path::new(&effective_guest_root),
-        src_path,
     )
     .await?;
 
     let stats = execute_plan(
         &actions,
-        SyncDirection::HostToGuest,
+        SyncDirection::HostToGuest { source: src_path },
         stream,
-        Path::new(&effective_guest_root),
-        src_path,
         args.dry_run,
     )
     .await?;
@@ -184,12 +164,11 @@ async fn sync_host_to_guest(
         &effective_guest_root,
         &stats,
         args.dry_run,
-        single_file_name.is_some(),
+        !is_dir_sync,
     );
     Ok(ExitCode::SUCCESS)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn sync_guest_to_host(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     src_endpoint: &GuestEndpoint,
@@ -201,18 +180,7 @@ async fn sync_guest_to_host(
     let dst_path = &dst_endpoint.path;
     let dst_has_trailing = dst_endpoint.has_trailing_separator;
 
-    send_request(
-        stream,
-        &SyncRequest::BeginSession {
-            guest_root: src_path_str.clone(),
-        },
-    )
-    .await?;
-
-    let initial_root_status = match read_reply(stream).await? {
-        SyncReply::SessionReady { root_status } => root_status,
-        other => anyhow::bail!("expected SessionReady, got {other:?}"),
-    };
+    let initial_root_status = begin_session(stream, src_path_str).await?;
 
     if initial_root_status == RootStatus::Missing {
         anyhow::bail!("guest source {src_path_str} does not exist");
@@ -233,11 +201,7 @@ async fn sync_guest_to_host(
     }
 
     let is_dir_sync = initial_root_status == RootStatus::ExistingDirectory;
-    let src_name = Path::new(src_path_str)
-        .file_name()
-        .unwrap_or(std::ffi::OsStr::new(""))
-        .to_str()
-        .context("guest source name is not valid UTF-8")?;
+    let src_name = file_name_str(Path::new(src_path_str), "guest source")?;
 
     let effective_host_root_str = resolve_placement(
         SourcePlacement {
@@ -260,11 +224,6 @@ async fn sync_guest_to_host(
             dst_path.display()
         );
     }
-    let single_file_name = if is_dir_sync {
-        None
-    } else {
-        Some(src_name.to_string())
-    };
 
     let source_entries = scan_guest_entries(stream).await?;
 
@@ -280,19 +239,19 @@ async fn sync_guest_to_host(
         &target_entries,
         args.checksum,
         args.delete,
-        SyncDirection::GuestToHost,
+        SyncDirection::GuestToHost {
+            target: &effective_host_root,
+        },
         stream,
-        &effective_host_root,
-        Path::new(src_path_str),
     )
     .await?;
 
     let stats = execute_plan(
         &actions,
-        SyncDirection::GuestToHost,
+        SyncDirection::GuestToHost {
+            target: &effective_host_root,
+        },
         stream,
-        &effective_host_root,
-        Path::new(src_path_str),
         args.dry_run,
     )
     .await?;
@@ -302,9 +261,33 @@ async fn sync_guest_to_host(
         &effective_host_root.display().to_string(),
         &stats,
         args.dry_run,
-        single_file_name.is_some(),
+        !is_dir_sync,
     );
     Ok(ExitCode::SUCCESS)
+}
+
+async fn begin_session(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    guest_root: &str,
+) -> Result<RootStatus> {
+    send_request(
+        stream,
+        &SyncRequest::BeginSession {
+            guest_root: guest_root.to_owned(),
+        },
+    )
+    .await?;
+    match read_reply(stream).await? {
+        SyncReply::SessionReady { root_status } => Ok(root_status),
+        other => anyhow::bail!("expected SessionReady, got {other:?}"),
+    }
+}
+
+fn file_name_str<'a>(path: &'a Path, description: &str) -> Result<&'a str> {
+    path.file_name()
+        .unwrap_or(std::ffi::OsStr::new(""))
+        .to_str()
+        .with_context(|| format!("{description} name is not valid UTF-8"))
 }
 
 fn report_result(from: &str, to: &str, stats: &SyncStats, is_dry_run: bool, is_single_file: bool) {
@@ -340,19 +323,36 @@ mod tests {
     use super::*;
     use terra_protocol::{SyncEntryKind, SyncReply};
 
+    /// A guest symlink target cannot forge a terra line: the sync error stays one line however
+    /// the guest string breaks.
+    #[test]
+    fn guest_strings_in_sync_errors_print_as_one_line() {
+        let error = security::validate_download_symlink_target(
+            "link",
+            "/x\nterra: copied 999 files\r\x1b[2J",
+        )
+        .unwrap_err();
+        let rendered = crate::render::render_error(&as_one_line(&error));
+        assert!(!rendered.contains(['\n', '\r', '\x1b']), "{rendered}");
+        assert!(rendered.contains("terra: copied 999 files"), "{rendered}");
+    }
+
     #[tokio::test]
     async fn malformed_guest_trees_are_rejected_before_planning() {
         let source = BTreeMap::from([
-            ("a".into(), entry("a", SyncEntryKind::Symlink, Some("."))),
+            (
+                "a".into(),
+                entry("a", SyncEntryKind::Symlink { target: ".".into() }),
+            ),
             (
                 "a/escape".into(),
-                entry("a/escape", SyncEntryKind::File, None),
+                entry("a/escape", SyncEntryKind::File { size: 0 }),
             ),
         ]);
         assert!(validate_plan_conflicts(&source, &BTreeMap::new()).is_err());
         let mut guest = peer(&[
-            SyncReply::Entry(entry("a", SyncEntryKind::File, None)),
-            SyncReply::Entry(entry("a", SyncEntryKind::File, None)),
+            SyncReply::Entry(entry("a", SyncEntryKind::File { size: 0 })),
+            SyncReply::Entry(entry("a", SyncEntryKind::File { size: 0 })),
             SyncReply::ScanComplete,
         ]);
         assert!(
@@ -373,14 +373,19 @@ mod tests {
             std::fs::create_dir_all(destination.join("d")).unwrap();
             std::os::unix::fs::symlink("..", destination.join("d/up")).unwrap();
             let mut source = vec![
-                entry("", SyncEntryKind::Directory, None),
-                entry("a", SyncEntryKind::Symlink, Some("d/up/../../x")),
-                entry("z", SyncEntryKind::File, None),
+                entry("", SyncEntryKind::Directory),
+                entry(
+                    "a",
+                    SyncEntryKind::Symlink {
+                        target: "d/up/../../x".into(),
+                    },
+                ),
+                entry("z", SyncEntryKind::File { size: 0 }),
             ];
             if !delete {
                 source.extend([
-                    entry("d", SyncEntryKind::Directory, None),
-                    entry("d/up", SyncEntryKind::File, None),
+                    entry("d", SyncEntryKind::Directory),
+                    entry("d/up", SyncEntryKind::File { size: 0 }),
                 ]);
             }
             let mut replies = vec![SyncReply::SessionReady {
@@ -489,7 +494,12 @@ mod tests {
             SyncReply::SessionReady {
                 root_status: RootStatus::ExistingSymlink,
             },
-            SyncReply::Entry(entry("", SyncEntryKind::Symlink, Some("outside/secret"))),
+            SyncReply::Entry(entry(
+                "",
+                SyncEntryKind::Symlink {
+                    target: "outside/secret".into(),
+                },
+            )),
             SyncReply::ScanComplete,
             SyncReply::Success,
         ];
@@ -541,7 +551,7 @@ mod tests {
             SyncReply::SessionReady {
                 root_status: RootStatus::ExistingDirectory,
             },
-            SyncReply::Entry(entry("", SyncEntryKind::Directory, None)),
+            SyncReply::Entry(entry("", SyncEntryKind::Directory)),
             SyncReply::ScanComplete,
             SyncReply::Success,
         ];
@@ -594,9 +604,9 @@ mod tests {
             SyncReply::SessionReady {
                 root_status: RootStatus::ExistingDirectory,
             },
-            SyncReply::Entry(entry("", SyncEntryKind::Directory, None)),
-            SyncReply::Entry(entry("日本語", SyncEntryKind::Directory, None)),
-            SyncReply::Entry(entry("日本語/café.txt", SyncEntryKind::File, None)),
+            SyncReply::Entry(entry("", SyncEntryKind::Directory)),
+            SyncReply::Entry(entry("日本語", SyncEntryKind::Directory)),
+            SyncReply::Entry(entry("日本語/café.txt", SyncEntryKind::File { size: 0 })),
             SyncReply::ScanComplete,
             SyncReply::ReadFileReady {
                 size: 0,
@@ -679,9 +689,9 @@ mod tests {
             SyncReply::SessionReady {
                 root_status: RootStatus::ExistingDirectory,
             },
-            SyncReply::Entry(entry("", SyncEntryKind::Directory, None)),
-            SyncReply::Entry(entry("a", SyncEntryKind::File, None)),
-            SyncReply::Entry(entry(&"x".repeat(300), SyncEntryKind::File, None)),
+            SyncReply::Entry(entry("", SyncEntryKind::Directory)),
+            SyncReply::Entry(entry("a", SyncEntryKind::File { size: 0 })),
+            SyncReply::Entry(entry(&"x".repeat(300), SyncEntryKind::File { size: 0 })),
             SyncReply::ScanComplete,
         ];
         let error = sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)

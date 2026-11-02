@@ -16,9 +16,6 @@ on:
       - scripts/kernel/vsock-tests/**
       - scripts/kernel/check-vsock-abi.py
       - components/vsock-frontend/src/transport.rs
-      - crates/terra-protocol/src/application.rs
-      - crates/terra-protocol/src/socket.rs
-      - crates/terra-protocol/src/vsock.rs
       - .github/workflows/kernel.yml
   pull_request:
     paths:
@@ -33,9 +30,6 @@ on:
       - scripts/kernel/vsock-tests/**
       - scripts/kernel/check-vsock-abi.py
       - components/vsock-frontend/src/transport.rs
-      - crates/terra-protocol/src/application.rs
-      - crates/terra-protocol/src/socket.rs
-      - crates/terra-protocol/src/vsock.rs
       - .github/workflows/kernel.yml
 
 permissions:

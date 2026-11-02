@@ -26,6 +26,10 @@ typedef uint32_t __be32;
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define min_t(type, a, b) min((type)(a), (type)(b))
 #define max_t(type, a, b) ((type)(a) > (type)(b) ? (type)(a) : (type)(b))
+#define clamp(value, low, high) ((value) < (low) ? (low) : (value) > (high) ? (high) : (value))
+#define MAX_TCP_KEEPIDLE 32767
+#define MAX_TCP_KEEPINTVL 32767
+#define MAX_TCP_KEEPCNT 127
 #define DIV_ROUND_UP(value, divisor) (((value) + (divisor) - 1) / (divisor))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(target, value) ((target) = (value))
@@ -340,7 +344,6 @@ struct sk_buff {
     int users;
     u8 cb[48];
     struct skb_shared_info shinfo;
-    u8 data[4116];
 };
 #define skb_shinfo(skb) (&(skb)->shinfo)
 static u8 *skb_frag_page(const skb_frag_t *fragment) {
@@ -358,7 +361,7 @@ static struct sk_buff *alloc_skb_with_frags(unsigned long header_length, unsigne
                                             int *error, int flags) {
     (void)order;
     (void)flags;
-    assert(header_length <= 4116);
+    assert(!header_length);
     if (skb_allocation_fails) {
         *error = -ENOBUFS;
         return NULL;
@@ -375,17 +378,7 @@ static struct sk_buff *alloc_skb_with_frags(unsigned long header_length, unsigne
     }
     return skb;
 }
-static u8 *skb_put(struct sk_buff *skb, unsigned int length) {
-    assert(!skb->data_len);
-    u8 *tail = skb->data + skb->len;
-    skb->len += length;
-    return tail;
-}
 static u8 skb_byte(const struct sk_buff *skb, unsigned int offset) {
-    unsigned int linear = skb->len - skb->data_len;
-    if (offset < linear)
-        return skb->data[offset];
-    offset -= linear;
     return skb->shinfo.frags[offset / 4096].page[offset % 4096];
 }
 static void skb_get(struct sk_buff *skb) {
@@ -398,17 +391,6 @@ struct sk_buff_head {
 };
 static bool skb_queue_empty(struct sk_buff_head *queue) {
     return !queue->first;
-}
-static struct sk_buff *alloc_skb(unsigned int length, int flags) {
-    assert(length <= 4116);
-    (void)flags;
-    struct sk_buff *skb = calloc(1, sizeof(struct sk_buff));
-    skb->users = 1;
-    return skb;
-}
-static void skb_put_data(struct sk_buff *skb, const void *bytes, unsigned int length) {
-    memcpy(skb->data, bytes, length);
-    skb->len = length;
 }
 static void skb_queue_tail(struct sk_buff_head *queue, struct sk_buff *skb) {
     if (queue->last)
@@ -467,8 +449,6 @@ static int kernel_sock_shutdown(struct socket *socket, int how) {
     return 0;
 }
 #include <linux/terra_abi.h>
-#define TERRA_UDP_FRAME_BYTES \
-    (TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + TERRA_UDP_DATAGRAM)
 struct terra_tsi_socket {
     u8 opened[TERRA_HEADER_BYTES + TERRA_STATUS_BYTES];
     struct mutex select_mutex;
@@ -486,7 +466,7 @@ struct terra_tsi_socket {
     int mode;
     const struct proto_ops *native_ops;
     struct work_struct setup_work, udp_work;
-    u8 opening[64];
+    u8 opening[TERRA_TCP_OPEN_FRAME_BYTES];
     unsigned int opening_offset, opened_length;
 };
 /* terra_connect_locked is compiled whole; the checks drive only its early branches, so its later steps abort.

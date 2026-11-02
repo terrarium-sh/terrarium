@@ -13,10 +13,10 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use terra_network::{Client, Error, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
-use terra_protocol::application::{TcpKeepalive, TcpOpenOptions, UDP_FRAME_OVERHEAD_BYTES};
+use terra_protocol::application::{TcpKeepalive, TcpOpenOptions};
 use terra_protocol::network::{
-    DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BATCH_BYTES,
-    MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind, SendFailure,
+    DatagramBatch, DatagramHeader, ListenerGrant, MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_NAME_BYTES,
+    ResourceKind, SendFailure, is_within_datagram_batch_limits,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -76,7 +76,7 @@ impl Drop for BrokerUdp {
 
 struct BrokerListener {
     client: Client,
-    grant: terra_network::ListenerGrant,
+    grant: ListenerGrant,
     closed: CancellationToken,
     is_accepting: bool,
 }
@@ -264,7 +264,7 @@ async fn until_closed<R>(
 fn begin_accept<D: WasiView + 'static>(
     store: impl AsContextMut<Data = D>,
     client: Client,
-    grant: terra_network::ListenerGrant,
+    grant: ListenerGrant,
     closed: CancellationToken,
     is_duplicate: bool,
     mut completion: Completion,
@@ -295,13 +295,9 @@ fn begin_accept<D: WasiView + 'static>(
 fn broker_error(error: Error) -> BrokerError {
     match error {
         Error::AccessDenied => BrokerError::AccessDenied,
-        Error::InvalidArgument | Error::NotSupported => BrokerError::InvalidArgument,
+        Error::InvalidArgument => BrokerError::InvalidArgument,
         Error::InvalidState | Error::NotReady => BrokerError::InvalidState,
-        Error::StaleHandle => BrokerError::StaleHandle,
-        Error::WrongKind => BrokerError::WrongKind,
-        Error::Busy => BrokerError::Busy,
         Error::LimitExceeded => BrokerError::LimitExceeded,
-        Error::DuplicateRequest => BrokerError::DuplicateRequest,
         Error::Cancelled => BrokerError::Cancelled,
         Error::ConnectionRefused => BrokerError::ConnectionRefused,
         Error::ConnectionReset => BrokerError::ConnectionReset,
@@ -361,7 +357,7 @@ fn resolve_listener_grant(
     host_port: u16,
     ipv6: bool,
     transport: ResourceKind,
-) -> Result<terra_network::ListenerGrant, Error> {
+) -> Result<ListenerGrant, Error> {
     host.listener_grants
         .iter()
         .find(|listener| {
@@ -648,15 +644,11 @@ async fn send_datagrams(
     flow: &UdpFlow,
     BrokerDatagramBatch { headers, bytes }: BrokerDatagramBatch,
 ) -> Result<(Vec<BrokerSendFailure>, Vec<SocketAddr>), Error> {
-    if headers.len() > MAX_NETWORK_DATAGRAMS {
-        return Err(Error::InvalidArgument);
-    }
     let lengths_total: usize = headers
         .iter()
         .map(|header| usize::from(header.length))
         .sum();
-    if lengths_total != bytes.len()
-        || bytes.len() + headers.len() * UDP_FRAME_OVERHEAD_BYTES > MAX_NETWORK_DATAGRAM_BATCH_BYTES
+    if lengths_total != bytes.len() || !is_within_datagram_batch_limits(headers.len(), bytes.len())
     {
         return Err(Error::InvalidArgument);
     }
@@ -764,7 +756,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use terra_network::config::{Config, Network, PublishedListener};
-    use terra_protocol::network::{MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BYTES};
+    use terra_protocol::application::MAX_NETWORK_DATAGRAM_BYTES;
+    use terra_protocol::network::MAX_NETWORK_DATAGRAMS;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
 

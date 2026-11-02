@@ -160,8 +160,8 @@ static void reject_opening(unsigned int guest_port, unsigned int host_port, unsi
     unsigned char response[128];
     ssize_t received = recv(descriptor, response, sizeof(response), 0);
     if (received > 0) {
-        unsigned char expected[12] = {0x01, 0x01, 0, 0, 4, 0, 0, 0, 20, 0, 0, 0};
-        expected[8] = host_port == TCP_PORT ? 20 : 0;
+        unsigned char expected[12] = {0x01, 0x01, 0, 0, 4, 0, 0, 0, 15, 0, 0, 0};
+        expected[8] = host_port == TCP_PORT ? 15 : 0;
         size_t length = (size_t)received;
         require(length <= sizeof(expected), "cross-role refusal carries no service bytes");
         while (length < sizeof(expected)) {

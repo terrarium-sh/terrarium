@@ -3,31 +3,15 @@
 use crate::VsockHeader;
 use std::collections::VecDeque;
 
-use terra_protocol::vsock;
+use terra_protocol::vsock::{
+    self, AGENT_PORT, AGENT_REPLY_BYTES, AGENT_UPSTREAM_BYTES, CONTROL_PORT, CONTROL_REPLY_BYTES,
+    CONTROL_UPSTREAM_BYTES, FLOW_REPLY_BYTES, FLOW_UPSTREAM_BYTES, GUEST_CID, HOST_CID,
+    MAX_NETWORK_SOCKETS, MAX_PACKET_DATA_BYTES, PUBLICATION_HOST_PORTS, PUBLICATION_PORT, TCP_PORT,
+    UDP_PORT,
+};
 
-pub use vsock::{MAX_NETWORK_SOCKETS, PUBLICATION_HOST_PORTS};
-pub const AGENT_VSOCK_PORT: u32 = vsock::AGENT_PORT;
-pub const CONTROL_VSOCK_PORT: u32 = vsock::CONTROL_PORT;
-pub const TCP_VSOCK_PORT: u32 = vsock::TCP_PORT;
-pub const UDP_VSOCK_PORT: u32 = vsock::UDP_PORT;
-pub const PUBLICATION_VSOCK_PORT: u32 = vsock::PUBLICATION_PORT;
-#[allow(clippy::cast_possible_truncation)]
-pub const FLOW_RX_ALLOC: u32 = vsock::FLOW_UPSTREAM_BYTES as u32;
-pub(crate) const MAX_FLOW_TX_BYTES: usize = vsock::FLOW_REPLY_BYTES;
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) const CONTROL_RX_ALLOC: u32 = vsock::CONTROL_UPSTREAM_BYTES as u32;
-pub(crate) const MAX_CONTROL_TX_BYTES: usize = vsock::CONTROL_REPLY_BYTES;
-
-pub const HOST_CID: u64 = vsock::HOST_CID as u64;
-pub const GUEST_CID: u64 = vsock::GUEST_CID as u64;
-pub const MAX_DATA_BYTES: u32 = 64 * 1024;
-const _: () = assert!(terra_protocol::network::MAX_NETWORK_CHUNK_BYTES == MAX_DATA_BYTES as usize);
-#[allow(clippy::cast_possible_truncation)]
-pub const AGENT_RX_ALLOC: u32 = vsock::AGENT_UPSTREAM_BYTES as u32;
-pub(crate) const MAX_AGENT_TX_BYTES: usize = vsock::AGENT_REPLY_BYTES;
 pub const MAX_QUEUED_REPLIES: usize = 128;
-pub const MAX_QUEUED_REPLY_BYTES: usize = vsock::MAX_QUEUED_REPLY_BYTES;
-pub const MAX_QUEUED_UPSTREAM_BYTES: usize = vsock::MAX_QUEUED_UPSTREAM_BYTES;
+pub const MAX_REJECTED_RESETS: usize = 32;
 
 const RESERVED_CONTROL_REPLY_SLOTS: usize = 8;
 
@@ -153,8 +137,8 @@ impl StreamConnection {
 
     fn host_header(host_port: u32, guest_port: u32) -> VsockHeader {
         VsockHeader {
-            src_cid: HOST_CID,
-            dst_cid: GUEST_CID,
+            src_cid: HOST_CID.into(),
+            dst_cid: GUEST_CID.into(),
             src_port: host_port,
             dst_port: guest_port,
             len: 0,
@@ -265,10 +249,10 @@ impl StreamConnection {
     pub fn rx(&mut self, header: &VsockHeader, data: &[u8]) {
         let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         if header.type_ != TYPE_STREAM
-            || header.src_cid != GUEST_CID
-            || header.dst_cid != HOST_CID
+            || header.src_cid != u64::from(GUEST_CID)
+            || header.dst_cid != u64::from(HOST_CID)
             || (header.op == OP_RW) != (header.len > 0)
-            || header.len > MAX_DATA_BYTES
+            || header.len > MAX_PACKET_DATA_BYTES
             || data_len != u64::from(header.len)
             || (header.op == OP_SHUTDOWN
                 && (header.flags == 0
@@ -446,7 +430,7 @@ impl StreamConnection {
             return 0;
         }
         self.available_send_credit()
-            .min(MAX_DATA_BYTES as usize)
+            .min(MAX_PACKET_DATA_BYTES as usize)
             .min(self.max_tx_bytes.saturating_sub(self.reply_bytes))
     }
 
@@ -526,7 +510,7 @@ impl StreamConnection {
         if queued_bytes(&snapshot) == 0 {
             connection.is_receive_credit_requested = false;
         }
-        if self.host_port != AGENT_VSOCK_PORT
+        if self.host_port != AGENT_PORT
             && !snapshot.is_receive_credit_requested
             && snapshot
                 .rx_fwd_cnt
@@ -597,9 +581,11 @@ pub enum Role {
 impl Role {
     const fn buffers(self) -> (u32, usize) {
         match self {
-            Self::Agent => (AGENT_RX_ALLOC, MAX_AGENT_TX_BYTES),
-            Self::Control => (CONTROL_RX_ALLOC, MAX_CONTROL_TX_BYTES),
-            Self::Tcp | Self::Udp | Self::Publication => (FLOW_RX_ALLOC, MAX_FLOW_TX_BYTES),
+            Self::Agent => (AGENT_UPSTREAM_BYTES, AGENT_REPLY_BYTES as usize),
+            Self::Control => (CONTROL_UPSTREAM_BYTES, CONTROL_REPLY_BYTES as usize),
+            Self::Tcp | Self::Udp | Self::Publication => {
+                (FLOW_UPSTREAM_BYTES, FLOW_REPLY_BYTES as usize)
+            }
         }
     }
 }
@@ -696,8 +682,8 @@ impl VsockSwitch {
     ) -> Self {
         Self {
             endpoints: vec![
-                Endpoint::new(Role::Agent, AGENT_VSOCK_PORT, AGENT_VSOCK_PORT, 1),
-                Endpoint::new(Role::Control, CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT, 2),
+                Endpoint::new(Role::Agent, AGENT_PORT, AGENT_PORT, 1),
+                Endpoint::new(Role::Control, CONTROL_PORT, CONTROL_PORT, 2),
             ],
             next_connection_number: 3,
             network_enabled,
@@ -718,19 +704,19 @@ impl VsockSwitch {
 
     fn classify(&self, guest_port: u32, host_port: u32) -> Option<Role> {
         match (guest_port, host_port) {
-            (AGENT_VSOCK_PORT, AGENT_VSOCK_PORT) => Some(Role::Agent),
-            (CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT) if self.network_enabled => Some(Role::Control),
-            (guest_port, TCP_VSOCK_PORT)
+            (AGENT_PORT, AGENT_PORT) => Some(Role::Agent),
+            (CONTROL_PORT, CONTROL_PORT) if self.network_enabled => Some(Role::Control),
+            (guest_port, TCP_PORT)
                 if self.network_enabled && vsock::is_flow_guest_port(guest_port) =>
             {
                 Some(Role::Tcp)
             }
-            (guest_port, UDP_VSOCK_PORT)
+            (guest_port, UDP_PORT)
                 if self.network_enabled && vsock::is_flow_guest_port(guest_port) =>
             {
                 Some(Role::Udp)
             }
-            (PUBLICATION_VSOCK_PORT, host_port)
+            (PUBLICATION_PORT, host_port)
                 if self.network_enabled && PUBLICATION_HOST_PORTS.contains(&host_port) =>
             {
                 Some(Role::Publication)
@@ -751,7 +737,7 @@ impl VsockSwitch {
     }
 
     fn reject(&mut self, header: &VsockHeader) {
-        if header.op != OP_RST && self.rejected.len() < 32 {
+        if header.op != OP_RST && self.rejected.len() < MAX_REJECTED_RESETS {
             let connection_number = self
                 .endpoint_index(header.src_port, header.dst_port)
                 .map_or(0, |index| self.endpoints[index].connection_number);
@@ -782,8 +768,8 @@ impl VsockSwitch {
             if !matches!(role, Role::Tcp | Role::Udp)
                 || header.op != OP_REQUEST
                 || header.type_ != TYPE_STREAM
-                || header.src_cid != GUEST_CID
-                || header.dst_cid != HOST_CID
+                || header.src_cid != u64::from(GUEST_CID)
+                || header.dst_cid != u64::from(HOST_CID)
                 || header.len != 0
                 || !bytes.is_empty()
                 || header.flags != 0
@@ -831,16 +817,13 @@ impl VsockSwitch {
         {
             return Err(VsockError::Backpressure);
         }
-        if self
-            .endpoint_index(PUBLICATION_VSOCK_PORT, host_port)
-            .is_some()
-        {
+        if self.endpoint_index(PUBLICATION_PORT, host_port).is_some() {
             return Err(VsockError::Busy);
         }
         let connection_number = self.allocate_connection_number();
         let mut endpoint = Endpoint::new(
             Role::Publication,
-            PUBLICATION_VSOCK_PORT,
+            PUBLICATION_PORT,
             host_port,
             connection_number,
         );
@@ -864,8 +847,8 @@ impl VsockSwitch {
     #[must_use]
     pub fn connection(&self, role: Role) -> Option<ConnectionId> {
         match role {
-            Role::Agent => self.connection_for(AGENT_VSOCK_PORT, AGENT_VSOCK_PORT),
-            Role::Control => self.connection_for(CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT),
+            Role::Agent => self.connection_for(AGENT_PORT, AGENT_PORT),
+            Role::Control => self.connection_for(CONTROL_PORT, CONTROL_PORT),
             Role::Tcp | Role::Udp | Role::Publication => None,
         }
     }
@@ -1016,7 +999,7 @@ impl VsockSwitch {
     }
 
     pub fn deliver(&mut self, connection: ConnectionId, bytes: Vec<u8>) -> Result<(), VsockError> {
-        if bytes.len() > MAX_DATA_BYTES as usize {
+        if bytes.len() > MAX_PACKET_DATA_BYTES as usize {
             return Err(VsockError::Backpressure);
         }
         self.stream_mut(connection)?.deliver(bytes)
@@ -1186,20 +1169,20 @@ impl Default for VsockSwitch {
 pub fn fuzz_rx_sequence(mut bytes: &[u8]) {
     let mut switch = VsockSwitch::new();
     for (guest_port, host_port) in [
-        (AGENT_VSOCK_PORT, AGENT_VSOCK_PORT),
-        (CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT),
-        (TCP_VSOCK_PORT, TCP_VSOCK_PORT),
-        (UDP_VSOCK_PORT, UDP_VSOCK_PORT),
+        (AGENT_PORT, AGENT_PORT),
+        (CONTROL_PORT, CONTROL_PORT),
+        (TCP_PORT, TCP_PORT),
+        (UDP_PORT, UDP_PORT),
     ] {
         switch.rx(
             &VsockHeader {
-                src_cid: GUEST_CID,
-                dst_cid: HOST_CID,
+                src_cid: GUEST_CID.into(),
+                dst_cid: HOST_CID.into(),
                 src_port: guest_port,
                 dst_port: host_port,
                 type_: TYPE_STREAM,
                 op: OP_REQUEST,
-                buf_alloc: AGENT_RX_ALLOC,
+                buf_alloc: AGENT_UPSTREAM_BYTES,
                 ..StreamConnection::host_header(host_port, guest_port)
             },
             &[],
@@ -1288,17 +1271,17 @@ pub fn fuzz_rx_sequence(mut bytes: &[u8]) {
                 );
             }
         }
-        assert!(switch.rejected.len() <= 32);
+        assert!(switch.rejected.len() <= MAX_REJECTED_RESETS);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_VSOCK_PORT, FLOW_RX_ALLOC, GUEST_CID, HOST_CID, MAX_QUEUED_REPLIES,
+        CONTROL_PORT, FLOW_UPSTREAM_BYTES, GUEST_CID, HOST_CID, MAX_QUEUED_REPLIES,
         OP_CREDIT_REQUEST, OP_CREDIT_UPDATE, OP_REQUEST, OP_RW, OP_SHUTDOWN,
-        PUBLICATION_HOST_PORTS, StreamConnection, TCP_VSOCK_PORT, TYPE_STREAM, UDP_VSOCK_PORT,
-        VsockError, VsockHeader, VsockSwitch, ack_ahead, unacked_bytes,
+        PUBLICATION_HOST_PORTS, StreamConnection, TCP_PORT, TYPE_STREAM, UDP_PORT, VsockError,
+        VsockHeader, VsockSwitch, ack_ahead, unacked_bytes,
     };
 
     #[test]
@@ -1310,10 +1293,10 @@ mod tests {
 
         let mut switch = VsockSwitch::new();
         let request = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
+            src_cid: GUEST_CID.into(),
+            dst_cid: HOST_CID.into(),
             src_port: 12345,
-            dst_port: TCP_VSOCK_PORT,
+            dst_port: TCP_PORT,
             len: 0,
             type_: TYPE_STREAM,
             op: OP_REQUEST,
@@ -1323,7 +1306,7 @@ mod tests {
         };
         switch.rx(&request, &[]);
         switch.take_replies();
-        let connection = switch.connection_for(12345, TCP_VSOCK_PORT).unwrap();
+        let connection = switch.connection_for(12345, TCP_PORT).unwrap();
         let index = switch.connection_index(connection).unwrap();
         let stream = &mut switch.endpoints[index].stream;
         stream.max_tx_bytes = 4;
@@ -1354,8 +1337,8 @@ mod tests {
     fn credit_test_stream(host_port: u32) -> (StreamConnection, VsockHeader) {
         let mut stream = StreamConnection::new(12345, host_port, 8, 16);
         let opening = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
+            src_cid: GUEST_CID.into(),
+            dst_cid: HOST_CID.into(),
             src_port: 12345,
             dst_port: host_port,
             buf_alloc: 16,
@@ -1370,9 +1353,9 @@ mod tests {
     #[test]
     fn network_receive_credit_batches_without_delaying_explicit_requests() {
         for host_port in [
-            CONTROL_VSOCK_PORT,
-            TCP_VSOCK_PORT,
-            UDP_VSOCK_PORT,
+            CONTROL_PORT,
+            TCP_PORT,
+            UDP_PORT,
             PUBLICATION_HOST_PORTS.start,
         ] {
             let (mut stream, opening) = credit_test_stream(host_port);
@@ -1433,7 +1416,7 @@ mod tests {
 
     #[test]
     fn early_credit_request_survives_partial_drains_and_counter_wrap() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(UDP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1488,7 +1471,7 @@ mod tests {
     #[test]
     fn requested_credit_flush_failure_retires_demand_before_port_reuse() {
         for consume_after_request in [false, true] {
-            let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+            let (mut stream, opening) = credit_test_stream(UDP_PORT);
             stream.rx(
                 &VsockHeader {
                     op: OP_RW,
@@ -1526,7 +1509,7 @@ mod tests {
     /// The next half-window update restores unidirectional progress without a request.
     #[test]
     fn discarded_piggyback_keeps_unidirectional_receive_credit_progress() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(UDP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1567,7 +1550,7 @@ mod tests {
 
     #[test]
     fn batched_receive_credit_wrap_preserves_fifo_order() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(TCP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1604,7 +1587,7 @@ mod tests {
 
     #[test]
     fn smaller_peer_window_and_dynamic_shrink_flush_deferred_receive_credit() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(UDP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1645,7 +1628,7 @@ mod tests {
 
     #[test]
     fn failed_window_shrink_credit_flush_retires_the_connection() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(TCP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1673,7 +1656,7 @@ mod tests {
 
     #[test]
     fn failed_credit_queue_and_empty_delivery_do_not_advance_advertised_credit() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        let (mut stream, opening) = credit_test_stream(TCP_PORT);
         stream.rx(
             &VsockHeader {
                 op: OP_RW,
@@ -1701,15 +1684,15 @@ mod tests {
     fn upstream_byte_fifo_preserves_fragment_order_capacity_and_overflow_isolation() {
         let mut switch = VsockSwitch::new();
         let request = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
+            src_cid: GUEST_CID.into(),
+            dst_cid: HOST_CID.into(),
             src_port: 12345,
-            dst_port: TCP_VSOCK_PORT,
+            dst_port: TCP_PORT,
             len: 0,
             type_: TYPE_STREAM,
             op: OP_REQUEST,
             flags: 0,
-            buf_alloc: FLOW_RX_ALLOC,
+            buf_alloc: FLOW_UPSTREAM_BYTES,
             fwd_cnt: 0,
         };
         let other = VsockHeader {
@@ -1726,7 +1709,7 @@ mod tests {
             .unwrap();
         let index = switch.connection_index(connection).unwrap();
         let capacity = switch.endpoints[index].stream.upstream.capacity();
-        assert_eq!(capacity, FLOW_RX_ALLOC as usize);
+        assert_eq!(capacity, FLOW_UPSTREAM_BYTES as usize);
         switch.take_replies();
         switch.consume_upstream(connection, 0).unwrap();
         switch.consume_upstream(connection, usize::MAX).unwrap();
@@ -1741,7 +1724,7 @@ mod tests {
         );
         let data = VsockHeader {
             op: OP_RW,
-            len: FLOW_RX_ALLOC - 129,
+            len: FLOW_UPSTREAM_BYTES - 129,
             ..request
         };
         switch.rx(&data, &vec![b'a'; capacity - 129]);
@@ -1753,10 +1736,13 @@ mod tests {
         assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
         let consumed = capacity - 64;
         switch.consume_upstream(connection, consumed).unwrap();
-        assert_eq!(switch.take_replies()[0].header.fwd_cnt, FLOW_RX_ALLOC - 64);
+        assert_eq!(
+            switch.take_replies()[0].header.fwd_cnt,
+            FLOW_UPSTREAM_BYTES - 64
+        );
         switch.rx(
             &VsockHeader {
-                len: FLOW_RX_ALLOC - 64,
+                len: FLOW_UPSTREAM_BYTES - 64,
                 ..data
             },
             &vec![b'z'; consumed],

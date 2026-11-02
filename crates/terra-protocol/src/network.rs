@@ -1,15 +1,15 @@
 //! Bounded messages for the network broker, one yamux stream per operation.
 
 use crate::application::{
-    TcpOpenOptions, UDP_FRAME_OVERHEAD_BYTES, extends_udp_run, is_valid_udp_run,
+    MAX_FRAME_BYTES, MAX_NETWORK_DATAGRAM_BYTES, TcpOpenOptions, UDP_FRAME_OVERHEAD_BYTES,
+    extends_udp_run, is_valid_udp_run,
 };
-pub use crate::socket::Error;
+use crate::socket::Error;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 
-/// One vsock packet's largest payload, so a TCP chunk crosses to the guest as one packet.
-pub const MAX_NETWORK_CHUNK_BYTES: usize = 64 * 1024;
-pub const MAX_NETWORK_DATAGRAM_BYTES: usize = 4096;
+/// One switch delivery's largest payload, so a TCP chunk fits one delivery.
+pub const MAX_NETWORK_CHUNK_BYTES: usize = crate::vsock::MAX_PACKET_DATA_BYTES as usize;
 pub const MAX_NETWORK_NAME_BYTES: usize = 256;
 pub const MAX_NETWORK_ADDRESSES: usize = 32;
 pub const MAX_NETWORK_PAYLOAD_BYTES: usize = MAX_NETWORK_CHUNK_BYTES + 128;
@@ -20,10 +20,21 @@ pub const MAX_NETWORK_DATAGRAM_BATCH_BYTES: usize = MAX_NETWORK_CHUNK_BYTES;
 pub const UDP_PEER_TTL_SECS: u64 = 60;
 
 const _: () = assert!(MAX_NETWORK_DATAGRAM_BATCH_BYTES <= MAX_NETWORK_PAYLOAD_BYTES);
-const _: () = assert!(
-    crate::application::MAX_UDP_RUN_BYTES + UDP_FRAME_OVERHEAD_BYTES
-        <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
-);
+const _: () = assert!(MAX_FRAME_BYTES <= MAX_NETWORK_DATAGRAM_BATCH_BYTES);
+
+/// What a batch of `entries` entries holding `bytes` datagram bytes counts against
+/// [`MAX_NETWORK_DATAGRAM_BATCH_BYTES`]: each entry costs the UDP frame it becomes in the guest.
+#[must_use]
+pub const fn datagram_batch_bytes(entries: usize, bytes: usize) -> usize {
+    bytes + entries * UDP_FRAME_OVERHEAD_BYTES
+}
+
+/// Whether `entries` entries holding `bytes` datagram bytes fit one batch.
+#[must_use]
+pub const fn is_within_datagram_batch_limits(entries: usize, bytes: usize) -> bool {
+    entries <= MAX_NETWORK_DATAGRAMS
+        && datagram_batch_bytes(entries, bytes) <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
+}
 
 pub type ListenerGrant = u32;
 
@@ -80,9 +91,8 @@ impl DatagramBatch {
             .sum();
         let batch = Self { headers, bytes };
         (total == batch.bytes.len()
-            && batch.headers.len() <= MAX_NETWORK_DATAGRAMS
-            && batch.batch_bytes() <= MAX_NETWORK_DATAGRAM_BATCH_BYTES)
-            .then_some(batch)
+            && is_within_datagram_batch_limits(batch.headers.len(), batch.bytes.len()))
+        .then_some(batch)
     }
 
     #[must_use]
@@ -102,14 +112,16 @@ impl DatagramBatch {
 
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
-        self.bytes.len() + self.len() * UDP_FRAME_OVERHEAD_BYTES
+        datagram_batch_bytes(self.len(), self.bytes.len())
     }
 
     #[must_use]
     pub fn has_room_for_datagram(&self) -> bool {
-        self.len() < MAX_NETWORK_DATAGRAMS
-            && self.batch_bytes() + UDP_FRAME_OVERHEAD_BYTES + MAX_NETWORK_DATAGRAM_BYTES
-                <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
+        self.has_room_for_entry(MAX_NETWORK_DATAGRAM_BYTES)
+    }
+
+    fn has_room_for_entry(&self, length: usize) -> bool {
+        is_within_datagram_batch_limits(self.len() + 1, self.bytes.len() + length)
     }
 
     /// Appends one datagram, merging it into the last entry's run where possible. `false` leaves
@@ -135,11 +147,7 @@ impl DatagramBatch {
                 return true;
             }
         }
-        if bytes.len() > MAX_NETWORK_DATAGRAM_BYTES
-            || self.len() >= MAX_NETWORK_DATAGRAMS
-            || batch_bytes + UDP_FRAME_OVERHEAD_BYTES + bytes.len()
-                > MAX_NETWORK_DATAGRAM_BATCH_BYTES
-        {
+        if bytes.len() > MAX_NETWORK_DATAGRAM_BYTES || !self.has_room_for_entry(bytes.len()) {
             return false;
         }
         self.bytes.extend_from_slice(bytes);
@@ -178,6 +186,7 @@ impl DatagramBatch {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn datagrams(&self) -> impl Iterator<Item = (SocketAddr, &[u8])> {
         self.entries().flat_map(|(peer, segment, run)| {
             let size = if segment == 0 {
@@ -225,19 +234,20 @@ impl crate::Message for Open {
     const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
 }
 
-/// Broker reply to [`Open`], sent as `Result<Opened, Error>`.
+/// Broker reply to [`Open::Resolve`], sent as `Result<Resolved, Error>`; every other [`Open`] is
+/// answered `Result<(), Error>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Opened {
-    Tcp,
-    Udp,
-    Resolved(
-        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
-        Vec<IpAddr>,
-    ),
+pub struct Resolved(
+    #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
+    pub Vec<IpAddr>,
+);
+
+impl crate::Message for Result<Resolved, Error> {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
 }
 
-impl crate::Message for Result<Opened, Error> {
-    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
+impl crate::Message for Result<(), Error> {
+    const MAX_PAYLOAD_BYTES: usize = 2;
 }
 
 /// Broker frames on a TCP stream; the client's upload is raw bytes ending in FIN.
@@ -362,14 +372,19 @@ mod tests {
             MAX_NETWORK_CHUNK_BYTES
                 + 1
         ])));
-        assert!(roundtrips(&Ok::<_, Error>(Opened::Resolved(vec![
+        assert!(roundtrips(&Ok::<_, Error>(Resolved(vec![
             "1.1.1.1".parse().unwrap();
             MAX_NETWORK_ADDRESSES
         ]))));
-        assert!(!roundtrips(&Ok::<_, Error>(Opened::Resolved(vec![
-            "1.1.1.1".parse().unwrap();
-            MAX_NETWORK_ADDRESSES + 1
+        assert!(!roundtrips(&Ok::<_, Error>(Resolved(vec![
+            "1.1.1.1"
+                .parse()
+                .unwrap();
+            MAX_NETWORK_ADDRESSES
+                + 1
         ]))));
+        assert!(roundtrips(&Ok::<(), Error>(())));
+        assert!(roundtrips(&Err::<(), _>(Error::Protocol)));
         let mut malicious = encode_frame(&TcpEvent::Data(vec![])).unwrap();
         malicious.pop();
         malicious.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
@@ -450,7 +465,9 @@ mod tests {
                 segment,
                 bytes,
             };
-            crate::application::append_udp_datagram(&mut frames, run).unwrap();
+            crate::application::HostFrame::UdpDatagram(run)
+                .append(&mut frames)
+                .unwrap();
         }
         frames.len()
     }

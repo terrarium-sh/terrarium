@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{MIN_MEM_MIB, Recipe, VolumeLifetime};
 use std::path::Path;
-use terra_protocol::MAX_VOLUMES;
 
 pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
     for (k, v) in env {
@@ -103,13 +102,6 @@ fn validate_sudo(recipe: &Recipe) -> Result<()> {
 }
 
 fn validate_volumes(recipe: &Recipe) -> Result<()> {
-    if recipe.volumes.len() > MAX_VOLUMES {
-        bail!(
-            "the recipe names {} volumes; at most {} fit (one guest block device each)",
-            recipe.volumes.len(),
-            MAX_VOLUMES
-        );
-    }
     let mut seen = HashSet::new();
     let mut has_overlay = false;
     for v in &recipe.volumes {

@@ -186,7 +186,7 @@ opcodes, endpoint encoding and error codes are defined in
 broker IPC in `network.rs`. The kernel, agent, components and runtime must be
 built together: packaged kernel and boot images carry ABI markers checked before
 boot, and `make kernel-abi` renders the kernel's copy of the constants.
-`scripts/kernel/check-vsock-abi.py` checks the kernel overlay against the Rust constants.
+`scripts/kernel/check-vsock-abi.py` checks the kernel's endpoint set and its kernel-only buffer limits.
 
 - **TCP:** the guest sends TcpOpen; the frontend connects through the broker and
   answers Opened before guest `connect` returns. After that the stream carries
@@ -199,7 +199,7 @@ boot, and `make kernel-abi` renders the kernel's copy of the constants.
   `IP_RECVERR`, an error-queue entry. `connect` is guest-local filtering. The
   broker accepts inbound datagrams only from the 128 most recent peers the socket
   sent to within 60 seconds. Frontend and broker exchange ordered batches of up to
-  64 datagrams per IPC frame (broker protocol 1).
+  64 datagrams per IPC frame.
 - **QUIC compatibility:** external UDP accepts the options QUIC stacks set, as
   documented no-ops where the host cannot honor them: DF/MTU discovery
   (`IP_MTU_DISCOVER`, `IPV6_DONTFRAG`), ECN (`IP_RECVTOS`, `IP_TOS` and their IPv6
@@ -209,7 +209,7 @@ boot, and `make kernel-abi` renders the kernel's copy of the constants.
   `UDP_GRO` coalesces received runs and reports their segment size. `sendmsg` accepts ECN, `UDP_SEGMENT` and same-source
   `PKTINFO` control messages; others return `EOPNOTSUPP`. With DF a no-op, the
   host may fragment a PMTU probe, so QUIC can choose a larger MTU than the path's.
-- **Control:** the agent sends Hello and waits for Ready before configuring DNS.
+- **Control:** the agent connects and waits for Ready before configuring DNS.
   It serves DNS at `100.96.0.53:53` and forwards queries (16 in flight) over this
   stream for broker resolution. Losing the control stream retires all network
   streams; agent control continues.
@@ -297,26 +297,27 @@ Boot drivers are built in. The boot volume contains the agent and resize helper;
 Terra does not ship a general-purpose module tree. Packages requiring other
 kernel drivers need a built-in equivalent.
 
-Kernel and boot gzip assets include [trusted ABI markers](#network-transport).
-Terra embeds them repacked as chunked LZ4 (`.tlz4`): independently compressed
-LZ4-HC chunks, each with a CRC32, behind a header that carries the same marker.
+The kernel's gzip artifact carries a [trusted ABI marker](#network-transport).
+Terra embeds the kernel and boot disk packed as chunked LZ4 (`.tlz4`): independently compressed
+LZ4-HC chunks behind a header that carries the same marker. Packing decodes the result back
+before writing it, so a bad block fails the build rather than a boot.
 The kernel uses 1 MiB chunks and is streamed into guest RAM at boot. The boot
 disk uses 64 KiB chunks and is read in place, decoding only the chunks the
 guest touches. Markers are checked before any decompression and VM creation.
-Make targets package both forms automatically. To package verified matching raw
-images manually, select the image kind as the first positional argument:
+Make targets package both automatically. To package verified matching raw
+images manually:
 
 ```sh
-cargo run --locked -p terra-protocol --example package-guest-image -- kernel build/vmlinux build/vmlinux.gz
-cargo run --locked -p terra-protocol --example package-guest-image -- boot build/boot.img build/boot.img.gz
-cargo run --locked -p terra-protocol --features packer --example repack-guest-image -- kernel build/vmlinux.gz build/vmlinux.tlz4
-cargo run --locked -p terra-protocol --features packer --example repack-guest-image -- boot build/boot.img.gz build/boot.img.tlz4
+cargo run --locked -p terra-protocol --example package-kernel -- build/vmlinux build/vmlinux.gz
+cargo run --locked -p terra-protocol --features packer --example pack-guest-image -- kernel build/vmlinux.gz build/vmlinux.tlz4
+cargo run --locked -p terra-protocol --features packer --example pack-guest-image -- boot build/boot.img build/boot.img.tlz4
 ```
 
-The kernel's 12-byte standard gzip `TK` subfield records `VS` and little-endian
-socket/application/vsock ABI versions. The boot image uses its separate `TB`
-marker. Direct `VmInput` callers supplying their own images are responsible for
-matching their trusted artifacts; the live version handshake still runs.
+The kernel's 7-byte standard gzip `TK` subfield records the little-endian kernel
+ABI version (`kernel_abi::VERSION`); the boot image's `TB` marker adds the agent
+protocol version. `terra` refuses to compile with a stale embedded image. Direct
+`VmInput` callers supplying their own images are responsible for matching their
+trusted artifacts.
 
 The pinned [kernel container](kernel/Containerfile) supplies the build tools and
 the AArch64 compiler, native on AArch64 hosts and cross on x86_64. Its wrapper

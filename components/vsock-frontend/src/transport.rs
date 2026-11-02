@@ -16,7 +16,8 @@ const TX: usize = 1;
 const QUEUE_SIZE: u16 = 256;
 const DESC_BYTES: u64 = SPLIT_RING_DESCRIPTOR_BYTES as u64;
 const MAX_CHAIN: usize = 16;
-const MAX_PACKET: usize = VSOCK_HEADER_BYTES + terra_vsock_device::MAX_DATA_BYTES as usize;
+const MAX_PACKET: usize =
+    VSOCK_HEADER_BYTES + terra_protocol::vsock::MAX_PACKET_DATA_BYTES as usize;
 const NO_INTERRUPT: u16 = 1;
 const NO_NOTIFY: u16 = 1;
 /// Held-back TX completions that force an interrupt, well below a full TX ring.
@@ -81,7 +82,9 @@ fn new_state() -> State {
             19,
             VIRTIO_F_VERSION_1,
             QUEUE_SIZE,
-            terra_vsock_device::GUEST_CID.to_le_bytes().to_vec(),
+            u64::from(terra_protocol::vsock::GUEST_CID)
+                .to_le_bytes()
+                .to_vec(),
         )
         .with_queue_count(3),
         next: [0; 2],
@@ -356,7 +359,7 @@ fn read_tx_packet(
     let data_len = descriptors[1..].iter().try_fold(0usize, |len, descriptor| {
         len.checked_add(descriptor.len as usize)
     });
-    if payload_len > terra_vsock_device::MAX_DATA_BYTES as usize
+    if payload_len > terra_protocol::vsock::MAX_PACKET_DATA_BYTES as usize
         || data_len != Some(payload_len)
         || descriptors[1..]
             .iter()
@@ -738,21 +741,20 @@ pub fn fuzz_tx_descriptors(bytes: &[u8], head: u16, queue_size: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_vsock_device::{
-        AGENT_RX_ALLOC, AGENT_VSOCK_PORT, GUEST_CID, HOST_CID, MAX_DATA_BYTES,
-    };
+    use terra_protocol::vsock::MAX_PACKET_DATA_BYTES;
+    use terra_protocol::vsock::{AGENT_PORT, AGENT_UPSTREAM_BYTES, GUEST_CID, HOST_CID};
 
     fn header(len: u32) -> VsockHeader {
         VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
-            src_port: AGENT_VSOCK_PORT,
-            dst_port: AGENT_VSOCK_PORT,
+            src_cid: GUEST_CID.into(),
+            dst_cid: HOST_CID.into(),
+            src_port: AGENT_PORT,
+            dst_port: AGENT_PORT,
             len,
             type_: 1,
             op: 5,
             flags: 0,
-            buf_alloc: AGENT_RX_ALLOC,
+            buf_alloc: AGENT_UPSTREAM_BYTES,
             fwd_cnt: 0,
         }
     }
@@ -1549,17 +1551,17 @@ mod tests {
 
     #[test]
     fn full_payload_is_distinct_from_header_and_packet_capacity() {
-        let descriptors = descriptors(MAX_DATA_BYTES);
+        let descriptors = descriptors(MAX_PACKET_DATA_BYTES);
         let (parsed, bytes) = read_tx_packet(&descriptors, |address, len| {
             if address == 100 {
-                Ok(header(MAX_DATA_BYTES).encode().to_vec())
+                Ok(header(MAX_PACKET_DATA_BYTES).encode().to_vec())
             } else {
                 Ok(vec![0; usize::try_from(len).unwrap()])
             }
         })
         .unwrap()
         .unwrap();
-        assert_eq!(parsed.len, MAX_DATA_BYTES);
+        assert_eq!(parsed.len, MAX_PACKET_DATA_BYTES);
         assert_eq!(bytes.len() + VSOCK_HEADER_BYTES, MAX_PACKET);
     }
 
@@ -1640,7 +1642,7 @@ mod tests {
 
     #[test]
     fn malformed_descriptor_metadata_is_rejected_before_reading_payload() {
-        for (payload_len, flags) in [(MAX_DATA_BYTES + 1, 0), (5, SPLIT_RING_DESC_F_WRITE)] {
+        for (payload_len, flags) in [(MAX_PACKET_DATA_BYTES + 1, 0), (5, SPLIT_RING_DESC_F_WRITE)] {
             let mut descriptors = descriptors(payload_len);
             descriptors[1].flags = flags;
             let mut reads = 0;
@@ -1671,8 +1673,8 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert_eq!(parsed.src_port, AGENT_VSOCK_PORT);
-        assert_eq!(parsed.dst_port, AGENT_VSOCK_PORT);
+        assert_eq!(parsed.src_port, AGENT_PORT);
+        assert_eq!(parsed.dst_port, AGENT_PORT);
         assert_eq!(parsed.len, 5);
         assert_eq!(bytes, b"agent");
     }
@@ -1689,8 +1691,8 @@ mod tests {
         for bytes in [vec![0], 0_u32.to_le_bytes().to_vec()] {
             *super::super::switch() = VsockSwitch::new();
             for port in [
-                terra_vsock_device::AGENT_VSOCK_PORT,
-                terra_vsock_device::CONTROL_VSOCK_PORT,
+                terra_protocol::vsock::AGENT_PORT,
+                terra_protocol::vsock::CONTROL_PORT,
             ] {
                 let request = VsockHeader {
                     op: 1,
@@ -1707,7 +1709,7 @@ mod tests {
                     19,
                     VIRTIO_F_VERSION_1,
                     QUEUE_SIZE,
-                    GUEST_CID.to_le_bytes().to_vec(),
+                    u64::from(GUEST_CID).to_le_bytes().to_vec(),
                 )
                 .with_queue_count(3),
                 next: [7, 9],

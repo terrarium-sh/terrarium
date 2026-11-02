@@ -46,7 +46,10 @@ fn fake_broker() -> (Client, FakeBroker) {
 
 impl FakeBroker {
     /// Accepts the next stream, reads its `Open`, and answers with `reply`.
-    async fn answer(&mut self, reply: Result<Opened, Error>) -> (Open, BrokerStream) {
+    async fn answer<Reply>(&mut self, reply: Result<Reply, Error>) -> (Open, BrokerStream)
+    where
+        Result<Reply, Error>: terra_protocol::Message,
+    {
         let mut stream = self.streams.recv().await.unwrap().compat();
         let open = terra_protocol::read_frame_async::<Open>(&mut stream)
             .await
@@ -90,7 +93,7 @@ async fn malformed_or_out_of_order_tcp_events_disconnect_the_client() {
                         .await
                         .unwrap()
                 },
-                broker.answer(Ok(Opened::Tcp))
+                broker.answer(Ok(()))
             );
             let (mut upload, mut download) = flow.split();
             for bytes in events {
@@ -104,10 +107,11 @@ async fn malformed_or_out_of_order_tcp_events_disconnect_the_client() {
     }
 }
 
+/// A reply of another request's shape, or an empty resolution, is a broker fault.
 #[tokio::test]
 async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
     let loopback: SocketAddr = PEER.parse().unwrap();
-    for (open_reply, is_accept) in [(Opened::Udp, false), (Opened::Resolved(vec![]), true)] {
+    for is_accept in [false, true] {
         bounded(async {
             let (client, mut broker) = fake_broker();
             let (result, _) = tokio::join!(
@@ -119,7 +123,7 @@ async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
                     }
                     .err()
                 },
-                broker.answer(Ok(open_reply.clone()))
+                broker.answer(Ok(Resolved(vec![loopback.ip()])))
             );
             assert_eq!(result, Some(Error::Closed));
             assert_disconnected(&client).await;
@@ -128,9 +132,16 @@ async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
     }
     bounded(async {
         let (client, mut broker) = fake_broker();
+        let (result, _) = tokio::join!(client.resolve("a.test".into()), broker.answer(Ok(())));
+        assert_eq!(result, Err(Error::Closed));
+        assert_disconnected(&client).await;
+    })
+    .await;
+    bounded(async {
+        let (client, mut broker) = fake_broker();
         let (result, _) = tokio::join!(
             client.resolve("a.test".into()),
-            broker.answer(Ok(Opened::Resolved(vec![])))
+            broker.answer(Ok(Resolved(vec![])))
         );
         assert_eq!(result, Err(Error::Closed));
         assert_disconnected(&client).await;
@@ -148,7 +159,7 @@ async fn broker_errors_are_returned_without_disconnecting() {
         let (client, mut broker) = fake_broker();
         let (result, (open, _)) = tokio::join!(
             client.open_tcp(PEER.parse().unwrap(), options),
-            broker.answer(Err(Error::AccessDenied))
+            broker.answer(Err::<(), _>(Error::AccessDenied))
         );
         assert_eq!(result.err(), Some(Error::AccessDenied));
         assert_eq!(
@@ -176,7 +187,7 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
             let (client, mut broker) = fake_broker();
             let (_flow, (_, mut stream)) = tokio::join!(
                 async { client.open_udp().await.unwrap() },
-                broker.answer(Ok(Opened::Udp))
+                broker.answer(Ok(()))
             );
             terra_protocol::write_frame_async(&mut stream, &reply)
                 .await
@@ -189,7 +200,7 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
         let (client, mut broker) = fake_broker();
         let (flow, (_, mut stream)) = tokio::join!(
             async { client.open_udp().await.unwrap() },
-            broker.answer(Ok(Opened::Udp))
+            broker.answer(Ok(()))
         );
         let receiving = tokio::spawn(async move { flow.receive().await });
         let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
@@ -218,7 +229,7 @@ async fn closing_a_udp_flow_with_a_reply_in_flight_keeps_the_client() {
         for yields in (0..16).cycle().take(512) {
             let (flow, (_, mut stream)) = tokio::join!(
                 async { client.open_udp().await.unwrap() },
-                broker.answer(Ok(Opened::Udp))
+                broker.answer(Ok(()))
             );
             let receiving = tokio::spawn({
                 let flow = flow.clone();
@@ -250,7 +261,7 @@ async fn out_of_range_send_failures_disconnect_the_client() {
         let (client, mut broker) = fake_broker();
         let (flow, (_, mut stream)) = tokio::join!(
             async { client.open_udp().await.unwrap() },
-            broker.answer(Ok(Opened::Udp))
+            broker.answer(Ok(()))
         );
         let sending = tokio::spawn(async move { flow.send(one_datagram()).await });
         let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
@@ -312,7 +323,7 @@ async fn a_broker_failure_ends_the_udp_flow_with_its_error() {
         let (client, mut broker) = fake_broker();
         let (flow, (_, mut stream)) = tokio::join!(
             async { client.open_udp().await.unwrap() },
-            broker.answer(Ok(Opened::Udp))
+            broker.answer(Ok(()))
         );
         let receiving = tokio::spawn({
             let flow = flow.clone();

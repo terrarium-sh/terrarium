@@ -38,9 +38,8 @@ class KernelSourceTests(unittest.TestCase):
             directory = Path(temporary)
             for name in ("Makefile", "pins.mk", "kernel/terra.config", "kernel/x86_64.config",
                          "kernel/Containerfile", "scripts/kernel/kernel-container.sh",
-                         "crates/terra-protocol/src/guest_image.rs", "crates/terra-protocol/src/socket.rs",
-                         "crates/terra-protocol/src/application.rs", "crates/terra-protocol/src/vsock.rs",
-                         "crates/terra-protocol/examples/package-guest-image.rs"):
+                         "crates/terra-protocol/src/guest_image.rs", "crates/terra-protocol/src/kernel_abi.rs",
+                         "crates/terra-protocol/examples/package-kernel.rs"):
                 destination = directory / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(SCRIPTS.parent.parent / name, destination)

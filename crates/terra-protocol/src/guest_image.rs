@@ -6,15 +6,15 @@ pub enum GuestImage {
     Kernel,
 }
 
-/// Bumps when a marker's layout changes.
-const MARKER_FORMAT: u8 = 4;
-pub const MARKER_BYTES: usize = 8;
+/// The marker's data after its gzip subfield ID and length: agent version and kernel ABI version.
+const MARKER_DATA_BYTES: u8 = 3;
+pub(crate) const MARKER_BYTES: usize = 4 + MARKER_DATA_BYTES as usize;
 
 impl GuestImage {
     /// The gzip header subfield naming the agent protocol and kernel ABI an image was built for:
-    /// its two-byte ID and length, then the marker format, agent version, and kernel ABI version.
+    /// its two-byte ID and length, then the agent version and kernel ABI version.
     #[must_use]
-    pub fn marker(self) -> [u8; MARKER_BYTES] {
+    pub const fn marker(self) -> [u8; MARKER_BYTES] {
         let (id, agent_version) = match self {
             Self::Boot => (*b"TB", crate::AGENT_PROTOCOL_VERSION),
             // The kernel image carries no agent.
@@ -24,30 +24,45 @@ impl GuestImage {
         [
             id[0],
             id[1],
-            4,
+            MARKER_DATA_BYTES,
             0,
-            MARKER_FORMAT,
             agent_version,
             abi_low,
             abi_high,
         ]
     }
 
+    /// Whether `bytes` is exactly this kind's marker; `const` so an embedded image can be checked
+    /// when it is compiled in.
+    #[must_use]
+    pub(crate) const fn is_marker(self, bytes: &[u8]) -> bool {
+        let marker = self.marker();
+        if bytes.len() != MARKER_BYTES {
+            return false;
+        }
+        let mut index = 0;
+        while index < MARKER_BYTES {
+            if bytes[index] != marker[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
     pub fn validate(self, extra: Option<&[u8]>) -> std::io::Result<()> {
-        if extra == Some(self.marker().as_slice()) {
+        if extra.is_some_and(|extra| self.is_marker(extra)) {
             return Ok(());
         }
-        let message = match self {
-            Self::Boot => {
-                "guest boot image protocol marker is missing or incompatible; rebuild the kernel, agent, components, and runtime together"
-            }
-            Self::Kernel => {
-                "guest kernel protocol marker is missing or incompatible; rebuild the matching kernel, agent, components, and runtime together"
-            }
+        let image = match self {
+            Self::Boot => "boot image",
+            Self::Kernel => "kernel",
         };
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            message,
+            format!(
+                "guest {image} protocol marker is missing or incompatible; rebuild the kernel, agent, components, and runtime together"
+            ),
         ))
     }
 }
@@ -55,27 +70,16 @@ impl GuestImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
 
     #[test]
     fn markers_pin_the_agent_protocol_and_kernel_abi_in_a_gzip_subfield() {
         let abi = crate::kernel_abi::VERSION.to_le_bytes();
         let boot = GuestImage::Boot.marker();
-        assert_eq!(
-            boot[..6],
-            [
-                b'T',
-                b'B',
-                4,
-                0,
-                MARKER_FORMAT,
-                crate::AGENT_PROTOCOL_VERSION
-            ]
-        );
-        assert_eq!(boot[6..], abi);
+        assert_eq!(boot[..5], [b'T', b'B', 3, 0, crate::AGENT_PROTOCOL_VERSION]);
+        assert_eq!(boot[5..], abi);
         let kernel = GuestImage::Kernel.marker();
-        assert_eq!(kernel[..6], [b'T', b'K', 4, 0, MARKER_FORMAT, 0]);
-        assert_eq!(kernel[6..], abi);
+        assert_eq!(kernel[..5], [b'T', b'K', 3, 0, 0]);
+        assert_eq!(kernel[5..], abi);
         GuestImage::Boot.validate(Some(&boot)).unwrap();
         GuestImage::Kernel.validate(Some(&kernel)).unwrap();
         assert!(GuestImage::Kernel.validate(Some(&boot)).is_err());
@@ -84,9 +88,9 @@ mod tests {
 
     #[test]
     fn missing_truncated_extended_or_changed_markers_are_rejected() {
-        for (image, rebuild_hint) in [
-            (GuestImage::Boot, "rebuild the kernel, agent"),
-            (GuestImage::Kernel, "rebuild the matching"),
+        for (image, name) in [
+            (GuestImage::Boot, "guest boot image"),
+            (GuestImage::Kernel, "guest kernel"),
         ] {
             let extra = image.marker();
             assert!(image.validate(None).is_err());
@@ -101,32 +105,10 @@ mod tests {
                 changed[index] ^= 1;
                 let error = image.validate(Some(&changed)).unwrap_err();
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-                assert!(error.to_string().contains(rebuild_hint));
+                let message = error.to_string();
+                assert!(message.starts_with(name), "{message}");
+                assert!(message.contains("rebuild the kernel, agent"), "{message}");
             }
-        }
-    }
-
-    #[test]
-    fn marked_gzip_remains_deterministic_and_decodes_as_an_ordinary_image() {
-        for extra in [GuestImage::Boot.marker(), GuestImage::Kernel.marker()] {
-            let image = b"guest artifact payload";
-            let compress = || {
-                let mut encoder = flate2::GzBuilder::new()
-                    .mtime(0)
-                    .extra(extra.to_vec())
-                    .write(Vec::new(), flate2::Compression::best());
-                encoder.write_all(image).unwrap();
-                encoder.finish().unwrap()
-            };
-            let compressed = compress();
-            assert_eq!(compressed, compress());
-            let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
-            let header = decoder.header().unwrap();
-            assert_eq!(header.mtime(), 0);
-            assert_eq!(header.extra(), Some(extra.as_slice()));
-            let mut restored_image = Vec::new();
-            decoder.read_to_end(&mut restored_image).unwrap();
-            assert_eq!(restored_image, image);
         }
     }
 }

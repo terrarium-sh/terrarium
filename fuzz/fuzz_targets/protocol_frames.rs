@@ -1,8 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use std::io::Cursor;
-use terra_protocol::{AgentOutput, ClientInput, ControlReply, ControlRequest};
+use terra_protocol::{AgentOutput, ClientInput, SessionControlReply, SessionControlRequest};
 
 /// Every frame that decodes re-encodes within its limit and decodes back to itself.
 fn round_trip<T>(mut bytes: &[u8])
@@ -24,7 +23,6 @@ where
 }
 
 fn decode_agent(bytes: &[u8]) {
-    let _ = terra_protocol::read_frame::<terra_protocol::AgentService>(&mut Cursor::new(bytes));
     let events = terra_agent_component::read_lifecycle_frames_for_fuzzing(bytes);
     assert!(events.len() * 5 <= bytes.len());
     for event in events {
@@ -32,16 +30,10 @@ fn decode_agent(bytes: &[u8]) {
             assert!(bytes.len() <= terra_protocol::MAX_DIAGNOSTIC_EVENT_BYTES);
         }
     }
-    if let Some(frame) = terra_runtime::component::agent::enrich_boot_plan_for_fuzzing(bytes) {
-        let mut frame_bytes = frame.as_slice();
-        let decoded = terra_protocol::read_frame::<terra_protocol::Plan>(&mut frame_bytes);
-        assert!(decoded.is_ok_and(|plan| plan.is_some()));
-        assert_eq!(frame_bytes, []);
-    }
 }
 
 fn answer_dns(query: &[u8]) {
-    use terra_protocol::{dns, network_control::DnsTransport};
+    use terra_protocol::dns::{self, DnsTransport};
     let _ = dns::error_response(query, dns::Rcode::NxDomain);
     let Some(question) = dns::Question::parse(query) else {
         return;
@@ -51,7 +43,7 @@ fn answer_dns(query: &[u8]) {
         std::net::Ipv6Addr::LOCALHOST.into(),
     ];
     let response = question.answer(&addresses, DnsTransport::Stream);
-    assert!(response.len() <= terra_protocol::socket::MAX_DNS_BYTES);
+    assert!(response.len() <= terra_protocol::dns::MAX_DNS_BYTES);
     let response = question.answer(&addresses, DnsTransport::Datagram);
     assert!(response.len() <= 512);
     let _ = question.error(dns::Rcode::ServFail);
@@ -69,14 +61,16 @@ fuzz_target!(|bytes: &[u8]| {
     round_trip::<terra_protocol::LifecycleEvent>(bytes);
     round_trip::<ClientInput>(bytes);
     round_trip::<AgentOutput>(bytes);
-    round_trip::<ControlRequest>(bytes);
-    round_trip::<ControlReply>(bytes);
+    round_trip::<SessionControlRequest>(bytes);
+    round_trip::<SessionControlReply>(bytes);
+    round_trip::<terra_protocol::HostState>(bytes);
     round_trip::<terra_protocol::network::Open>(bytes);
-    round_trip::<Result<terra_protocol::network::Opened, terra_protocol::network::Error>>(bytes);
+    round_trip::<Result<terra_protocol::network::Resolved, terra_protocol::socket::Error>>(bytes);
+    round_trip::<Result<(), terra_protocol::socket::Error>>(bytes);
     round_trip::<terra_protocol::network::TcpEvent>(bytes);
     round_trip::<terra_protocol::network::UdpRequest>(bytes);
     round_trip::<terra_protocol::network::UdpReply>(bytes);
-    round_trip::<terra_protocol::network_control::AgentControl>(bytes);
+    round_trip::<terra_protocol::network_control::DnsQuery>(bytes);
     round_trip::<terra_protocol::network_control::FrontendControl>(bytes);
     round_trip::<terra_protocol::network_control::Publication>(bytes);
 });

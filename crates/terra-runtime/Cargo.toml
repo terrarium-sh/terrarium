@@ -11,13 +11,13 @@ default = []
 # The shipped device runtime only deserializes artifacts produced by the
 # trusted build. Keep Cranelift out of that dependency graph.
 compiler = ["wasmtime/cranelift"]
-test-support = ["terra-protocol/test-support"]
+test-support = ["terra-protocol/test-support", "terra-protocol/tokio"]
 
 [dependencies]
 terra-hypervisor = { path = "../terra-hypervisor" }
 terra-platform = { path = "../terra-platform" }
 terra-network = { path = "../terra-network" }
-terra-protocol = { path = "../terra-protocol", features = ["packed-image"] }
+terra-protocol = { path = "../terra-protocol", features = ["packed-image", "mux"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
@@ -38,7 +38,6 @@ rustix.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
-terra-protocol = { path = "../terra-protocol", features = ["mux", "test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }

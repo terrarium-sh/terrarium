@@ -6,7 +6,8 @@ use std::time::Duration;
 use terra_platform::local_socket::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::mux::MAX_STREAM_WINDOW_BYTES;
 
-use support::{AgentGuest, plan_frame, yamux_frame};
+use support::{AgentGuest, plan_frame};
+use terra_runtime::test_support::yamux;
 
 const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
@@ -50,18 +51,32 @@ async fn client_round_trip_preserves_large_payloads() {
                 }
             }
             for frame in agent.drain_yamux() {
-                if frame.stream != 2 {
+                if frame.stream != yamux::FIRST_CLIENT_STREAM_ID {
                     continue;
                 }
-                if frame.flags & 1 != 0 {
-                    agent.send_session(&yamux_frame(1, 2, 2, 0, &[])).await;
+                if frame.flags & yamux::SYN != 0 {
+                    agent
+                        .send_session(&yamux::encode(
+                            yamux::WINDOW_UPDATE,
+                            yamux::ACK,
+                            yamux::FIRST_CLIENT_STREAM_ID,
+                            0,
+                            &[],
+                        ))
+                        .await;
                 }
-                if frame.kind == 0 && !frame.payload.is_empty() {
+                if frame.kind == yamux::DATA && !frame.payload.is_empty() {
                     received.extend_from_slice(&frame.payload);
                     agent
-                        .send_session(&yamux_frame(1, 0, 2, frame.value, &[]))
+                        .send_session(&yamux::encode(
+                            yamux::WINDOW_UPDATE,
+                            0,
+                            yamux::FIRST_CLIENT_STREAM_ID,
+                            frame.value,
+                            &[],
+                        ))
                         .await;
-                } else if frame.kind == 1 {
+                } else if frame.kind == yamux::WINDOW_UPDATE {
                     send_credit += frame.value as usize;
                 }
             }
@@ -73,13 +88,14 @@ async fn client_round_trip_preserves_large_payloads() {
                     .min(8192)
                     .min(send_credit);
                 agent
-                    .send_session(&yamux_frame(
-                        0,
-                        0,
-                        2,
-                        u32::try_from(length).expect("bounded frame length"),
-                        &response[response_written..response_written + length],
-                    ))
+                    .send_session(
+                        &yamux::data(
+                            0,
+                            yamux::FIRST_CLIENT_STREAM_ID,
+                            &response[response_written..response_written + length],
+                        )
+                        .expect("bounded frame length"),
+                    )
                     .await;
                 response_written += length;
                 send_credit -= length;
@@ -116,7 +132,15 @@ async fn control_progress_survives_stalled_bulk_delivery() {
     agent.negotiate().await;
     agent.read_plan().await;
     wait_for_client_stream(&mut agent).await;
-    agent.send_session(&yamux_frame(1, 2, 2, 0, &[])).await;
+    agent
+        .send_session(&yamux::encode(
+            yamux::WINDOW_UPDATE,
+            yamux::ACK,
+            yamux::FIRST_CLIENT_STREAM_ID,
+            0,
+            &[],
+        ))
+        .await;
     let payload = vec![b'x'; PAYLOAD_BYTES];
     let mut written = 0;
     let mut received = 0;
@@ -132,7 +156,9 @@ async fn control_progress_survives_stalled_bulk_delivery() {
             received += agent
                 .drain_yamux()
                 .into_iter()
-                .filter(|frame| frame.kind == 0 && frame.stream == 2)
+                .filter(|frame| {
+                    frame.kind == yamux::DATA && frame.stream == yamux::FIRST_CLIENT_STREAM_ID
+                })
                 .map(|frame| frame.payload.len())
                 .sum::<usize>();
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -162,7 +188,7 @@ async fn control_progress_survives_stalled_bulk_delivery() {
         agent
             .drain_yamux()
             .iter()
-            .all(|frame| frame.stream != 2 || frame.payload.is_empty())
+            .all(|frame| frame.stream != yamux::FIRST_CLIENT_STREAM_ID || frame.payload.is_empty())
     );
     agent.endpoint.disconnect(agent.connection_number);
     wait_for_client_eof(&mut client).await;
@@ -207,7 +233,15 @@ async fn cancelling_client_stream_preserves_agent_readiness() {
                 .expect("ready frame"),
         )
         .await;
-    agent.send_session(&yamux_frame(0, 8, 2, 0, &[])).await;
+    agent
+        .send_session(&yamux::encode(
+            yamux::DATA,
+            yamux::RST,
+            yamux::FIRST_CLIENT_STREAM_ID,
+            0,
+            &[],
+        ))
+        .await;
     wait_for_client_eof(&mut client).await;
     tokio::time::timeout(Duration::from_secs(1), async {
         while !agent.lifecycle.is_agent_ready() {
@@ -223,11 +257,9 @@ async fn cancelling_client_stream_preserves_agent_readiness() {
 async fn wait_for_client_stream(agent: &mut AgentGuest) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if agent
-                .drain_yamux()
-                .iter()
-                .any(|frame| frame.stream == 2 && frame.flags & 1 != 0)
-            {
+            if agent.drain_yamux().iter().any(|frame| {
+                frame.stream == yamux::FIRST_CLIENT_STREAM_ID && frame.flags & yamux::SYN != 0
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;

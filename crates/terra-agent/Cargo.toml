@@ -11,7 +11,7 @@ anyhow = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["io", "std"] }
 sha2 = { version = "0.11", default-features = false }
 terra-protocol = { path = "../terra-protocol", features = ["tokio", "mux"] }
-yamux = "0.14.1"
+yamux = "=0.14.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
@@ -25,6 +25,7 @@ rustix.workspace = true
 vt100 = "0.18"
 
 [dev-dependencies]
+terra-protocol = { path = "../terra-protocol", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints]

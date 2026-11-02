@@ -8,14 +8,14 @@ Guest CID 3 initiates streams to host CID 2:
 | --- | --- | --- | --- | --- |
 | Agent | 6000 | 6000 | 64 KiB | 256 KiB |
 | Control | 6001 | 6001 | 32 KiB | 128 KiB |
-| TCP | Nonzero, excluding 6000/6001/6004 | 6002 | 48 KiB per flow | 80 KiB per flow |
-| UDP | Nonzero, excluding 6000/6001/6004 | 6003 | 48 KiB per flow | 80 KiB per flow |
-| Publication (frontend initiated) | 6004 | `0x100000..0x200000` | 48 KiB per flow | 80 KiB per flow |
+| TCP | Nonzero, excluding 6000/6001/6004 | 6002 | 64 KiB per flow | 80 KiB per flow |
+| UDP | Nonzero, excluding 6000/6001/6004 | 6003 | 64 KiB per flow | 80 KiB per flow |
+| Publication (frontend initiated) | 6004 | `0x100000..0x200000` | 64 KiB per flow | 80 KiB per flow |
 
 TCP, UDP, and publication share the frontend's configured admission limit,
-at most 128 sockets. Retiring flows keep their slot until the frontend releases
-their binding and queued reset. Flow input windows total at most 6 MiB;
-flow replies and outstanding send credits total at most 10 MiB. Agent and control
+at most 1024 sockets. Retiring flows keep their slot until the frontend releases
+their binding and queued reset. Flow input windows total at most 64 MiB;
+flow replies and outstanding send credits total at most 80 MiB. Agent and control
 reserves are separate. Guest-initiated publication requests are refused.
 TCP publication consumes one stream per accepted host connection; UDP
 publication consumes one stream per listener family.

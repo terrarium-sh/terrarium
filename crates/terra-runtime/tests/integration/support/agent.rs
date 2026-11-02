@@ -8,6 +8,7 @@ use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
 use terra_runtime::component::agent::Agent;
 use terra_runtime::component::vmm::lifecycle::LifecycleNotifier;
 use terra_runtime::component::vsock::streams::{STREAM_BUFFER_BYTES, StreamEndpoint};
+use terra_runtime::test_support::yamux;
 
 pub struct AgentGuest {
     pub endpoint: StreamEndpoint,
@@ -20,7 +21,7 @@ pub struct AgentGuest {
     teardown: terra_runtime::component::vmm::teardown::NativeTeardown,
     control_bytes: Vec<u8>,
     session_bytes: Vec<u8>,
-    frames: VecDeque<YamuxFrame>,
+    frames: VecDeque<yamux::Frame>,
 }
 
 impl AgentGuest {
@@ -74,18 +75,14 @@ impl AgentGuest {
         self.endpoint
             .connect(self.connection_number)
             .expect("connect");
-        let mut streams = yamux_frame(0, 1, terra_protocol::mux::CONTROL_STREAM_ID, 0, &[]);
-        streams.extend(yamux_frame(
-            0,
-            1,
-            terra_protocol::mux::DIAGNOSTIC_STREAM_ID,
-            0,
-            &[],
-        ));
+        let streams: Vec<u8> = terra_protocol::mux::RESERVED_STREAM_IDS
+            .into_iter()
+            .flat_map(|stream| yamux::encode(yamux::DATA, yamux::SYN, stream, 0, &[]))
+            .collect();
         self.send_session(&streams).await;
     }
 
-    pub fn drain_control(&mut self) {
+    pub fn drain_session(&mut self) {
         while let Ok(bytes) = self
             .endpoint
             .try_read(self.connection_number, self.read_limit)
@@ -95,36 +92,19 @@ impl AgentGuest {
             }
             self.session_bytes.extend(bytes);
         }
-        while self.session_bytes.len() >= 12 {
-            let bytes = &self.session_bytes;
-            let kind = bytes[1];
-            let flags = u16::from_be_bytes(bytes[2..4].try_into().expect("flags"));
-            let stream = u32::from_be_bytes(bytes[4..8].try_into().expect("stream"));
-            let value = u32::from_be_bytes(bytes[8..12].try_into().expect("value"));
-            let length = if kind == 0 { value as usize } else { 0 };
-            if bytes.len() < 12 + length {
-                break;
-            }
-            let payload = bytes[12..12 + length].to_vec();
-            if kind == 0 && stream == terra_protocol::mux::CONTROL_STREAM_ID {
-                self.control_bytes.extend(payload);
+        while let Some(frame) = yamux::take_frame(&mut self.session_bytes).expect("yamux frame") {
+            if frame.kind == yamux::DATA && frame.stream == terra_protocol::mux::CONTROL_STREAM_ID {
+                self.control_bytes.extend(frame.payload);
             } else {
-                self.frames.push_back(YamuxFrame {
-                    kind,
-                    flags,
-                    stream,
-                    value,
-                    payload,
-                });
+                self.frames.push_back(frame);
             }
-            self.session_bytes.drain(..12 + length);
         }
     }
 
     pub async fn read_control(&mut self, length: usize) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(2), async {
             while self.control_bytes.len() < length {
-                self.drain_control();
+                self.drain_session();
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             self.control_bytes.drain(..length).collect()
@@ -133,8 +113,11 @@ impl AgentGuest {
         .expect("control progress deadline")
     }
 
+    /// Reads the boot plan and the host state frame that follows it.
     pub async fn read_plan(&mut self) -> terra_protocol::Plan {
-        self.read_control_message().await
+        let plan = self.read_control_message().await;
+        let _: terra_protocol::HostState = self.read_control_message().await;
+        plan
     }
 
     async fn read_control_message<T: terra_protocol::Message>(&mut self) -> T {
@@ -145,13 +128,9 @@ impl AgentGuest {
     }
 
     pub async fn send_control(&mut self, bytes: &[u8]) {
-        self.send_session(&yamux_frame(
-            0,
-            0,
-            terra_protocol::mux::CONTROL_STREAM_ID,
-            u32::try_from(bytes.len()).expect("control frame length"),
-            bytes,
-        ))
+        self.send_session(
+            &yamux::data(0, terra_protocol::mux::CONTROL_STREAM_ID, bytes).expect("control frame"),
+        )
         .await;
     }
 
@@ -159,8 +138,8 @@ impl AgentGuest {
         loop {
             match self.read_control_message().await {
                 terra_protocol::AgentCommand::Stop => return,
-                terra_protocol::AgentCommand::SyncClock { nanoseconds, .. } => {
-                    assert!(nanoseconds < 1_000_000_000);
+                terra_protocol::AgentCommand::SyncClock(time) => {
+                    assert!(time.nanoseconds < 1_000_000_000);
                 }
             }
         }
@@ -176,7 +155,7 @@ impl AgentGuest {
                     .try_write(self.connection_number, chunk)
                     .expect("session bytes");
                 if written < bytes.len() {
-                    self.drain_control();
+                    self.drain_session();
                     tokio::task::yield_now().await;
                 }
             }
@@ -185,8 +164,8 @@ impl AgentGuest {
         .expect("guest write deadline");
     }
 
-    pub fn drain_yamux(&mut self) -> Vec<YamuxFrame> {
-        self.drain_control();
+    pub fn drain_yamux(&mut self) -> Vec<yamux::Frame> {
+        self.drain_session();
         self.frames.drain(..).collect()
     }
 
@@ -223,23 +202,6 @@ impl AgentGuest {
             .await
             .expect("failed runtime shutdown deadline");
     }
-}
-
-pub struct YamuxFrame {
-    pub kind: u8,
-    pub flags: u16,
-    pub stream: u32,
-    pub value: u32,
-    pub payload: Vec<u8>,
-}
-
-pub fn yamux_frame(kind: u8, flags: u16, stream: u32, value: u32, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![0, kind];
-    bytes.extend(flags.to_be_bytes());
-    bytes.extend(stream.to_be_bytes());
-    bytes.extend(value.to_be_bytes());
-    bytes.extend(payload);
-    bytes
 }
 
 pub fn plan_frame() -> Vec<u8> {

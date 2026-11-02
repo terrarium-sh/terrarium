@@ -2,8 +2,16 @@
 
 use std::net::IpAddr;
 
-use crate::network_control::DnsTransport;
-use crate::socket::MAX_DNS_BYTES;
+use serde::{Deserialize, Serialize};
+
+pub const MAX_DNS_BYTES: usize = 4096;
+
+/// How the guest sent a DNS query: as one datagram, or on a TCP stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DnsTransport {
+    Datagram,
+    Stream,
+}
 
 /// The question name starts right after the fixed header.
 const QUESTION_NAME_OFFSET: u8 = 12;

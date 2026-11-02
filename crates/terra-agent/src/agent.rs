@@ -423,11 +423,8 @@ pub(crate) async fn watch_control(
             loop {
                 match terra_protocol::read_frame_async::<AgentCommand>(&mut control).await {
                     Ok(None | Some(AgentCommand::Stop)) => break,
-                    Ok(Some(AgentCommand::SyncClock {
-                        seconds,
-                        nanoseconds,
-                    })) => {
-                        if let Err(error) = bootstrap::sync_clock(seconds, nanoseconds) {
+                    Ok(Some(AgentCommand::SyncClock(time))) => {
+                        if let Err(error) = bootstrap::sync_clock(time) {
                             eprintln!("terra-agent: clock update failed ({error:#})");
                         }
                     }

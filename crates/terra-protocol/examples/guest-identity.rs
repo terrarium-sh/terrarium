@@ -23,8 +23,11 @@ fn main() -> std::io::Result<()> {
 mod unix {
     use std::{fmt::Write as _, fs, io, io::Write, os::unix::fs::PermissionsExt, path::Path};
 
-    use terra_protocol::guest_root::{SUBORDINATE_ID_COUNT, SUBORDINATE_ID_START};
     use terra_protocol::{WORKLOAD_HOME, WORKLOAD_ID, WORKLOAD_USER_NAME};
+
+    /// First subordinate uid and gid the workload user owns, for rootless containers.
+    const SUBORDINATE_ID_START: u32 = 100_000;
+    const SUBORDINATE_ID_COUNT: u32 = 65_536;
 
     const CONTAINERS_CONF_DIR: &str = ".config/containers";
     const CONTAINERS_CONF: &str = "[engine]\ncgroup_manager = \"cgroupfs\"\n";
@@ -94,7 +97,7 @@ mod unix {
         use std::os::unix::fs::MetadataExt;
 
         use super::*;
-        use terra_protocol::guest_root::PER_BOOT_LINKS;
+        use terra_protocol::guest_root::{PER_BOOT_DIR, PER_BOOT_LINKS};
 
         fn seeded_tree() -> tempfile::TempDir {
             let tree = tempfile::tempdir().unwrap();
@@ -144,9 +147,9 @@ mod unix {
         fn links_replace_existing_files_and_directories() {
             let tree = seeded_tree();
             write_identity(tree.path(), &tree.path().join("owners")).unwrap();
-            for (link, target) in PER_BOOT_LINKS {
+            for (link, name) in PER_BOOT_LINKS {
                 let read = fs::read_link(join(tree.path(), link)).unwrap();
-                assert_eq!(read, Path::new(target), "{link}");
+                assert_eq!(read, Path::new(PER_BOOT_DIR).join(name), "{link}");
             }
             assert!(tree.path().join("terra").is_dir());
         }

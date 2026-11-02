@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the fixed vsock device, endpoints, and reviewed kernel buffer limits."""
+"""Check the fixed vsock device, the kernel endpoint set, and reviewed kernel-only buffer limits."""
 
 from pathlib import Path
 import re
@@ -18,11 +18,7 @@ def parse_constant(source, expression, description):
     declaration = re.search(expression, source, re.MULTILINE)
     if declaration is None:
         raise ValueError(f'Cannot verify {description}; rebuild matching vsock artifacts.')
-    factors = declaration[1].replace('_', '').split('*')
-    value = 1
-    for factor in factors:
-        value *= int(factor.strip(), 0 if factor.strip().startswith('0x') else 10)
-    return value
+    return int(declaration[1].replace('_', ''))
 
 
 def validate_device_id(source):
@@ -47,32 +43,29 @@ def validate_patch_series(patches):
         raise ValueError('Active kernel patches must be exactly 0001, 0002 and 0004-terra-socket-vsock.patch.')
 
 
-def validate_endpoints(protocol_source, kernel_source):
-    for name, expected in (('HOST_CID', 2), ('GUEST_CID', 3), ('AGENT_PORT', 6000),
-                           ('CONTROL_PORT', 6001), ('TCP_PORT', 6002), ('UDP_PORT', 6003),
-                           ('PUBLICATION_PORT', 6004)):
-        value = parse_constant(protocol_source, rf'^pub const {name}: u32 = ([0-9_]+);$', name)
-        if value != expected:
-            raise ValueError(f'Fixed vsock {name} must be {expected}.')
+def validate_endpoints(kernel_source):
     endpoints = set()
     for declaration in re.findall(r'^\s*struct sockaddr_vm \w+ = \{([^}]+)\};',
                                   kernel_source, re.MULTILINE):
-        cid = parse_constant(declaration, r'\.svm_cid\s*=\s*([0-9_]+)', 'kernel CID')
+        cid = re.search(r'\.svm_cid\s*=\s*(\w+)', declaration)
+        if cid is None:
+            raise ValueError('Every kernel vsock endpoint must name its .svm_cid.')
+        cid = cid[1]
         if '.svm_port = VMADDR_PORT_ANY' in declaration:
-            if cid != 3:
+            if cid != 'TERRA_GUEST_CID':
                 raise ValueError('Dynamic flow source ports require guest CID 3.')
             continue
-        port = re.search(r'\.svm_port\s*=\s*(\w+)', declaration)[1]
-        endpoints.add((cid, port))
-    if endpoints != {(2, 'TERRA_TCP_PORT'), (2, 'TERRA_UDP_PORT')}:
+        port = re.search(r'\.svm_port\s*=\s*(\w+)', declaration)
+        if port is None:
+            raise ValueError('Every kernel vsock endpoint must name its .svm_port.')
+        endpoints.add((cid, port[1]))
+    if endpoints != {('TERRA_HOST_CID', 'TERRA_TCP_PORT'), ('TERRA_HOST_CID', 'TERRA_UDP_PORT')}:
         raise ValueError('The kernel opens only dynamic per-socket streams to host TCP 6002 and UDP 6003.')
 
 
 def validate_kernel_buffers(kernel_source):
     for name, expected in (('TERRA_TCP_SEGMENT_BYTES', 65535),
-                           ('TERRA_TCP_RECEIVE_BYTES', 81920),
                            ('TERRA_TCP_SEND_BYTES', 49152),
-                           ('TERRA_UDP_CARRIER_BYTES', 65536),
                            ('TERRA_UDP_QUEUE_BYTES', 131072),
                            ('TERRA_UDP_QUEUED_DATAGRAMS', 48)):
         value = parse_constant(kernel_source, rf'^#define {name} ([0-9_]+)$', name)
@@ -89,7 +82,7 @@ def load_kernel_source(root):
 
 
 def check(root=ROOT):
-    patches = {path.name: path.read_text() for path in (root / 'kernel/patches').glob('*.patch')}
+    patches = {path.name for path in (root / 'kernel/patches').glob('*.patch')}
     validate_patch_series(patches)
     kernel_source = load_kernel_source(root)
     validate_kernel_buffers(kernel_source)
@@ -97,7 +90,7 @@ def check(root=ROOT):
     for architecture in ('x86_64', 'aarch64'):
         validate_kernel_config(common_config + '\n' + (root / f'kernel/{architecture}.config').read_text())
     validate_device_id((root / 'components/vsock-frontend/src/transport.rs').read_text())
-    validate_endpoints((root / 'crates/terra-protocol/src/vsock.rs').read_text(), kernel_source)
+    validate_endpoints(kernel_source)
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ mod reap;
 mod services;
 mod session;
 mod sync;
+mod vsock;
 mod workload;
 
 use {

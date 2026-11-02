@@ -1,7 +1,10 @@
+use super::SyncDirection;
 use super::plan::PlanAction;
-use super::scan::{checked_host_path, meta_mtime_nanos, meta_mtime_secs, optional_metadata};
+use super::scan::{
+    checked_host_path, join_relative, meta_mtime_nanos, meta_mtime_secs, optional_metadata,
+};
 use super::security::{
-    sanitize_guest_error_message, to_guest_mode, to_safe_mode, validate_download_symlink_target,
+    printable_guest_error, to_guest_mode, to_safe_mode, validate_download_symlink_target,
 };
 use crate::sys;
 use crate::vm::image;
@@ -10,7 +13,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use terra_protocol::{
-    MAX_FILE_BYTES, SyncDirection, SyncReply, SyncRequest, read_frame_async, write_frame_async,
+    MAX_SYNC_FILE_BYTES, SyncReply, SyncRequest, read_frame_async, write_frame_async,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -24,8 +27,20 @@ pub(super) async fn read_reply(stream: &mut (impl AsyncRead + Unpin)) -> Result<
         .context("reading agent reply")?
         .ok_or_else(|| anyhow::anyhow!("agent closed connection without replying"))?;
     match reply {
-        SyncReply::Err(err) => anyhow::bail!("guest: {}", sanitize_guest_error_message(&err)),
+        SyncReply::Err(err) => anyhow::bail!("guest: {}", printable_guest_error(&err)),
         other => Ok(other),
+    }
+}
+
+async fn expect_success(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    request: &SyncRequest,
+    what: &str,
+) -> Result<()> {
+    send_request(stream, request).await?;
+    match read_reply(stream).await? {
+        SyncReply::Success => Ok(()),
+        other => anyhow::bail!("expected Success after {what}, got {other:?}"),
     }
 }
 
@@ -106,10 +121,10 @@ async fn send_file_into_guest(
 ) -> Result<u64> {
     let size = meta.len();
     anyhow::ensure!(
-        size <= MAX_FILE_BYTES,
+        size <= MAX_SYNC_FILE_BYTES,
         "file {} is {size} bytes, past the {} GiB sync limit",
         host_path.display(),
-        MAX_FILE_BYTES >> 30
+        MAX_SYNC_FILE_BYTES >> 30
     );
     let mtime_secs = meta_mtime_secs(meta);
     let mtime_nanos = meta_mtime_nanos(meta);
@@ -161,12 +176,7 @@ async fn send_file_into_guest(
         after.len() == size && after.modified()? == meta.modified()?,
         "source changed while transferring; retry with a quiet source"
     );
-    send_request(stream, &SyncRequest::CommitFile).await?;
-
-    match read_reply(stream).await? {
-        SyncReply::Success => {}
-        other => anyhow::bail!("expected Success after file transfer, got {other:?}"),
-    }
+    expect_success(stream, &SyncRequest::CommitFile, "file transfer").await?;
     Ok(sent)
 }
 
@@ -199,12 +209,6 @@ async fn fetch_file_from_guest(
         (size, mode & 0o777, mtime_secs, mtime_nanos) == *expected,
         "guest file metadata changed since planning; retry with a quiet source"
     );
-    anyhow::ensure!(
-        size <= MAX_FILE_BYTES,
-        "remote file is {size} bytes, past the {} GiB sync limit",
-        MAX_FILE_BYTES >> 30
-    );
-
     if let Some(parent) = dst_full_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating directory {}", parent.display()))?;
@@ -255,45 +259,95 @@ pub(super) struct SyncStats {
     pub(super) transferred_bytes: u64,
 }
 
-type TransferItem<'a> = (&'a String, Option<(u64, u32, i64, u32)>, Option<&'a String>);
+struct DirToCreate<'a> {
+    rel_path: &'a str,
+    mode: u32,
+}
 
-fn dry_run_report(
-    create_dirs: &[(&String, u32)],
-    transfers_and_symlinks: &[TransferItem<'_>],
-    file_meta_updates: &[(&String, u32, i64, u32)],
-    deletions: &[(&String, bool)],
-    dir_meta_updates: &[(&String, u32, i64, u32)],
-) -> SyncStats {
-    let mut stats = SyncStats::default();
-    for (rel, _) in create_dirs {
-        let rel = crate::render::escape_printable(rel);
-        eprintln!("terra: [dry-run] mkdir {rel}");
-    }
-    for (rel, file_info, link_target) in transfers_and_symlinks {
-        stats.copied_count += 1;
-        if let Some((size, _, _, _)) = file_info {
-            stats.transferred_bytes += *size;
-            let rel = crate::render::escape_printable(rel);
-            eprintln!("terra: [dry-run] copy {rel} ({size} bytes)");
-        } else if let Some(target) = link_target {
-            let target = crate::render::escape_printable(target);
-            let rel = crate::render::escape_printable(rel);
-            eprintln!("terra: [dry-run] symlink {rel} -> {target}");
+enum TransferItem<'a> {
+    File {
+        rel_path: &'a str,
+        expected: (u64, u32, i64, u32),
+    },
+    Symlink {
+        rel_path: &'a str,
+        target: &'a str,
+    },
+}
+
+struct MetadataUpdate<'a> {
+    rel_path: &'a str,
+    mode: u32,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+}
+
+impl<'a> MetadataUpdate<'a> {
+    const fn new(rel_path: &'a str, (mode, mtime_secs, mtime_nanos): (u32, i64, u32)) -> Self {
+        Self {
+            rel_path,
+            mode,
+            mtime_secs,
+            mtime_nanos,
         }
     }
-    for (rel, _, _, _) in file_meta_updates {
+
+    fn request(&self) -> SyncRequest {
+        SyncRequest::UpdateMetadata {
+            relative_path: self.rel_path.to_owned(),
+            mode: self.mode,
+            mtime_secs: self.mtime_secs,
+            mtime_nanos: self.mtime_nanos,
+        }
+    }
+}
+
+struct Deletion<'a> {
+    rel_path: &'a str,
+    is_dir: bool,
+}
+
+fn dry_run_report(
+    create_dirs: &[DirToCreate<'_>],
+    transfers_and_symlinks: &[TransferItem<'_>],
+    file_meta_updates: &[MetadataUpdate<'_>],
+    deletions: &[Deletion<'_>],
+    dir_meta_updates: &[MetadataUpdate<'_>],
+) -> SyncStats {
+    let mut stats = SyncStats::default();
+    for dir in create_dirs {
+        let rel = crate::render::escape_printable(dir.rel_path);
+        eprintln!("terra: [dry-run] mkdir {rel}");
+    }
+    for item in transfers_and_symlinks {
+        stats.copied_count += 1;
+        match item {
+            TransferItem::File { rel_path, expected } => {
+                let size = expected.0;
+                stats.transferred_bytes += size;
+                let rel = crate::render::escape_printable(rel_path);
+                eprintln!("terra: [dry-run] copy {rel} ({size} bytes)");
+            }
+            TransferItem::Symlink { rel_path, target } => {
+                let target = crate::render::escape_printable(target);
+                let rel = crate::render::escape_printable(rel_path);
+                eprintln!("terra: [dry-run] symlink {rel} -> {target}");
+            }
+        }
+    }
+    for update in file_meta_updates {
         stats.metadata_updated_count += 1;
-        let rel = crate::render::escape_printable(rel);
+        let rel = crate::render::escape_printable(update.rel_path);
         eprintln!("terra: [dry-run] chmod/mtime {rel}");
     }
-    for (rel, is_dir) in deletions {
+    for deletion in deletions {
         stats.deleted_count += 1;
-        let kind = if *is_dir { "dir" } else { "file" };
-        let rel = crate::render::escape_printable(rel);
+        let kind = if deletion.is_dir { "dir" } else { "file" };
+        let rel = crate::render::escape_printable(deletion.rel_path);
         eprintln!("terra: [dry-run] rm {kind} {rel}");
     }
-    for (rel, _, _, _) in dir_meta_updates {
-        let rel = crate::render::escape_printable(rel);
+    for update in dir_meta_updates {
+        let rel = crate::render::escape_printable(update.rel_path);
         eprintln!("terra: [dry-run] dir mtime {rel}");
     }
     stats
@@ -301,28 +355,20 @@ fn dry_run_report(
 
 async fn execute_create_dirs(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    create_dirs: &[(&String, u32)],
-    direction: SyncDirection,
-    host_target_root: &Path,
+    create_dirs: &[DirToCreate<'_>],
+    direction: SyncDirection<'_>,
 ) -> Result<()> {
-    for (rel_path, mode) in create_dirs {
+    for DirToCreate { rel_path, mode } in create_dirs {
         match direction {
-            SyncDirection::HostToGuest => {
-                send_request(
-                    stream,
-                    &SyncRequest::CreateDir {
-                        relative_path: (*rel_path).clone(),
-                        mode: *mode,
-                    },
-                )
-                .await?;
-                match read_reply(stream).await? {
-                    SyncReply::Success => {}
-                    other => anyhow::bail!("expected Success after CreateDir, got {other:?}"),
-                }
+            SyncDirection::HostToGuest { .. } => {
+                let request = SyncRequest::CreateDir {
+                    relative_path: (*rel_path).to_owned(),
+                    mode: *mode,
+                };
+                expect_success(stream, &request, "CreateDir").await?;
             }
-            SyncDirection::GuestToHost => {
-                let dir_path = checked_host_path(host_target_root, rel_path)?;
+            SyncDirection::GuestToHost { target } => {
+                let dir_path = checked_host_path(target, rel_path)?;
                 if let Some(meta) = optional_metadata(&dir_path)? {
                     anyhow::ensure!(meta.is_dir(), "destination directory is a file or symlink");
                 }
@@ -337,72 +383,87 @@ async fn execute_create_dirs(
 async fn execute_transfers_and_symlinks(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     transfers_and_symlinks: &[TransferItem<'_>],
-    direction: SyncDirection,
-    host_source_root: &Path,
-    host_target_root: &Path,
+    direction: SyncDirection<'_>,
     deadline: Instant,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    for (rel_path, file_info, link_target) in transfers_and_symlinks {
+    for item in transfers_and_symlinks {
         stats.copied_count += 1;
-        if let Some(expected) = file_info {
-            match direction {
-                SyncDirection::HostToGuest => {
-                    let local_file = if rel_path.is_empty() {
-                        host_source_root.to_path_buf()
-                    } else {
-                        host_source_root.join(rel_path)
-                    };
-                    let meta = std::fs::symlink_metadata(&local_file)
-                        .with_context(|| format!("reading {}", local_file.display()))?;
-                    anyhow::ensure!(
-                        meta.is_file()
-                            && (
-                                meta.len(),
-                                to_guest_mode(&meta),
-                                meta_mtime_secs(&meta),
-                                meta_mtime_nanos(&meta)
-                            ) == *expected,
-                        "host source changed since planning"
-                    );
-                    let sent = send_file_into_guest(stream, &local_file, rel_path, &meta, deadline)
-                        .await?;
-                    stats.transferred_bytes += sent;
-                }
-                SyncDirection::GuestToHost => {
-                    let local_file = checked_host_path(host_target_root, rel_path)?;
-                    let received =
-                        fetch_file_from_guest(stream, rel_path, &local_file, expected, deadline)
-                            .await?;
-                    stats.transferred_bytes += received;
-                }
+        match (item, direction) {
+            (TransferItem::File { rel_path, expected }, SyncDirection::HostToGuest { source }) => {
+                let local_file = join_relative(source, rel_path);
+                let meta = std::fs::symlink_metadata(&local_file)
+                    .with_context(|| format!("reading {}", local_file.display()))?;
+                anyhow::ensure!(
+                    meta.is_file()
+                        && (
+                            meta.len(),
+                            to_guest_mode(&meta),
+                            meta_mtime_secs(&meta),
+                            meta_mtime_nanos(&meta)
+                        ) == *expected,
+                    "host source changed since planning"
+                );
+                let sent =
+                    send_file_into_guest(stream, &local_file, rel_path, &meta, deadline).await?;
+                stats.transferred_bytes += sent;
             }
-        } else if let Some(target) = link_target {
-            match direction {
-                SyncDirection::HostToGuest => {
-                    send_request(
-                        stream,
-                        &SyncRequest::CreateSymlink {
-                            relative_path: (*rel_path).clone(),
-                            target: (*target).clone(),
-                        },
-                    )
-                    .await?;
-                    match read_reply(stream).await? {
-                        SyncReply::Success => {}
-                        other => {
-                            anyhow::bail!("expected Success after CreateSymlink, got {other:?}")
-                        }
-                    }
+            (
+                TransferItem::File { rel_path, expected },
+                SyncDirection::GuestToHost {
+                    target: host_target,
+                },
+            ) => {
+                let local_file = checked_host_path(host_target, rel_path)?;
+                let received =
+                    fetch_file_from_guest(stream, rel_path, &local_file, expected, deadline)
+                        .await?;
+                stats.transferred_bytes += received;
+            }
+            (TransferItem::Symlink { rel_path, target }, SyncDirection::HostToGuest { .. }) => {
+                let request = SyncRequest::CreateSymlink {
+                    relative_path: (*rel_path).to_owned(),
+                    target: (*target).to_owned(),
+                };
+                expect_success(stream, &request, "CreateSymlink").await?;
+            }
+            (
+                TransferItem::Symlink { rel_path, target },
+                SyncDirection::GuestToHost {
+                    target: host_target,
+                },
+            ) => {
+                validate_download_symlink_target(rel_path, target)?;
+                let link_path = checked_host_path(host_target, rel_path)?;
+                if let Some(parent) = link_path.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                SyncDirection::GuestToHost => {
-                    validate_download_symlink_target(rel_path, target)?;
-                    let link_path = checked_host_path(host_target_root, rel_path)?;
-                    if let Some(parent) = link_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    install_host_symlink(target, &link_path)?;
-                }
+                install_host_symlink(target, &link_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn execute_metadata_updates(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    updates: &[MetadataUpdate<'_>],
+    direction: SyncDirection<'_>,
+    what: &str,
+) -> Result<()> {
+    for update in updates {
+        match direction {
+            SyncDirection::HostToGuest { .. } => {
+                expect_success(stream, &update.request(), what).await?;
+            }
+            SyncDirection::GuestToHost { target } => {
+                let local_path = checked_host_path(target, update.rel_path)?;
+                update_host_metadata(
+                    &local_path,
+                    update.mode,
+                    update.mtime_secs,
+                    update.mtime_nanos,
+                )?;
             }
         }
     }
@@ -411,65 +472,31 @@ async fn execute_transfers_and_symlinks(
 
 async fn execute_file_meta_updates(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    file_meta_updates: &[(&String, u32, i64, u32)],
-    direction: SyncDirection,
-    host_target_root: &Path,
+    file_meta_updates: &[MetadataUpdate<'_>],
+    direction: SyncDirection<'_>,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    for (rel_path, mode, mtime_secs, mtime_nanos) in file_meta_updates {
-        stats.metadata_updated_count += 1;
-        match direction {
-            SyncDirection::HostToGuest => {
-                send_request(
-                    stream,
-                    &SyncRequest::UpdateMetadata {
-                        relative_path: (*rel_path).clone(),
-                        mode: *mode,
-                        mtime_secs: *mtime_secs,
-                        mtime_nanos: *mtime_nanos,
-                    },
-                )
-                .await?;
-                match read_reply(stream).await? {
-                    SyncReply::Success => {}
-                    other => anyhow::bail!("expected Success after UpdateMetadata, got {other:?}"),
-                }
-            }
-            SyncDirection::GuestToHost => {
-                let local_path = checked_host_path(host_target_root, rel_path)?;
-                update_host_metadata(&local_path, *mode, *mtime_secs, *mtime_nanos)?;
-            }
-        }
-    }
-    Ok(())
+    stats.metadata_updated_count += file_meta_updates.len();
+    execute_metadata_updates(stream, file_meta_updates, direction, "UpdateMetadata").await
 }
 
 async fn execute_deletions(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    deletions: &[(&String, bool)],
-    direction: SyncDirection,
-    host_target_root: &Path,
+    deletions: &[Deletion<'_>],
+    direction: SyncDirection<'_>,
     stats: &mut SyncStats,
 ) -> Result<()> {
-    for (rel_path, is_dir) in deletions {
+    for Deletion { rel_path, is_dir } in deletions {
         stats.deleted_count += 1;
         match direction {
-            SyncDirection::HostToGuest => {
-                send_request(
-                    stream,
-                    &SyncRequest::RemoveEntry {
-                        relative_path: (*rel_path).clone(),
-                        is_dir: *is_dir,
-                    },
-                )
-                .await?;
-                match read_reply(stream).await? {
-                    SyncReply::Success => {}
-                    other => anyhow::bail!("expected Success after RemoveEntry, got {other:?}"),
-                }
+            SyncDirection::HostToGuest { .. } => {
+                let request = SyncRequest::RemoveEntry {
+                    relative_path: (*rel_path).to_owned(),
+                };
+                expect_success(stream, &request, "RemoveEntry").await?;
             }
-            SyncDirection::GuestToHost => {
-                let target = checked_host_path(host_target_root, rel_path)?;
+            SyncDirection::GuestToHost { target } => {
+                let target = checked_host_path(target, rel_path)?;
                 if *is_dir {
                     std::fs::remove_dir(&target)
                         .with_context(|| format!("removing directory {}", target.display()))?;
@@ -483,47 +510,10 @@ async fn execute_deletions(
     Ok(())
 }
 
-async fn execute_dir_meta_updates(
-    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    dir_meta_updates: &[(&String, u32, i64, u32)],
-    direction: SyncDirection,
-    host_target_root: &Path,
-) -> Result<()> {
-    for (rel_path, mode, mtime_secs, mtime_nanos) in dir_meta_updates {
-        match direction {
-            SyncDirection::HostToGuest => {
-                send_request(
-                    stream,
-                    &SyncRequest::UpdateMetadata {
-                        relative_path: (*rel_path).clone(),
-                        mode: *mode,
-                        mtime_secs: *mtime_secs,
-                        mtime_nanos: *mtime_nanos,
-                    },
-                )
-                .await?;
-                match read_reply(stream).await? {
-                    SyncReply::Success => {}
-                    other => anyhow::bail!(
-                        "expected Success after directory UpdateMetadata, got {other:?}"
-                    ),
-                }
-            }
-            SyncDirection::GuestToHost => {
-                let local_path = checked_host_path(host_target_root, rel_path)?;
-                update_host_metadata(&local_path, *mode, *mtime_secs, *mtime_nanos)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(super) async fn execute_plan(
     actions: &[PlanAction],
-    direction: SyncDirection,
+    direction: SyncDirection<'_>,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    host_target_root: &Path,
-    host_source_root: &Path,
     is_dry_run: bool,
 ) -> Result<SyncStats> {
     let mut stats = SyncStats::default();
@@ -538,7 +528,10 @@ pub(super) async fn execute_plan(
     for action in actions {
         match action {
             PlanAction::CreateDir { rel_path, mode } => {
-                create_dirs.push((rel_path, *mode));
+                create_dirs.push(DirToCreate {
+                    rel_path,
+                    mode: *mode,
+                });
             }
             PlanAction::TransferFile {
                 rel_path,
@@ -547,14 +540,13 @@ pub(super) async fn execute_plan(
                 mtime_secs,
                 mtime_nanos,
             } => {
-                transfers_and_symlinks.push((
+                transfers_and_symlinks.push(TransferItem::File {
                     rel_path,
-                    Some((*size, *mode, *mtime_secs, *mtime_nanos)),
-                    None,
-                ));
+                    expected: (*size, *mode, *mtime_secs, *mtime_nanos),
+                });
             }
             PlanAction::CreateSymlink { rel_path, target } => {
-                transfers_and_symlinks.push((rel_path, None, Some(target)));
+                transfers_and_symlinks.push(TransferItem::Symlink { rel_path, target });
             }
             PlanAction::UpdateFileMetadata {
                 rel_path,
@@ -562,10 +554,16 @@ pub(super) async fn execute_plan(
                 mtime_secs,
                 mtime_nanos,
             } => {
-                file_meta_updates.push((rel_path, *mode, *mtime_secs, *mtime_nanos));
+                file_meta_updates.push(MetadataUpdate::new(
+                    rel_path,
+                    (*mode, *mtime_secs, *mtime_nanos),
+                ));
             }
             PlanAction::RemoveEntry { rel_path, is_dir } => {
-                deletions.push((rel_path, *is_dir));
+                deletions.push(Deletion {
+                    rel_path,
+                    is_dir: *is_dir,
+                });
             }
             PlanAction::UpdateDirMetadata {
                 rel_path,
@@ -573,7 +571,10 @@ pub(super) async fn execute_plan(
                 mtime_secs,
                 mtime_nanos,
             } => {
-                dir_meta_updates.push((rel_path, *mode, *mtime_secs, *mtime_nanos));
+                dir_meta_updates.push(MetadataUpdate::new(
+                    rel_path,
+                    (*mode, *mtime_secs, *mtime_nanos),
+                ));
             }
             PlanAction::Skip { .. } => {
                 stats.skipped_count += 1;
@@ -581,52 +582,43 @@ pub(super) async fn execute_plan(
         }
     }
 
-    create_dirs.sort_by_key(|(p, _)| p.len());
-    deletions.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
-    dir_meta_updates.sort_by_key(|(p, _, _, _)| std::cmp::Reverse(p.len()));
+    create_dirs.sort_by_key(|dir| dir.rel_path.len());
+    deletions.sort_by_key(|deletion| std::cmp::Reverse(deletion.rel_path.len()));
+    dir_meta_updates.sort_by_key(|update| std::cmp::Reverse(update.rel_path.len()));
 
     if is_dry_run {
-        let dry_stats = dry_run_report(
-            &create_dirs,
-            &transfers_and_symlinks,
-            &file_meta_updates,
-            &deletions,
-            &dir_meta_updates,
-        );
-        stats.copied_count = dry_stats.copied_count;
-        stats.transferred_bytes = dry_stats.transferred_bytes;
-        stats.metadata_updated_count = dry_stats.metadata_updated_count;
-        stats.deleted_count = dry_stats.deleted_count;
-        return Ok(stats);
+        return Ok(SyncStats {
+            skipped_count: stats.skipped_count,
+            ..dry_run_report(
+                &create_dirs,
+                &transfers_and_symlinks,
+                &file_meta_updates,
+                &deletions,
+                &dir_meta_updates,
+            )
+        });
     }
 
-    execute_create_dirs(stream, &create_dirs, direction, host_target_root).await?;
+    execute_create_dirs(stream, &create_dirs, direction).await?;
     execute_transfers_and_symlinks(
         stream,
         &transfers_and_symlinks,
         direction,
-        host_source_root,
-        host_target_root,
         deadline,
         &mut stats,
     )
     .await?;
-    execute_file_meta_updates(
+    execute_file_meta_updates(stream, &file_meta_updates, direction, &mut stats).await?;
+    execute_deletions(stream, &deletions, direction, &mut stats).await?;
+    execute_metadata_updates(
         stream,
-        &file_meta_updates,
+        &dir_meta_updates,
         direction,
-        host_target_root,
-        &mut stats,
+        "directory UpdateMetadata",
     )
     .await?;
-    execute_deletions(stream, &deletions, direction, host_target_root, &mut stats).await?;
-    execute_dir_meta_updates(stream, &dir_meta_updates, direction, host_target_root).await?;
 
-    send_request(stream, &SyncRequest::EndSession).await?;
-    anyhow::ensure!(
-        matches!(read_reply(stream).await?, SyncReply::Success),
-        "expected session completion"
-    );
+    expect_success(stream, &SyncRequest::EndSession, "EndSession").await?;
     Ok(stats)
 }
 
@@ -683,9 +675,13 @@ mod tests {
         let updates = [(String::from("file"), 0o755, 200, 0)];
         let error = execute_file_meta_updates(
             &mut peer(&[]),
-            &[(&updates[0].0, updates[0].1, updates[0].2, updates[0].3)],
-            SyncDirection::GuestToHost,
-            &root,
+            &[MetadataUpdate {
+                rel_path: &updates[0].0,
+                mode: updates[0].1,
+                mtime_secs: updates[0].2,
+                mtime_nanos: updates[0].3,
+            }],
+            SyncDirection::GuestToHost { target: &root },
             &mut SyncStats::default(),
         )
         .await
@@ -738,10 +734,10 @@ mod tests {
         assert!(
             execute_plan(
                 &actions,
-                SyncDirection::GuestToHost,
+                SyncDirection::GuestToHost {
+                    target: scratch.path(),
+                },
                 &mut guest,
-                scratch.path(),
-                Path::new("/guest"),
                 false
             )
             .await

@@ -447,7 +447,7 @@ fn validate_volume_names() {
         }
         try_parse(&y)
     };
-    let limit = terra_protocol::MAX_VOLUMES.min(crate::vm::MAX_GUEST_STORAGE_DEVICES);
+    let limit = crate::vm::MAX_GUEST_STORAGE_DEVICES;
     assert!(many(limit).is_ok());
     let err = many(limit + 1).unwrap_err().to_string();
     assert!(err.contains("at most"), "{err}");

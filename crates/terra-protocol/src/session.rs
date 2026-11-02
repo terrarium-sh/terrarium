@@ -6,6 +6,10 @@ use std::collections::BTreeMap;
 
 /// Terminal bytes one [`ClientInput::Keys`], [`AgentOutput::Out`] or [`AgentOutput::Err`] carries at most.
 pub const MAX_TERMINAL_CHUNK_BYTES: usize = 64 << 10;
+/// Clients one [`SessionControlReply::Clients`] lists at most.
+const MAX_SESSION_CLIENTS: usize = 1024;
+/// A [`SessionClient`] at its largest: a ten-byte id, the option tag and two three-byte sizes.
+const MAX_SESSION_CLIENT_BYTES: usize = 17;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermSize {
@@ -43,27 +47,49 @@ impl crate::Message for AgentOutput {
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlRequest {
+pub enum SessionControlRequest {
     List,
     Detach { id: u64 },
     DetachAll,
 }
 
-impl crate::Message for ControlRequest {
+impl crate::Message for SessionControlRequest {
     const MAX_PAYLOAD_BYTES: usize = 16;
 }
 
-/// The agent's answer to a [`ControlRequest`].
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlReply {
-    Client { id: u64, size: Option<TermSize> },
-    Done,
-    Detached { id: u64 },
-    Missing { id: u64 },
+/// One attached client in the answer to [`SessionControlRequest::List`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClient {
+    pub id: u64,
+    pub reported_size: Option<TermSize>,
 }
 
-impl crate::Message for ControlReply {
-    const MAX_PAYLOAD_BYTES: usize = 4096;
+/// How a [`SessionControlRequest::Detach`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetachOutcome {
+    Detached,
+    /// No client with that id was attached.
+    Missing,
+}
+
+/// The agent's answer to a [`SessionControlRequest`]. The variant tag keeps one request's
+/// reply from decoding as another's, as an empty listing and a detach would untagged.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionControlReply {
+    /// The answer to [`SessionControlRequest::List`].
+    Clients(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_SESSION_CLIENTS>")]
+        Vec<SessionClient>,
+    ),
+    /// The answer to [`SessionControlRequest::Detach`].
+    Detach(DetachOutcome),
+    /// The answer to [`SessionControlRequest::DetachAll`]: how many clients it detached.
+    DetachedAll(u64),
+}
+
+impl crate::Message for SessionControlReply {
+    /// The variant tag, the list's two-byte length varint, then every client at its largest.
+    const MAX_PAYLOAD_BYTES: usize = 1 + 2 + MAX_SESSION_CLIENTS * MAX_SESSION_CLIENT_BYTES;
 }
 
 /// `as_root` is the `--root` flag, and the agent resolves the command identity.
@@ -112,19 +138,27 @@ mod tests {
             &[2, 1]
         );
         assert_eq!(
-            &encode_frame(&ControlRequest::Detach { id: 7 }).unwrap()[4..],
+            &encode_frame(&SessionControlRequest::Detach { id: 7 }).unwrap()[4..],
             &[1, 7]
         );
         assert_eq!(
-            &encode_frame(&ControlReply::Client {
+            &encode_frame(&SessionControlReply::Clients(vec![SessionClient {
                 id: 7,
-                size: Some(TermSize {
+                reported_size: Some(TermSize {
                     rows: 40,
                     cols: 120
                 }),
-            })
+            }]))
             .unwrap()[4..],
-            &[0, 7, 1, 40, 120]
+            &[0, 1, 7, 1, 40, 120]
+        );
+        assert_eq!(
+            &encode_frame(&SessionControlReply::Detach(DetachOutcome::Missing)).unwrap()[4..],
+            &[1, 1]
+        );
+        assert_eq!(
+            &encode_frame(&SessionControlReply::DetachedAll(5)).unwrap()[4..],
+            &[2, 5]
         );
     }
 
@@ -204,38 +238,76 @@ mod tests {
     #[test]
     fn round_trip_control_requests() {
         for msg in [
-            ControlRequest::List,
-            ControlRequest::Detach { id: 0 },
-            ControlRequest::Detach { id: u64::MAX },
-            ControlRequest::DetachAll,
+            SessionControlRequest::List,
+            SessionControlRequest::Detach { id: 0 },
+            SessionControlRequest::Detach { id: u64::MAX },
+            SessionControlRequest::DetachAll,
         ] {
             let encoded = encode_frame(&msg).unwrap();
             let mut cur = std::io::Cursor::new(encoded);
             assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
         }
         let mut empty = std::io::Cursor::new(Vec::new());
-        assert_eq!(read_frame::<ControlRequest>(&mut empty).unwrap(), None);
+        assert_eq!(
+            read_frame::<SessionControlRequest>(&mut empty).unwrap(),
+            None
+        );
     }
 
+    /// Every control reply round-trips at its largest, and a listing past the client limit is
+    /// refused.
     #[test]
-    fn round_trip_control_replies() {
-        for msg in [
-            ControlReply::Client {
-                id: 7,
-                size: Some(TermSize {
-                    rows: 40,
-                    cols: 120,
-                }),
-            },
-            ControlReply::Client { id: 3, size: None },
-            ControlReply::Done,
-            ControlReply::Detached { id: 2 },
-            ControlReply::Missing { id: 9 },
+    fn control_replies_round_trip_at_their_limits() {
+        let largest = SessionClient {
+            id: u64::MAX,
+            reported_size: Some(TermSize {
+                rows: u16::MAX,
+                cols: u16::MAX,
+            }),
+        };
+        let full = SessionControlReply::Clients(vec![largest; MAX_SESSION_CLIENTS]);
+        let frame = encode_frame(&full).unwrap();
+        assert_eq!(
+            frame.len() - 4,
+            <SessionControlReply as crate::Message>::MAX_PAYLOAD_BYTES
+        );
+        assert_eq!(read_frame(&mut frame.as_slice()).unwrap(), Some(full));
+        let over = crate::frames::frame_bytes(&SessionControlReply::Clients(vec![
+            SessionClient {
+                id: 0,
+                reported_size: None,
+            };
+            MAX_SESSION_CLIENTS
+                + 1
+        ]));
+        assert!(read_frame::<SessionControlReply>(&mut over.as_slice()).is_err());
+        for reply in [
+            SessionControlReply::Clients(Vec::new()),
+            SessionControlReply::Detach(DetachOutcome::Detached),
+            SessionControlReply::Detach(DetachOutcome::Missing),
+            SessionControlReply::DetachedAll(0),
+            SessionControlReply::DetachedAll(u64::MAX),
         ] {
-            let encoded = encode_frame(&msg).unwrap();
-            let mut cur = std::io::Cursor::new(encoded);
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
+            let frame = encode_frame(&reply).unwrap();
+            assert_eq!(read_frame(&mut frame.as_slice()).unwrap(), Some(reply));
         }
+    }
+
+    /// An empty listing, a detach and a zero detach count encode differently, so a reply to the
+    /// wrong request never reads as this one's.
+    #[test]
+    fn replies_to_different_requests_never_share_bytes() {
+        let replies = [
+            SessionControlReply::Clients(Vec::new()),
+            SessionControlReply::Detach(DetachOutcome::Detached),
+            SessionControlReply::Detach(DetachOutcome::Missing),
+            SessionControlReply::DetachedAll(0),
+        ];
+        let frames: std::collections::BTreeSet<_> = replies
+            .iter()
+            .map(|reply| encode_frame(reply).unwrap())
+            .collect();
+        assert_eq!(frames.len(), replies.len());
     }
 
     #[test]
@@ -243,7 +315,7 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(&4u32.to_le_bytes());
         bad.extend_from_slice(b"nope");
-        let err = read_frame::<ControlReply>(&mut std::io::Cursor::new(bad)).unwrap_err();
+        let err = read_frame::<SessionControlReply>(&mut std::io::Cursor::new(bad)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

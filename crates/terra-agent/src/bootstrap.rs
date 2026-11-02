@@ -11,7 +11,10 @@ use terra_protocol::guest_root::{
     PER_BOOT_DIR, PER_BOOT_DOAS_CONF, PER_BOOT_DOAS_DIR, PER_BOOT_LOCALTIME, PER_BOOT_RESOLV_CONF,
     PER_BOOT_SANDBOX_INFO,
 };
-use terra_protocol::{Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, RootfsMount, WORKLOAD_ID};
+use terra_protocol::{
+    HostState, HostTime, Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, RootfsMount,
+    WORKLOAD_ID,
+};
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -36,9 +39,9 @@ pub(crate) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
     fs::create_dir_all(CLEAN_MOUNT)?;
 
     let mut streams = crate::mux::GuestMux::connect()?;
-    let plan = read_boot_plan(&mut streams.control)?;
+    let (plan, host_state) = read_boot_plan(&mut streams.control)?;
     setup_env(&plan);
-    apply_host_state(&plan)?;
+    apply_host_state(&host_state)?;
     for volume in &plan.volumes {
         grow_filesystem(&volume.dev);
     }
@@ -128,13 +131,17 @@ fn mount_scratch_directories() -> Result<()> {
     Ok(())
 }
 
-fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<Plan> {
+/// Reads the boot plan and the host state that follows it.
+fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<(Plan, HostState)> {
     let plan: Plan = terra_protocol::read_frame(reader)
         .context("reading the boot plan")?
         .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
     plan.validate_network()
         .context("validating guest network configuration")?;
-    Ok(plan)
+    let host_state = terra_protocol::read_frame(reader)
+        .context("reading the host state")?
+        .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving host state"))?;
+    Ok((plan, host_state))
 }
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -286,12 +293,10 @@ fn render_doas_policy(sudo: &[String]) -> String {
 }
 
 fn write_per_boot_files(directory: &Path, plan: &Plan) -> Result<()> {
-    let file = |per_boot_path: &str| {
-        directory.join(Path::new(per_boot_path).file_name().unwrap_or_default())
-    };
+    let file = |name: &str| directory.join(name);
     fs::create_dir_all(directory).with_context(|| format!("creating {}", directory.display()))?;
-    let write = |per_boot_path: &str, contents: &[u8]| {
-        let path = file(per_boot_path);
+    let write = |name: &str, contents: &[u8]| {
+        let path = file(name);
         fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
     };
     write(
@@ -321,17 +326,12 @@ fn write_per_boot_files(directory: &Path, plan: &Plan) -> Result<()> {
     write(PER_BOOT_SANDBOX_INFO, plan.sandbox_info.as_bytes())
 }
 
-fn apply_host_state(plan: &Plan) -> Result<()> {
-    if let Some(seed) = plan.host_seed {
-        credit_entropy(&seed)?;
-        let mut ready = [0];
-        rustix::rand::getrandom(&mut ready, rustix::rand::GetRandomFlags::empty())
-            .context("waiting for the guest CSPRNG")?;
-    }
-    if let Some(time) = plan.host_time {
-        set_clock(time.seconds, time.nanoseconds)?;
-    }
-    Ok(())
+fn apply_host_state(state: &HostState) -> Result<()> {
+    credit_entropy(&state.seed)?;
+    let mut ready = [0];
+    rustix::rand::getrandom(&mut ready, rustix::rand::GetRandomFlags::empty())
+        .context("waiting for the guest CSPRNG")?;
+    set_clock(state.time)
 }
 
 #[repr(C)]
@@ -362,15 +362,15 @@ fn credit_entropy(seed: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-fn set_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
-    if nanoseconds >= 1_000_000_000 {
+fn set_clock(time: HostTime) -> Result<()> {
+    if time.nanoseconds >= 1_000_000_000 {
         bail!("invalid host clock sample");
     }
     rustix::time::clock_settime(
         rustix::time::ClockId::Realtime,
         rustix::time::Timespec {
-            tv_sec: seconds,
-            tv_nsec: nanoseconds.into(),
+            tv_sec: time.seconds,
+            tv_nsec: time.nanoseconds.into(),
         },
     )
     .map_err(std::io::Error::from)
@@ -379,12 +379,12 @@ fn set_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
 }
 
 /// Set the guest clock to the host's when they differ by five seconds or more.
-pub(crate) fn sync_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
+pub(crate) fn sync_clock(time: HostTime) -> Result<()> {
     let current = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
-    if current.tv_sec.abs_diff(seconds) < 5 {
+    if current.tv_sec.abs_diff(time.seconds) < 5 {
         return Ok(());
     }
-    set_clock(seconds, nanoseconds)
+    set_clock(time)
 }
 
 #[allow(unsafe_code)]
@@ -520,18 +520,16 @@ mod tests {
     fn per_boot_files_follow_the_plan() {
         let directory = crate::create_scratch_path("bootstrap", "per-boot");
         let _ = fs::remove_dir_all(&directory);
-        let read = |path: &str| {
-            fs::read_to_string(directory.join(Path::new(path).file_name().unwrap())).unwrap()
-        };
-        let mode = |path: &str| {
-            fs::metadata(directory.join(Path::new(path).file_name().unwrap()))
+        let read = |name: &str| fs::read_to_string(directory.join(name)).unwrap();
+        let mode = |name: &str| {
+            fs::metadata(directory.join(name))
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777
         };
         let mut plan = test_plan();
-        plan.net = terra_protocol::Net::Tsi;
+        plan.net = terra_protocol::Net::Brokered;
         plan.sudo = vec!["/bin/ls".into(), "bad\ncmd".into(), "x # y".into()];
         plan.sandbox_info = "readme".into();
         plan.host_tz = None;
@@ -544,7 +542,7 @@ mod tests {
         assert_eq!(mode(PER_BOOT_DOAS_CONF), 0o640);
         assert_eq!(mode(PER_BOOT_DOAS_DIR), 0o750);
         assert_eq!(
-            fs::read_dir(directory.join(Path::new(PER_BOOT_DOAS_DIR).file_name().unwrap()))
+            fs::read_dir(directory.join(PER_BOOT_DOAS_DIR))
                 .unwrap()
                 .count(),
             0
@@ -564,13 +562,21 @@ mod tests {
     fn boot_plan_carries_host_state_and_hooks() {
         let mut plan = test_plan();
         plan.on_start.push("exit 99".into());
-        plan.host_time = Some(terra_protocol::HostTime {
-            seconds: 12,
-            nanoseconds: 34,
-        });
-        plan.host_seed = Some([0; 32]);
-        let frame = terra_protocol::encode_frame(&plan).unwrap();
-        assert_eq!(read_boot_plan(&mut frame.as_slice()).unwrap(), plan);
+        let host_state = HostState {
+            time: terra_protocol::HostTime {
+                seconds: 12,
+                nanoseconds: 34,
+            },
+            seed: [0; 32],
+        };
+        let mut frames = terra_protocol::encode_frame(&plan).unwrap();
+        frames.extend(terra_protocol::encode_frame(&host_state).unwrap());
+        assert_eq!(
+            read_boot_plan(&mut frames.as_slice()).unwrap(),
+            (plan.clone(), host_state)
+        );
+        let plan_only = terra_protocol::encode_frame(&plan).unwrap();
+        assert!(read_boot_plan(&mut plan_only.as_slice()).is_err());
     }
 
     #[test]

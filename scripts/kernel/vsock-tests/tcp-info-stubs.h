@@ -27,8 +27,7 @@ typedef uint64_t u64;
 #define TCP_CLOSE 7
 #define TCP_CLOSE_WAIT 8
 #define TERRA_SOCKET_EXTERNAL 2
-#define TERRA_TCP_RECEIVE_BYTES 81920
-#define TERRA_TCP_SEND_BYTES 49152
+#include <linux/terra_abi.h>
 #define RCV_SHUTDOWN 1
 #define SEND_SHUTDOWN 2
 #define READ_ONCE(value) (value)

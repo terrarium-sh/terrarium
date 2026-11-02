@@ -7,7 +7,7 @@ use crate::workload::GuestUser;
 use std::os::fd::AsFd;
 use std::time::Duration;
 use terra_protocol::{AgentOutput, ClientInput, ExecRequest, TermSize};
-use terra_protocol::{read_frame_async as read_frame, write_frame_async as write_frame};
+use terra_protocol::{read_frame_async, write_frame_async};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ pub(crate) async fn serve_exec(
     let req = tokio::select! {
         biased;
         () = cancellation.cancelled() => return,
-        result = tokio::time::timeout(FRAME_TIMEOUT, read_frame::<ExecRequest>(&mut reader)) => result,
+        result = tokio::time::timeout(FRAME_TIMEOUT, read_frame_async::<ExecRequest>(&mut reader)) => result,
     };
     let code = if let Ok(Ok(Some(req))) = req {
         Box::pin(run_exec(
@@ -164,7 +164,7 @@ async fn pump_input<R: AsyncRead + Unpin>(
 ) {
     let forward = async {
         let mut stdin = Some(stdin);
-        while let Ok(Some(input)) = read_frame(reader).await {
+        while let Ok(Some(input)) = read_frame_async(reader).await {
             let bytes = match input {
                 ClientInput::Keys(bytes) => bytes,
                 ClientInput::Resize(size) => {
@@ -305,7 +305,7 @@ async fn send_output<W: AsyncWrite + Unpin>(
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(()),
-        result = tokio::time::timeout(FRAME_TIMEOUT, write_frame(conn, msg)) => match result {
+        result = tokio::time::timeout(FRAME_TIMEOUT, write_frame_async(conn, msg)) => match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) | Err(_) => Err(()),
         },
@@ -460,7 +460,10 @@ mod tests {
         let (sender, mut receiver) = tokio::io::duplex(1024);
         let reader = tokio::spawn(async move {
             let mut frames = 0;
-            while let Some(frame) = read_frame::<AgentOutput>(&mut receiver).await.unwrap() {
+            while let Some(frame) = read_frame_async::<AgentOutput>(&mut receiver)
+                .await
+                .unwrap()
+            {
                 assert_eq!(
                     frame,
                     AgentOutput::Out(vec![b'x'; terra_protocol::MAX_TERMINAL_CHUNK_BYTES])

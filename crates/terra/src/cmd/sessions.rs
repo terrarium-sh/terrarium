@@ -3,11 +3,12 @@
 
 use crate::recipe::resolve;
 use crate::render;
-use crate::session::{self, SessionClient};
+use crate::session;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use terra_protocol::SessionClient;
 
 #[derive(serde::Serialize)]
 struct SessionEntry {
@@ -27,7 +28,7 @@ pub async fn run(
             .into_iter()
             .map(|client| SessionEntry {
                 id: client.id,
-                term_size: client.reported_term_size,
+                term_size: client.reported_size,
             })
             .collect();
         let json =
@@ -48,7 +49,7 @@ pub async fn run(
 
 fn format_client_line(client: &SessionClient) -> String {
     let size = client
-        .reported_term_size
+        .reported_size
         .map_or_else(|| "-".to_owned(), |s| format!("{}x{}", s.rows, s.cols));
     format!("{}\t{size}", client.id)
 }
@@ -65,14 +66,14 @@ mod tests {
         assert_eq!(
             format_client_line(&SessionClient {
                 id: 3,
-                reported_term_size: None
+                reported_size: None
             }),
             "3\t-"
         );
         assert_eq!(
             format_client_line(&SessionClient {
                 id: 7,
-                reported_term_size: Some(terra_protocol::TermSize { rows: 24, cols: 80 })
+                reported_size: Some(terra_protocol::TermSize { rows: 24, cols: 80 })
             }),
             "7\t24x80"
         );

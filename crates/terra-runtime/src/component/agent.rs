@@ -238,12 +238,6 @@ impl Agent {
     }
 }
 
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn enrich_boot_plan_for_fuzzing(bytes: &[u8]) -> Option<Vec<u8>> {
-    host::enrich_plan_with_host_state(bytes, 0, 0, [0; 32]).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

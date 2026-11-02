@@ -10,7 +10,7 @@ Guest CID 3 connects to host CID 2: agent port 6000, control port 6001, one
 stream per TCP socket on port 6002, and one stream per UDP socket on port 6003.
 TCP and UDP complete a bounded opening handshake before carrying raw TCP
 bytes or framed UDP datagrams and asynchronous errors. The agent's userspace
-control connection carries version/readiness and DNS. Accepted published TCP
+control connection carries readiness and DNS. Accepted published TCP
 connections open frontend-initiated streams to the guest listener on port 6004.
 Each published UDP listener family owns at most one publication stream carrying
 datagram frames; the broker permits replies only to recent inbound peers.
@@ -32,9 +32,8 @@ retires and disables network connections while the agent remains available;
 a physical device reset disconnects every connection.
 
 The device reserves agent and control budgets separately from the configured
-combined TCP/UDP/publication limit, at most 1024 sockets. Each flow has a 48 KiB
-input window and an 80 KiB output bound; all device payload queues total at most
-49248 KiB upstream and 82304 KiB in replies. Control allows 16 concurrent DNS
+combined TCP/UDP/publication limit; the network transport lists the socket
+limit and each stream's payload budgets. Control allows 16 concurrent DNS
 queries. Async broker operations and readiness resume bounded work; TCP
 payloads have no guest read/write RPCs or per-chunk IDs. TCP/UDP opening,
 control startup, and publication headers have a 30-second deadline.

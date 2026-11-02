@@ -18,9 +18,10 @@ use std::{
 use terra_protocol::application::OPEN_TIMEOUT_SECS;
 use terra_protocol::network_control::Publication;
 use terra_protocol::socket::Error as SocketError;
-use terra_vsock_device::{ConnectionId, PUBLICATION_HOST_PORTS, VsockError};
+use terra_protocol::vsock::PUBLICATION_HOST_PORTS;
+use terra_vsock_device::{ConnectionId, VsockError};
 
-const MAX_HOST_PORT_ATTEMPTS: usize = terra_vsock_device::MAX_NETWORK_SOCKETS + 1;
+const MAX_HOST_PORT_ATTEMPTS: usize = terra_protocol::vsock::MAX_NETWORK_SOCKETS + 1;
 static NEXT_HOST_PORT: AtomicU32 = AtomicU32::new(PUBLICATION_HOST_PORTS.start);
 
 /// A published port with both ports nonzero.

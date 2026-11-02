@@ -9,8 +9,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use terra_protocol::{
-    MAX_FILE_BYTES, RootStatus, SyncEntry, SyncEntryKind, SyncReply, SyncRequest, encode_frame,
-    read_frame, truncate_nanos,
+    MAX_SYNC_FILE_BYTES, RootStatus, SyncEntry, SyncEntryKind, SyncReply, SyncRequest,
+    encode_frame, read_frame, truncate_nanos,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -166,9 +166,10 @@ fn open_regular_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Me
     if !meta.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
-    if meta.len() > MAX_FILE_BYTES {
+    if meta.len() > MAX_SYNC_FILE_BYTES {
         return Err(std::io::Error::other(format!(
-            "file is larger than the {MAX_FILE_BYTES}-byte limit"
+            "file is larger than the {} GiB sync limit",
+            MAX_SYNC_FILE_BYTES >> 30
         )));
     }
     Ok((file, meta))
@@ -258,18 +259,34 @@ fn read_link_target(path: &Path) -> std::io::Result<String> {
 /// Describes the entry at `full`, reported to the host as `relative_path`.
 fn entry_at(full: &Path, relative_path: String) -> std::io::Result<SyncEntry> {
     let metadata = std::fs::symlink_metadata(full)?;
-    let kind = entry_kind(&metadata).ok_or_else(|| {
-        std::io::Error::other(format!("unsupported special file: {relative_path}"))
-    })?;
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        SyncEntryKind::Directory
+    } else if file_type.is_symlink() {
+        SyncEntryKind::Symlink {
+            target: read_link_target(full)?,
+        }
+    } else if file_type.is_file() {
+        if metadata.len() > MAX_SYNC_FILE_BYTES {
+            let name = if relative_path.is_empty() {
+                "the sync root"
+            } else {
+                &relative_path
+            };
+            return Err(std::io::Error::other(format!(
+                "file is larger than the {} GiB sync limit: {name}",
+                MAX_SYNC_FILE_BYTES >> 30
+            )));
+        }
+        SyncEntryKind::File {
+            size: metadata.len(),
+        }
+    } else {
+        return Err(std::io::Error::other(format!(
+            "unsupported special file: {relative_path}"
+        )));
+    };
     Ok(SyncEntry {
-        size: match kind {
-            SyncEntryKind::File => metadata.len(),
-            SyncEntryKind::Directory | SyncEntryKind::Symlink => 0,
-        },
-        link_target: match kind {
-            SyncEntryKind::Symlink => Some(read_link_target(full)?),
-            SyncEntryKind::Directory | SyncEntryKind::File => None,
-        },
         relative_path,
         kind,
         mode: metadata.mode() & PERMISSION_BITS,
@@ -278,29 +295,24 @@ fn entry_at(full: &Path, relative_path: String) -> std::io::Result<SyncEntry> {
     })
 }
 
-fn entry_kind(metadata: &std::fs::Metadata) -> Option<SyncEntryKind> {
-    let file_type = metadata.file_type();
-    if file_type.is_dir() {
-        Some(SyncEntryKind::Directory)
-    } else if file_type.is_symlink() {
-        Some(SyncEntryKind::Symlink)
-    } else if file_type.is_file() {
-        Some(SyncEntryKind::File)
-    } else {
-        None
-    }
-}
-
-/// `None` when nothing exists at `path`.
-fn inspect_root(path: &Path) -> std::io::Result<Option<SyncEntryKind>> {
+fn inspect_root(path: &Path) -> std::io::Result<RootStatus> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => entry_kind(&metadata).map(Some).ok_or_else(|| {
-            std::io::Error::other(format!(
-                "root {} is an unsupported file type",
-                path.display()
-            ))
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_dir() {
+                Ok(RootStatus::ExistingDirectory)
+            } else if file_type.is_symlink() {
+                Ok(RootStatus::ExistingSymlink)
+            } else if file_type.is_file() {
+                Ok(RootStatus::ExistingFile)
+            } else {
+                Err(std::io::Error::other(format!(
+                    "root {} is an unsupported file type",
+                    path.display()
+                )))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RootStatus::Missing),
         Err(e) => Err(std::io::Error::new(
             e.kind(),
             format!("inspecting root {}: {e}", path.display()),
@@ -319,7 +331,7 @@ struct WriteFileMeta {
 /// The guest root a host sync works on, from `BeginSession` on.
 struct Session {
     root: PathBuf,
-    root_kind: Option<SyncEntryKind>,
+    root_status: RootStatus,
     owner: GuestUser,
     cancellation: CancellationToken,
 }
@@ -331,7 +343,7 @@ impl Session {
         cancellation: &CancellationToken,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            root_kind: inspect_root(&root)?,
+            root_status: inspect_root(&root)?,
             root,
             owner,
             cancellation: cancellation.clone(),
@@ -339,12 +351,7 @@ impl Session {
     }
 
     fn root_status(&self) -> RootStatus {
-        match self.root_kind {
-            Some(SyncEntryKind::Directory) => RootStatus::ExistingDirectory,
-            Some(SyncEntryKind::File) => RootStatus::ExistingFile,
-            Some(SyncEntryKind::Symlink) => RootStatus::ExistingSymlink,
-            None => RootStatus::Missing,
-        }
+        self.root_status
     }
 
     fn ensure_not_cancelled(&self) -> std::io::Result<()> {
@@ -377,15 +384,14 @@ impl Session {
 
     fn scan(&self, conn: &mut impl Write) -> Result<SyncReply, Failure> {
         self.ensure_not_cancelled()?;
-        if self.root_kind.is_none() {
+        if self.root_status == RootStatus::Missing {
             return Ok(SyncReply::ScanComplete);
         }
         let root = entry_at(&self.root, String::new())?;
-        let kind = root.kind;
+        let is_directory = root.kind == SyncEntryKind::Directory;
         send_partial(conn, &SyncReply::Entry(root))?;
-        match kind {
-            SyncEntryKind::Directory => self.scan_tree(conn)?,
-            SyncEntryKind::File | SyncEntryKind::Symlink => {}
+        if is_directory {
+            self.scan_tree(conn)?;
         }
         Ok(SyncReply::ScanComplete)
     }
@@ -404,11 +410,8 @@ impl Session {
             for dir_entry in read_dir {
                 self.ensure_not_cancelled()?;
                 let child = self.child_entry(&rel, &dir_entry?.file_name())?;
-                match child.kind {
-                    SyncEntryKind::Directory => {
-                        pending_directories.push_back(child.relative_path.clone());
-                    }
-                    SyncEntryKind::File | SyncEntryKind::Symlink => {}
+                if child.kind == SyncEntryKind::Directory {
+                    pending_directories.push_back(child.relative_path.clone());
                 }
                 send_partial(conn, &SyncReply::Entry(child))?;
             }
@@ -439,7 +442,7 @@ impl Session {
         let mut last_report = std::time::Instant::now();
         loop {
             self.ensure_not_cancelled()?;
-            if std::time::Instant::now() >= deadline || total_hashed > MAX_FILE_BYTES {
+            if std::time::Instant::now() >= deadline || total_hashed > MAX_SYNC_FILE_BYTES {
                 return Err(std::io::Error::other("hashing exceeded its limit").into());
             }
             match file.read(&mut buffer) {
@@ -562,12 +565,12 @@ impl Session {
         Ok(SyncReply::Success)
     }
 
-    fn remove_entry(&self, relative_path: &str, is_dir: bool) -> Result<SyncReply, Failure> {
+    fn remove_entry(&self, relative_path: &str) -> Result<SyncReply, Failure> {
         if relative_path.is_empty() {
             return Err(std::io::Error::other("cannot remove session root itself").into());
         }
         let target = self.resolve(relative_path)?;
-        if is_dir {
+        if std::fs::symlink_metadata(&target)?.is_dir() {
             std::fs::remove_dir(&target)?;
         } else {
             std::fs::remove_file(&target)?;
@@ -641,10 +644,9 @@ pub(crate) fn serve_sync_session(
                 mtime_secs,
                 mtime_nanos,
             ),
-            SyncRequest::RemoveEntry {
-                relative_path,
-                is_dir,
-            } => active(session.as_ref())?.remove_entry(&relative_path, is_dir),
+            SyncRequest::RemoveEntry { relative_path } => {
+                active(session.as_ref())?.remove_entry(&relative_path)
+            }
         };
         match reply {
             Ok(reply) => send_reply(conn, &reply)?,
@@ -671,17 +673,17 @@ mod tests {
         std::fs::create_dir_all(real.join("app")).unwrap();
         let alias = scratch.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        assert_eq!(inspect_root(&alias).unwrap(), Some(SyncEntryKind::Symlink));
+        assert_eq!(inspect_root(&alias).unwrap(), RootStatus::ExistingSymlink);
         let root = alias.join("app");
-        assert_eq!(inspect_root(&root).unwrap(), Some(SyncEntryKind::Directory));
-        let session = test_session(&root, SyncEntryKind::Directory);
+        assert_eq!(inspect_root(&root).unwrap(), RootStatus::ExistingDirectory);
+        let session = test_session(&root, RootStatus::ExistingDirectory);
         let file = session.resolve("file").unwrap();
         std::fs::write(file, b"inside").unwrap();
         assert_eq!(std::fs::read(real.join("app/file")).unwrap(), b"inside");
         std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
         assert!(session.resolve("link/file").is_err());
         assert!(
-            test_session(&alias, SyncEntryKind::Symlink)
+            test_session(&alias, RootStatus::ExistingSymlink)
                 .resolve("file")
                 .is_err()
         );
@@ -698,7 +700,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let session = test_session(&root, SyncEntryKind::Directory);
+        let session = test_session(&root, RootStatus::ExistingDirectory);
         session.scan(&mut TestConn::new(Vec::new())).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("new")).unwrap();
         assert!(session.create_directory("new", 0o777).is_err());
@@ -757,7 +759,7 @@ mod tests {
         let destination = scratch.join("file");
         std::fs::write(&destination, b"old").unwrap();
         let mut closed = std::io::Cursor::new(&mut [] as &mut [u8]);
-        let written = test_session(&scratch, SyncEntryKind::Directory).write_file(
+        let written = test_session(&scratch, RootStatus::ExistingDirectory).write_file(
             "file",
             WriteFileMeta {
                 size: 3,
@@ -802,7 +804,6 @@ mod tests {
             },
             SyncRequest::RemoveEntry {
                 relative_path: String::new(),
-                is_dir: true,
             },
             SyncRequest::EndSession,
         ];
@@ -832,10 +833,10 @@ mod tests {
         cancel_at: Option<(u64, CancellationToken)>,
     }
 
-    fn test_session(root: &Path, root_kind: SyncEntryKind) -> Session {
+    fn test_session(root: &Path, root_status: RootStatus) -> Session {
         Session {
             root: root.to_path_buf(),
-            root_kind: Some(root_kind),
+            root_status,
             owner: GuestUser::Root,
             cancellation: CancellationToken::new(),
         }
@@ -953,6 +954,31 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    #[test]
+    fn scan_replies_with_an_error_for_a_file_past_the_sync_limit() {
+        let scratch = crate::create_scratch_path("sync", "oversized-file");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::File::create(scratch.join("big"))
+            .unwrap()
+            .set_len(MAX_SYNC_FILE_BYTES + 1)
+            .unwrap();
+        let mut input = begin_session(&scratch);
+        input.extend(frame(&SyncRequest::ScanEntries));
+        input.extend(frame(&SyncRequest::EndSession));
+        let mut conn = TestConn::new(input);
+        serve_sync_session(&mut conn, GuestUser::Root, &CancellationToken::new()).unwrap();
+        assert_matches!(
+            conn.replies().as_slice(),
+            [
+                SyncReply::SessionReady { .. },
+                SyncReply::Entry(_),
+                SyncReply::Err(message),
+                SyncReply::Success,
+            ] if message == "file is larger than the 16 GiB sync limit: big"
+        );
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     /// A workload can swap an entry for a link before `UpdateMetadata`; the chmod
     /// and times must land on the entry itself, never on the link's target.
     #[test]
@@ -964,8 +990,8 @@ mod tests {
         let root = scratch.join("root");
         std::fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let updated =
-            test_session(&root, SyncEntryKind::Directory).update_metadata("link", 0o777, 100, 0);
+        let updated = test_session(&root, RootStatus::ExistingDirectory)
+            .update_metadata("link", 0o777, 100, 0);
         assert_matches!(
             updated,
             Err(Failure::Request(error)) if error.to_string() == "cannot update symlink metadata"
@@ -979,7 +1005,7 @@ mod tests {
         let scratch = crate::create_scratch_path("sync", "create-symlink");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("entry"), b"old").unwrap();
-        let session = test_session(&scratch, SyncEntryKind::Directory);
+        let session = test_session(&scratch, RootStatus::ExistingDirectory);
         session.create_symlink("entry", "target").unwrap();
         session.create_symlink("nested/link", "../target").unwrap();
         assert_eq!(
@@ -1000,7 +1026,7 @@ mod tests {
         let directory = scratch.join("directory");
         std::fs::create_dir_all(&directory).unwrap();
         let accessed_before = std::fs::metadata(&directory).unwrap().accessed().unwrap();
-        test_session(&scratch, SyncEntryKind::Directory)
+        test_session(&scratch, RootStatus::ExistingDirectory)
             .update_metadata("directory", 0o755, 1000, 500)
             .unwrap();
         let metadata = std::fs::metadata(&directory).unwrap();
@@ -1018,6 +1044,25 @@ mod tests {
     }
 
     #[test]
+    fn remove_entry_removes_files_dirs_and_links_without_following() {
+        let scratch = crate::create_scratch_path("sync", "remove-entry");
+        let root = scratch.join("root");
+        let outside = scratch.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let session = test_session(&root, RootStatus::ExistingDirectory);
+        for name in ["file", "dir", "link"] {
+            assert_eq!(session.remove_entry(name).unwrap(), SyncReply::Success);
+            assert!(std::fs::symlink_metadata(root.join(name)).is_err());
+        }
+        assert!(outside.is_dir());
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
     fn scans_preserve_metadata_for_directories_files_and_symlinks() {
         let scratch = crate::create_scratch_path("sync", "scan-metadata");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -1028,14 +1073,28 @@ mod tests {
         let link = scratch.join("link");
         std::os::unix::fs::symlink("file", &link).unwrap();
 
-        for (path, kind, size, target) in [
-            (&scratch, SyncEntryKind::Directory, 0, None),
-            (&file, SyncEntryKind::File, 8, None),
-            (&link, SyncEntryKind::Symlink, 0, Some("file")),
+        for (path, root_status, kind) in [
+            (
+                &scratch,
+                RootStatus::ExistingDirectory,
+                SyncEntryKind::Directory,
+            ),
+            (
+                &file,
+                RootStatus::ExistingFile,
+                SyncEntryKind::File { size: 8 },
+            ),
+            (
+                &link,
+                RootStatus::ExistingSymlink,
+                SyncEntryKind::Symlink {
+                    target: "file".into(),
+                },
+            ),
         ] {
             let mut conn = TestConn::new(Vec::new());
             assert_eq!(
-                test_session(path, kind).scan(&mut conn).unwrap(),
+                test_session(path, root_status).scan(&mut conn).unwrap(),
                 SyncReply::ScanComplete
             );
             let metadata = std::fs::symlink_metadata(path).unwrap();
@@ -1044,12 +1103,10 @@ mod tests {
                 replies.next(),
                 Some(SyncReply::Entry(SyncEntry {
                     relative_path: String::new(),
-                    kind,
-                    size,
+                    kind: kind.clone(),
                     mode: metadata.mode() & 0o777,
                     mtime_secs: metadata.mtime(),
                     mtime_nanos: truncate_nanos(u32::try_from(metadata.mtime_nsec()).unwrap()),
-                    link_target: target.map(str::to_owned),
                 }))
             );
             let mut children: Vec<_> = replies
@@ -1064,21 +1121,20 @@ mod tests {
                 assert_eq!(
                     (
                         children[0].relative_path.as_str(),
-                        children[0].kind,
-                        children[0].size,
+                        &children[0].kind,
                         children[0].mode,
                         children[0].mtime_secs
                     ),
-                    ("file", SyncEntryKind::File, 8, 0o640, 1000)
+                    ("file", &SyncEntryKind::File { size: 8 }, 0o640, 1000)
                 );
                 assert_eq!(
+                    (children[1].relative_path.as_str(), &children[1].kind),
                     (
-                        children[1].relative_path.as_str(),
-                        children[1].kind,
-                        children[1].size,
-                        children[1].link_target.as_deref()
-                    ),
-                    ("link", SyncEntryKind::Symlink, 0, Some("file"))
+                        "link",
+                        &SyncEntryKind::Symlink {
+                            target: "file".into()
+                        }
+                    )
                 );
             } else {
                 assert_eq!(children, [] as [terra_protocol::SyncEntry; 0]);

@@ -4,23 +4,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_PLAN_BYTES: usize = 1 << 20;
-pub const MAX_PLAN_HOST_STATE_BYTES: usize = 1024;
 pub const MAX_PUBLISHED_PORTS: usize = 32;
 
 pub const RESIZE2FS_GUEST_PATH: &str = "/terra-resize2fs";
 
 pub const ROOT_DEVICE: &str = "/dev/vdb";
 
-/// How many scratch volumes fit after the boot volume and root device.
-pub const MAX_VOLUMES: usize = 32;
+const FIRST_VOLUME_INDEX: usize = 2;
 
-/// Block device name for the `index`-th volume; `None` past [`MAX_VOLUMES`].
+/// Block device name for the `index`-th volume.
 #[must_use]
-pub fn to_volume_device(index: usize) -> Option<String> {
-    (index < MAX_VOLUMES).then(|| format!("/dev/vd{}", disk_suffix(index + 2)))
+pub fn to_volume_device(index: usize) -> String {
+    block_device(FIRST_VOLUME_INDEX + index)
 }
 
-fn disk_suffix(mut index: usize) -> String {
+/// The guest's name for the `index`-th block device the host attaches.
+fn block_device(mut index: usize) -> String {
     let mut suffix = String::new();
     loop {
         #[allow(clippy::cast_possible_truncation)]
@@ -30,7 +29,7 @@ fn disk_suffix(mut index: usize) -> String {
         }
         index = index / 26 - 1;
     }
-    suffix.chars().rev().collect()
+    format!("/dev/vd{}", suffix.chars().rev().collect::<String>())
 }
 
 /// Kernel cmdline for booting the guest agent from the boot disk.
@@ -51,23 +50,14 @@ pub struct Share {
     pub readonly: bool,
 }
 
-/// Workload user name (cosmetic, for shell prompts).
-pub const WORKLOAD_USER_NAME: &str = "terri";
-
-/// The non-root workload user's uid and gid, shared by the image build and the agent.
-pub const WORKLOAD_ID: u32 = 1000;
-
-pub const WORKLOAD_HOME: &str = "/home/terri";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Disk {
+pub struct VolumeMount {
     pub dev: String,
     pub guest: String,
 }
 
 /// How the agent mounts the guest root.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum RootfsMount {
     Writable,
     /// The host attached the root device read-only, so the agent mounts it
@@ -81,17 +71,10 @@ pub enum RootfsMount {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum Net {
-    Tsi,
+    /// Guest sockets reach the host through the network frontend and its broker.
+    Brokered,
     LocalOnly,
-}
-
-/// A UTC sample captured immediately before the guest receives its boot plan.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HostTime {
-    pub seconds: i64,
-    pub nanoseconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +83,7 @@ pub struct Plan {
     pub hostname: String,
     pub workdir: Option<String>,
     pub shares: Vec<Share>,
-    pub volumes: Vec<Disk>,
+    pub volumes: Vec<VolumeMount>,
     pub net: Net,
     pub published_ports: Vec<u16>,
     pub published_udp_ports: Vec<u16>,
@@ -120,8 +103,6 @@ pub struct Plan {
     pub await_initial_session: bool,
     #[serde(with = "serde_bytes")]
     pub host_tz: Option<Vec<u8>>,
-    pub host_time: Option<HostTime>,
-    pub host_seed: Option<[u8; 32]>,
 }
 
 impl crate::Message for Plan {
@@ -129,6 +110,7 @@ impl crate::Message for Plan {
 }
 
 impl Plan {
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn bare_run(workload: Vec<String>) -> Self {
         Self {
@@ -137,7 +119,7 @@ impl Plan {
             workdir: None,
             shares: Vec::new(),
             volumes: Vec::new(),
-            net: Net::Tsi,
+            net: Net::Brokered,
             published_ports: Vec::new(),
             published_udp_ports: Vec::new(),
             env: BTreeMap::new(),
@@ -152,8 +134,6 @@ impl Plan {
             sandbox_info: String::new(),
             await_initial_session: false,
             host_tz: None,
-            host_time: None,
-            host_seed: None,
         }
     }
 
@@ -181,12 +161,6 @@ mod tests {
     use super::*;
     use crate::{encode_frame, read_frame};
 
-    // pin WORKLOAD_USER_NAME and WORKLOAD_HOME
-    #[test]
-    fn match_workload_home_to_user() {
-        assert_eq!(WORKLOAD_HOME, format!("/home/{WORKLOAD_USER_NAME}"));
-    }
-
     #[test]
     fn plan_mode_retains_its_wire_format() {
         assert_eq!(postcard::to_allocvec(&PlanMode::Create).unwrap(), [1]);
@@ -213,17 +187,17 @@ mod tests {
                     guest: "/etc/x".into(),
                     readonly: true,
                 }],
-                volumes: vec![Disk {
-                    dev: to_volume_device(0).unwrap(),
+                volumes: vec![VolumeMount {
+                    dev: to_volume_device(0),
                     guest: "/data".into(),
                 }],
-                net: Net::Tsi,
+                net: Net::Brokered,
                 published_ports: vec![80, 443],
                 published_udp_ports: vec![53],
                 env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                 as_root: false,
                 rootfs: RootfsMount::Overlay {
-                    upper_dev: to_volume_device(1).unwrap(),
+                    upper_dev: to_volume_device(1),
                 },
                 sudo: vec!["apk".into()],
                 on_create: vec!["apk add git".into()],
@@ -234,11 +208,6 @@ mod tests {
                 sandbox_info: "# Terrarium sandbox".into(),
                 await_initial_session: true,
                 host_tz,
-                host_time: Some(HostTime {
-                    seconds: 1,
-                    nanoseconds: 2,
-                }),
-                host_seed: Some([3; 32]),
             };
             assert!(plan.validate_network().is_ok());
             for ports in [vec![0], vec![443, 80], vec![80, 80], (1..=33).collect()] {
@@ -268,27 +237,18 @@ mod tests {
     }
 
     #[test]
-    fn run_volume_devices_continue_after_vdz() {
-        assert_eq!(to_volume_device(0).unwrap(), "/dev/vdc");
-        assert_eq!(to_volume_device(23).unwrap(), "/dev/vdz");
-        assert_eq!(to_volume_device(24).unwrap(), "/dev/vdaa");
-        assert_eq!(to_volume_device(MAX_VOLUMES - 1).unwrap(), "/dev/vdah");
-        // Past the last letter is the caller's error to report, never a panic:
-        // this is linked into guest PID 1.
-        assert_eq!(to_volume_device(MAX_VOLUMES), None);
+    fn volume_devices_continue_after_vdz() {
+        assert_eq!(to_volume_device(0), "/dev/vdc");
+        assert_eq!(to_volume_device(23), "/dev/vdz");
+        assert_eq!(to_volume_device(24), "/dev/vdaa");
     }
 
+    /// The kernel boots from the first device the host attaches and the agent finds the root
+    /// on the second, so volumes start at the third.
     #[test]
-    fn network_modes_round_trip_by_name() {
-        for (net, name) in [(Net::Tsi, "tsi"), (Net::LocalOnly, "local_only")] {
-            let payload = postcard::to_allocvec(&net).unwrap();
-            assert_eq!(postcard::from_bytes::<Net>(&payload).unwrap(), net);
-            let decoder = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
-            assert_eq!(Net::deserialize(decoder).unwrap(), net);
-        }
-        for name in ["packet", "Tsi", "LocalOnly"] {
-            let decoder = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
-            assert!(Net::deserialize(decoder).is_err());
-        }
+    fn named_devices_follow_the_attach_order() {
+        assert!(KERNEL_CMDLINE.contains(&format!("root={} ", block_device(0))));
+        assert_eq!(ROOT_DEVICE, block_device(1));
+        assert_eq!(to_volume_device(0), block_device(2));
     }
 }

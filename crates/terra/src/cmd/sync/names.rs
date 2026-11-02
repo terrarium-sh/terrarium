@@ -282,9 +282,10 @@ mod tests {
             std::fs::write(root.path().join(name), b"keep").unwrap();
             let is_alias = root.path().join(alias).exists();
             let modified = root.path().metadata().unwrap().modified().unwrap();
-            let source = BTreeMap::from([(alias.into(), entry(alias, SyncEntryKind::File, None))]);
+            let source =
+                BTreeMap::from([(alias.into(), entry(alias, SyncEntryKind::File { size: 0 }))]);
             let destination =
-                BTreeMap::from([(name.into(), entry(name, SyncEntryKind::File, None))]);
+                BTreeMap::from([(name.into(), entry(name, SyncEntryKind::File { size: 0 }))]);
             let result = HostNames::new(root.path(), &source, &destination);
             assert_eq!(result.is_err(), is_alias, "{name}, {alias}");
             if let Ok(names) = result {
@@ -322,21 +323,32 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             for existing in [false, true] {
                 let mut source = BTreeMap::from([
-                    ("dir".into(), entry("dir", SyncEntryKind::Directory, None)),
+                    ("dir".into(), entry("dir", SyncEntryKind::Directory)),
                     (
                         "dir/up".into(),
-                        entry("dir/up", SyncEntryKind::Symlink, Some("..")),
+                        entry(
+                            "dir/up",
+                            SyncEntryKind::Symlink {
+                                target: "..".into(),
+                            },
+                        ),
                     ),
                     (
                         "link".into(),
                         entry(
                             "link",
-                            SyncEntryKind::Symlink,
-                            Some(&format!("{alias}/up/..")),
+                            SyncEntryKind::Symlink {
+                                target: format!("{alias}/up/.."),
+                            },
                         ),
                     ),
                 ]);
-                let link = entry(name, SyncEntryKind::Symlink, Some("dir"));
+                let link = entry(
+                    name,
+                    SyncEntryKind::Symlink {
+                        target: "dir".into(),
+                    },
+                );
                 let mut destination = BTreeMap::new();
                 if existing {
                     destination.insert(name.into(), link);
@@ -361,17 +373,23 @@ mod tests {
             }
 
             let source = BTreeMap::from([
-                (name.into(), entry(name, SyncEntryKind::Directory, None)),
+                (name.into(), entry(name, SyncEntryKind::Directory)),
                 (
                     format!("{name}/up"),
-                    entry(&format!("{name}/up"), SyncEntryKind::Symlink, Some("..")),
+                    entry(
+                        &format!("{name}/up"),
+                        SyncEntryKind::Symlink {
+                            target: "..".into(),
+                        },
+                    ),
                 ),
                 (
                     "link".into(),
                     entry(
                         "link",
-                        SyncEntryKind::Symlink,
-                        Some(&format!("{alias}/up/..")),
+                        SyncEntryKind::Symlink {
+                            target: format!("{alias}/up/.."),
+                        },
                     ),
                 ),
             ]);
@@ -401,13 +419,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let modified = root.path().metadata().unwrap().modified().unwrap();
         let source = BTreeMap::from([
-            (
-                "日本語".into(),
-                entry("日本語", SyncEntryKind::Directory, None),
-            ),
+            ("日本語".into(), entry("日本語", SyncEntryKind::Directory)),
             (
                 "日本語/café".into(),
-                entry("日本語/café", SyncEntryKind::File, None),
+                entry("日本語/café", SyncEntryKind::File { size: 0 }),
             ),
         ]);
         let names = HostNames::new(

@@ -9,6 +9,10 @@ pub const DEFAULT_COMPONENT_MEMORY_MIB: u32 = 16;
 /// Admits every flow the vsock switch allows.
 pub const NETWORK_FRONTEND_MEMORY_BYTES: usize = terra_limits::NETWORK_SHARED_MEMORY_BYTES
     + terra_protocol::vsock::MAX_NETWORK_SOCKETS * terra_limits::NETWORK_FLOW_MEMORY_BYTES;
+const _: () = assert!(
+    (terra_protocol::vsock::FLOW_UPSTREAM_BYTES + terra_protocol::vsock::FLOW_REPLY_BYTES) as usize
+        <= terra_limits::NETWORK_FLOW_MEMORY_BYTES
+);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ComponentMemoryLimits {

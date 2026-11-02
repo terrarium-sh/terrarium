@@ -1,7 +1,7 @@
 //! Host disk capabilities for the Wasm block device.
 
 use crate::component::AccessMode;
-use terra_protocol::packed_image::{ChunkCache, PackedImage};
+use terra_protocol::packed_image::PackedImage;
 
 /// In-memory disk for tests: fixed capacity with the real read-only mode
 /// enforced on every mutation path.
@@ -156,15 +156,17 @@ impl BlockBacking for BoundedDisk {
 /// Read-only disk decoded chunk by chunk from a packed image; one decoded
 /// chunk stays cached.
 pub struct PackedDisk {
-    image: PackedImage<'static>,
-    cache: std::sync::Mutex<ChunkCache>,
+    capacity: u64,
+    image: std::sync::Mutex<PackedImage<'static>>,
 }
 
 impl PackedDisk {
     #[must_use]
     pub fn new(image: PackedImage<'static>) -> Self {
-        let cache = std::sync::Mutex::new(ChunkCache::new(&image));
-        Self { image, cache }
+        Self {
+            capacity: image.image_bytes(),
+            image: std::sync::Mutex::new(image),
+        }
     }
 }
 
@@ -178,7 +180,7 @@ fn check_range(capacity: u64, offset: u64, len: u64) -> Result<(), BackingError>
 
 impl BlockBacking for PackedDisk {
     fn capacity(&self) -> u64 {
-        self.image.image_bytes()
+        self.capacity
     }
 
     fn access(&self) -> AccessMode {
@@ -186,13 +188,11 @@ impl BlockBacking for PackedDisk {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
-        check_range(self.capacity(), offset, buf.len() as u64)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        check_range(self.capacity, offset, buf.len() as u64)?;
         self.image
-            .read_at(offset, buf, &mut cache)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_at(offset, buf)
             .map_err(|_| BackingError::Io)
     }
 
@@ -347,16 +347,17 @@ mod packed_tests {
         PackedDisk::new(pack_fast_leaked(&contents(), GuestImage::Boot).unwrap())
     }
 
-    /// A disk whose chunks listed by `is_corrupt` decode to bytes that fail their CRC.
+    /// A disk whose chunks listed by `is_corrupt` are stored as blocks that fail to decode.
     fn disk_with_corrupt_chunks(is_corrupt: impl Fn(usize) -> bool) -> PackedDisk {
         let mut index = 0;
         let packed = pack(&contents(), GuestImage::Boot, |chunk| {
-            let mut bytes = chunk.to_vec();
-            if is_corrupt(index) {
-                bytes[0] ^= 1;
-            }
+            let corrupt = is_corrupt(index);
             index += 1;
-            compress_fast(&bytes)
+            if corrupt {
+                Ok(vec![0xff; 16])
+            } else {
+                compress_fast(chunk)
+            }
         })
         .unwrap();
         PackedDisk::new(PackedImage::parse(packed.leak(), GuestImage::Boot).unwrap())
@@ -409,7 +410,7 @@ mod packed_tests {
         assert_eq!(disk.sync(), Ok(()));
     }
 
-    /// A chunk that fails its checksum surfaces as an I/O error, and the failed
+    /// A chunk that fails to decode surfaces as an I/O error, and the failed
     /// decode, which overwrote the cache buffer, never serves the previously
     /// cached chunk's bytes as that chunk again.
     #[test]

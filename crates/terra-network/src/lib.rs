@@ -9,21 +9,24 @@ mod server;
 mod sockets;
 
 pub use client::{Client, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
-pub use mux::YAMUX_STREAM_WINDOW_BYTES;
+pub use mux::broker_yamux_config;
 pub use server::{Broker, bind_listeners, embeds_ipv4};
 pub use sockets::{OutboundSockets, SocketSource};
 
-pub use terra_protocol::network::{Error, ListenerGrant, ResourceKind};
+pub use terra_protocol::socket::Error;
 
 pub const MAX_RESOURCES: usize = 2 * terra_protocol::vsock::MAX_NETWORK_SOCKETS;
-pub const MAX_DNS_REQUESTS: usize = 16;
 pub const MAX_LISTENERS: usize = 2 * terra_protocol::MAX_PUBLISHED_PORTS;
 pub const MAX_RESOLVERS: usize = 8;
-pub const MAX_UDP_PUBLICATION_PEERS: usize = terra_protocol::network::MAX_UDP_PUBLICATION_PEERS;
 /// One shared QUIC endpoint talks to every server through one socket, so outbound sockets track more peers.
 pub const MAX_UDP_OUTBOUND_PEERS: usize = 128;
 pub const MAX_SOCKET_BUFFER_BYTES: u32 = 256 << 10;
-const MAX_STREAMS: usize = MAX_RESOURCES + MAX_LISTENERS + MAX_DNS_REQUESTS + 16;
+/// Streams the broker keeps open just long enough to answer an over-limit open with an error.
+const MAX_REJECTED_OPEN_STREAMS: usize = 16;
+const MAX_STREAMS: usize = MAX_RESOURCES
+    + MAX_LISTENERS
+    + terra_protocol::network_control::MAX_DNS_QUERIES
+    + MAX_REJECTED_OPEN_STREAMS;
 const _: () = assert!(
     terra_protocol::network::MAX_NETWORK_CHUNK_BYTES <= terra_limits::NETWORK_TCP_READ_BUFFER_BYTES
 );

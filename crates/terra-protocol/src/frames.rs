@@ -15,7 +15,7 @@ pub trait Message: Serialize + DeserializeOwned {
 /// A byte-string variant's tag and length varint, for strings under 2 MiB.
 pub(crate) const BYTE_VARIANT_OVERHEAD_BYTES: usize = 4;
 
-fn check_len<T: Message>(len: usize) -> io::Result<usize> {
+fn payload_len_within_limit<T: Message>(len: usize) -> io::Result<usize> {
     if len > T::MAX_PAYLOAD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -30,14 +30,14 @@ fn check_len<T: Message>(len: usize) -> io::Result<usize> {
 
 /// The payload length a frame's `u32` LE prefix declares, refused past `T`'s limit.
 pub fn frame_payload_len<T: Message>(prefix: [u8; 4]) -> io::Result<usize> {
-    check_len::<T>(u32::from_le_bytes(prefix) as usize)
+    payload_len_within_limit::<T>(u32::from_le_bytes(prefix) as usize)
 }
 
-/// Encode a message as the one wire shape every terra channel uses: a `u32` LE
-/// length prefix plus Postcard.
+/// Encode a message as a `u32` LE length prefix plus Postcard.
 pub fn encode_frame<T: Message>(value: &T) -> io::Result<Vec<u8>> {
     let mut frame = postcard::to_extend(value, vec![0; 4]).map_err(io::Error::other)?;
-    let len = u32::try_from(check_len::<T>(frame.len() - 4)?).map_err(io::Error::other)?;
+    let len =
+        u32::try_from(payload_len_within_limit::<T>(frame.len() - 4)?).map_err(io::Error::other)?;
     frame[..4].copy_from_slice(&len.to_le_bytes());
     Ok(frame)
 }
@@ -53,10 +53,8 @@ macro_rules! read_frame_body {
         }
         $reader.read_exact(&mut bytes[1..])$(.$await)??;
         let len = frame_payload_len::<$T>(bytes)?;
-        let mut payload = Vec::with_capacity(len);
-        if $reader.take(len as u64).read_to_end(&mut payload)$(.$await)?? != len {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
+        let mut payload = vec![0; len];
+        $reader.read_exact(&mut payload)$(.$await)??;
         decode_frame_payload(&payload).map(Some)
     }};
 }
@@ -94,7 +92,7 @@ pub async fn write_frame_async<T: Message>(
 
 /// Decode a complete Postcard payload, rejecting trailing bytes.
 pub fn decode_frame_payload<T: Message>(payload: &[u8]) -> io::Result<T> {
-    check_len::<T>(payload.len())?;
+    payload_len_within_limit::<T>(payload.len())?;
     let (value, remaining) = postcard::take_from_bytes(payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !remaining.is_empty() {

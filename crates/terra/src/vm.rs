@@ -42,7 +42,7 @@ use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
 use terra_protocol::{
-    Disk, Net, Plan, PlanMode, RootfsMount, Share, WORKLOAD_ID, WORKLOAD_USER_NAME,
+    Net, Plan, PlanMode, RootfsMount, Share, VolumeMount, WORKLOAD_ID, WORKLOAD_USER_NAME,
 };
 use terra_runtime::component::AccessMode;
 
@@ -88,13 +88,7 @@ pub async fn run(
 }
 
 pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8>> {
-    // The host's clock and seed join the plan after this, within MAX_PLAN_HOST_STATE_BYTES.
     terra_protocol::encode_frame(&build_plan(spec, box_name)?)
-        .ok()
-        .filter(|frame| {
-            frame.len() - 4
-                <= terra_protocol::MAX_PLAN_BYTES - terra_protocol::MAX_PLAN_HOST_STATE_BYTES
-        })
         .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
 }
 
@@ -121,15 +115,11 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             readonly: mount.readonly,
         })
         .collect();
-    let get_volume_device = |index| {
-        terra_protocol::to_volume_device(index)
-            .with_context(|| format!("volume {index} is past the last guest block device"))
-    };
     let mut volumes = Vec::new();
     for (index, volume) in recipe.volumes.iter().enumerate() {
         if let Some(guest) = &volume.guest {
-            volumes.push(Disk {
-                dev: get_volume_device(index)?,
+            volumes.push(VolumeMount {
+                dev: terra_protocol::to_volume_device(index),
                 guest: guest.to_string_lossy().into_owned(),
             });
         }
@@ -142,7 +132,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             .position(|volume| volume.rootfs_overlay)
         {
             Some(index) => RootfsMount::Overlay {
-                upper_dev: get_volume_device(index)?,
+                upper_dev: terra_protocol::to_volume_device(index),
             },
             None => RootfsMount::ReadOnly,
         },
@@ -175,7 +165,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         shares,
         volumes,
         net: if recipe.network.enabled {
-            Net::Tsi
+            Net::Brokered
         } else {
             Net::LocalOnly
         },
@@ -195,8 +185,6 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             .collect(),
         sandbox_info,
         host_tz: read_host_timezone(),
-        host_time: None,
-        host_seed: None,
     };
     plan.validate_network()?;
     Ok(plan)
@@ -416,7 +404,7 @@ mod tests {
         assert!(plan.shares[0].readonly);
         assert_eq!(plan.volumes[0].dev, "/dev/vdc");
         assert_eq!(plan.volumes[0].guest, "/data");
-        assert_eq!(plan.net, Net::Tsi);
+        assert_eq!(plan.net, Net::Brokered);
         spec.recipe.network.enabled = false;
         assert_eq!(build_plan(&spec, "dev").unwrap().net, Net::LocalOnly);
         let foreground = BootSpec {
@@ -578,15 +566,19 @@ mod tests {
         assert_eq!(
             plan.rootfs,
             RootfsMount::Overlay {
-                upper_dev: terra_protocol::to_volume_device(1).unwrap()
+                upper_dev: terra_protocol::to_volume_device(1)
             }
         );
-        let devices: Vec<_> = plan.volumes.iter().map(|disk| disk.dev.clone()).collect();
+        let devices: Vec<_> = plan
+            .volumes
+            .iter()
+            .map(|volume| volume.dev.clone())
+            .collect();
         assert_eq!(
             devices,
             [
-                terra_protocol::to_volume_device(0).unwrap(),
-                terra_protocol::to_volume_device(2).unwrap()
+                terra_protocol::to_volume_device(0),
+                terra_protocol::to_volume_device(2)
             ]
         );
         assert_eq!(plan.volumes[0].guest, "/before");

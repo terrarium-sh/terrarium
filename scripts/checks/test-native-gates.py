@@ -71,19 +71,13 @@ class NativeGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.validate_patch_series({})
 
-    def test_fixed_endpoint_tuples_match_protocol_and_kernel(self):
+    def test_kernel_opens_only_the_fixed_endpoints(self):
         module = self.vsock_checks
-        protocol = (ROOT / 'crates/terra-protocol/src/vsock.rs').read_text()
         kernel = module.load_kernel_source(ROOT)
-        module.validate_endpoints(protocol, kernel)
-        for guest, adapter in (
-            (protocol.replace('HOST_CID: u32 = 2', 'HOST_CID: u32 = 4'), kernel),
-            (protocol.replace('UDP_PORT: u32 = 6003', 'UDP_PORT: u32 = 6005'), kernel),
-            (protocol, kernel + '\n\tstruct sockaddr_vm extra = { .svm_cid = 2, .svm_port = 6001 };'),
-            ('', kernel), (protocol, ''),
-        ):
+        module.validate_endpoints(kernel)
+        for invalid in (kernel + '\n\tstruct sockaddr_vm extra = { .svm_cid = 2, .svm_port = 6001 };', ''):
             with self.subTest(), self.assertRaises(ValueError):
-                module.validate_endpoints(guest, adapter)
+                module.validate_endpoints(invalid)
 
     def test_guest_socket_buffers_keep_the_reviewed_limits(self):
         module = self.vsock_checks
@@ -91,7 +85,6 @@ class NativeGateTests(unittest.TestCase):
         module.validate_kernel_buffers(kernel)
         for source in ('',
                        kernel.replace('TERRA_TCP_SEGMENT_BYTES 65535', 'TERRA_TCP_SEGMENT_BYTES 65536'),
-                       kernel.replace('TERRA_TCP_RECEIVE_BYTES 81920', 'TERRA_TCP_RECEIVE_BYTES 32768'),
                        kernel.replace('TERRA_TCP_SEND_BYTES 49152', 'TERRA_TCP_SEND_BYTES 32768'),
                        kernel.replace('TERRA_UDP_QUEUE_BYTES 131072', 'TERRA_UDP_QUEUE_BYTES 65536'),
                        kernel.replace('TERRA_UDP_QUEUED_DATAGRAMS 48', 'TERRA_UDP_QUEUED_DATAGRAMS 96')):

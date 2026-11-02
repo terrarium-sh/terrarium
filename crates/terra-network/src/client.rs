@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::Poll;
 use terra_protocol::application::TcpOpenOptions;
-use terra_protocol::network::{ListenerGrant, MAX_NETWORK_NAME_BYTES, Open, Opened};
+use terra_protocol::network::{ListenerGrant, MAX_NETWORK_NAME_BYTES, Open, Resolved};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
@@ -65,57 +65,46 @@ impl Client {
         peer: SocketAddr,
         options: TcpOpenOptions,
     ) -> Result<TcpFlow, Error> {
-        let (stream, opened) = self.open_stream(&Open::Tcp { peer, options }).await?;
-        match opened {
-            Opened::Tcp => Ok(TcpFlow::start(self, stream)),
-            Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
-        }
+        let (stream, ()) = self.open_stream(&Open::Tcp { peer, options }).await?;
+        Ok(TcpFlow::start(self, stream))
     }
 
     /// Waits for one connection to the published listener.
     pub async fn accept(&self, grant: ListenerGrant) -> Result<TcpFlow, Error> {
-        let (stream, opened) = self.open_stream(&Open::Accept(grant)).await?;
-        match opened {
-            Opened::Tcp => Ok(TcpFlow::start(self, stream)),
-            Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
-        }
+        let (stream, ()) = self.open_stream(&Open::Accept(grant)).await?;
+        Ok(TcpFlow::start(self, stream))
     }
 
     pub async fn open_udp(&self) -> Result<UdpFlow, Error> {
-        self.open_udp_stream(&Open::Udp).await
+        let (stream, ()) = self.open_stream(&Open::Udp).await?;
+        Ok(UdpFlow::start(self, stream))
     }
 
     pub async fn open_published_udp(&self, grant: ListenerGrant) -> Result<UdpFlow, Error> {
-        self.open_udp_stream(&Open::PublishedUdp(grant)).await
+        let (stream, ()) = self.open_stream(&Open::PublishedUdp(grant)).await?;
+        Ok(UdpFlow::start(self, stream))
     }
 
     pub async fn resolve(&self, name: String) -> Result<Vec<IpAddr>, Error> {
         if name.len() > MAX_NETWORK_NAME_BYTES {
             return Err(Error::InvalidArgument);
         }
-        match self.open_stream(&Open::Resolve(name)).await?.1 {
-            Opened::Resolved(addresses)
-                if !addresses.is_empty()
-                    && addresses
-                        .iter()
-                        .all(|address| *address == address.to_canonical()) =>
-            {
-                Ok(addresses)
-            }
-            Opened::Resolved(_) | Opened::Tcp | Opened::Udp => Err(self.reject_broker()),
+        let (_, Resolved(addresses)) = self.open_stream(&Open::Resolve(name)).await?;
+        if addresses.is_empty()
+            || addresses
+                .iter()
+                .any(|address| *address != address.to_canonical())
+        {
+            return Err(self.reject_broker());
         }
-    }
-
-    async fn open_udp_stream(&self, open: &Open) -> Result<UdpFlow, Error> {
-        let (stream, opened) = self.open_stream(open).await?;
-        match opened {
-            Opened::Udp => Ok(UdpFlow::start(self, stream)),
-            Opened::Tcp | Opened::Resolved(_) => Err(self.reject_broker()),
-        }
+        Ok(addresses)
     }
 
     /// Opens a stream, sends `open`, and waits for the broker's reply. Dropping the future resets the stream.
-    async fn open_stream(&self, open: &Open) -> Result<(Compat<yamux::Stream>, Opened), Error> {
+    async fn open_stream<Reply>(&self, open: &Open) -> Result<(Compat<yamux::Stream>, Reply), Error>
+    where
+        Result<Reply, Error>: terra_protocol::Message,
+    {
         let opening = async {
             let (reply, stream) = oneshot::channel();
             self.0
@@ -134,11 +123,11 @@ impl Client {
             terra_protocol::write_frame_async(&mut stream, open)
                 .await
                 .map_err(|_| Error::Closed)?;
-            let opened = terra_protocol::read_frame_async::<Result<Opened, Error>>(&mut stream)
+            let reply = terra_protocol::read_frame_async::<Result<Reply, Error>>(&mut stream)
                 .await
                 .map_err(|error| self.reject_malformed(&error))?
                 .ok_or(Error::Closed)??;
-            Ok((stream, opened))
+            Ok((stream, reply))
         };
         tokio::select! {
             () = self.0.closed.cancelled() => Err(Error::Closed),

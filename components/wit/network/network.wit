@@ -15,10 +15,9 @@ interface broker {
     }
     record socket-address { address: ip-address, port: u16 }
     enum error {
-        access-denied, invalid-argument, invalid-state, stale-handle, wrong-kind,
-        busy, limit-exceeded, duplicate-request, cancelled, connection-refused,
-        connection-reset, timed-out, name-unresolvable, resolver-busy,
-        datagram-too-large, closed, io,
+        access-denied, invalid-argument, invalid-state, limit-exceeded, cancelled,
+        connection-refused, connection-reset, timed-out, name-unresolvable,
+        resolver-busy, datagram-too-large, closed, io,
     }
     resource tcp {
         send: func(data: stream<u8>) -> future<result<_, error>>;

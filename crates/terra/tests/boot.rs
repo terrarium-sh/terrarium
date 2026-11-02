@@ -391,7 +391,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use terra_protocol::application::{Frame as _, GuestFrame, HostFrame, TcpOpenOptions};
+    use terra_protocol::application::{GuestFrame, HostFrame, TcpOpenOptions};
 
     fn serve_credit_payload(
         listener: &TcpListener,

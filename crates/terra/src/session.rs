@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use terra_platform::local_socket::AsyncLocalStream;
-use terra_protocol::{self as protocol, AgentOutput, AgentService, ClientInput, TermSize};
+use terra_protocol::{
+    self as protocol, AgentOutput, AgentService, ClientInput, SessionClient, SessionControlReply,
+    TermSize,
+};
 
 const AGENT_HELLO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_SESSION_CLIENTS: usize = 1024;
 const SILENT_BOOT_GRACE: Duration = Duration::from_secs(15);
 
 pub fn read_terminal_size() -> Option<TermSize> {
@@ -147,20 +149,14 @@ pub(crate) fn wait_while_running(bx: &BoxRef, timeout: Option<u64>) -> impl FnMu
     }
 }
 
-/// One attached client of a box's session, as `terra <box> sessions` shows it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct SessionClient {
-    pub id: u64,
-    pub reported_term_size: Option<TermSize>,
-}
-
+/// Sends one session-control request and reads its one reply, named by `reply` in errors.
 async fn request_control(
     bx: &BoxRef,
     verb: &str,
-    req: &protocol::ControlRequest,
+    request: &protocol::SessionControlRequest,
     agent_timeout: Option<u64>,
-    ctx: &'static str,
-) -> Result<AsyncLocalStream> {
+    reply: &str,
+) -> Result<SessionControlReply> {
     let mut stream = connect_to_running_agent(
         bx,
         verb,
@@ -169,112 +165,76 @@ async fn request_control(
         agent_timeout,
     )
     .await?;
-    protocol::write_frame_async(&mut stream, req)
+    protocol::write_frame_async(&mut stream, request)
         .await
-        .context(ctx)?;
-    Ok(stream)
+        .with_context(|| format!("asking for {reply}"))?;
+    tokio::time::timeout(
+        CONTROL_READ_TIMEOUT,
+        protocol::read_frame_async::<SessionControlReply>(&mut stream),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("reading {reply} timed out"))?
+    .with_context(|| format!("reading {reply}"))?
+    .with_context(|| format!("{bx} stopped before its agent sent {reply}"))
+}
+
+fn answered_another_request(reply: &str) -> anyhow::Error {
+    anyhow::anyhow!("the agent answered another request instead of sending {reply}")
 }
 
 pub async fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<SessionClient>> {
-    let mut stream = request_control(
+    const REPLY: &str = "the session listing";
+    match request_control(
         bx,
         "sessions",
-        &protocol::ControlRequest::List,
+        &protocol::SessionControlRequest::List,
         agent_timeout,
-        "asking for the session's clients",
+        REPLY,
     )
-    .await?;
-    let mut clients = Vec::new();
-    loop {
-        match tokio::time::timeout(
-            CONTROL_READ_TIMEOUT,
-            protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("reading the session listing timed out"))?
-        {
-            Ok(Some(protocol::ControlReply::Client { id, size })) => {
-                if clients.len() == MAX_SESSION_CLIENTS {
-                    anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} session clients");
-                }
-                clients.push(SessionClient {
-                    id,
-                    reported_term_size: size,
-                });
-            }
-            Ok(Some(protocol::ControlReply::Done)) => return Ok(clients),
-            Ok(Some(
-                protocol::ControlReply::Detached { .. } | protocol::ControlReply::Missing { .. },
-            )) => anyhow::bail!("the agent answered a listing with a detach reply"),
-            Ok(None) => anyhow::bail!("{bx} stopped before its agent listed the session"),
-            Err(e) => return Err(e).context("reading the session listing"),
+    .await?
+    {
+        SessionControlReply::Clients(clients) => Ok(clients),
+        SessionControlReply::Detach(_) | SessionControlReply::DetachedAll(_) => {
+            Err(answered_another_request(REPLY))
         }
     }
 }
 
 pub async fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) -> Result<()> {
-    let mut stream = request_control(
+    const REPLY: &str = "the detach reply";
+    match request_control(
         bx,
         "detach",
-        &protocol::ControlRequest::Detach { id: client_id },
+        &protocol::SessionControlRequest::Detach { id: client_id },
         agent_timeout,
-        "asking to detach a client",
+        REPLY,
     )
-    .await?;
-    match tokio::time::timeout(
-        CONTROL_READ_TIMEOUT,
-        protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("reading the detach reply timed out"))?
+    .await?
     {
-        Ok(Some(protocol::ControlReply::Detached { id })) if id == client_id => Ok(()),
-        Ok(Some(protocol::ControlReply::Missing { id })) if id == client_id => {
+        SessionControlReply::Detach(protocol::DetachOutcome::Detached) => Ok(()),
+        SessionControlReply::Detach(protocol::DetachOutcome::Missing) => {
             anyhow::bail!("no client {client_id} is attached to {bx}")
         }
-        Ok(Some(
-            protocol::ControlReply::Detached { id } | protocol::ControlReply::Missing { id },
-        )) => {
-            anyhow::bail!("the agent answered detach for client {client_id} with client {id}");
+        SessionControlReply::Clients(_) | SessionControlReply::DetachedAll(_) => {
+            Err(answered_another_request(REPLY))
         }
-        Ok(Some(protocol::ControlReply::Client { .. } | protocol::ControlReply::Done)) => {
-            anyhow::bail!("the agent answered a detach with a listing reply")
-        }
-        Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
-        Err(e) => Err(e).context("reading the detach reply"),
     }
 }
 
 pub async fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
-    let mut stream = request_control(
+    const REPLY: &str = "the detach replies";
+    match request_control(
         bx,
         "detach",
-        &protocol::ControlRequest::DetachAll,
+        &protocol::SessionControlRequest::DetachAll,
         agent_timeout,
-        "asking to detach every client",
+        REPLY,
     )
-    .await?;
-    let mut detached = 0;
-    loop {
-        match tokio::time::timeout(
-            CONTROL_READ_TIMEOUT,
-            protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("reading the detach replies timed out"))?
-        {
-            Ok(Some(protocol::ControlReply::Detached { .. })) => {
-                if detached == MAX_SESSION_CLIENTS as u64 {
-                    anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} detach replies");
-                }
-                detached += 1;
-            }
-            Ok(Some(protocol::ControlReply::Done)) => return Ok(detached),
-            Ok(Some(
-                protocol::ControlReply::Client { .. } | protocol::ControlReply::Missing { .. },
-            )) => anyhow::bail!("the agent answered a detach with a listing reply"),
-            Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
-            Err(e) => return Err(e).context("reading the detach replies"),
+    .await?
+    {
+        SessionControlReply::DetachedAll(detached) => Ok(detached),
+        SessionControlReply::Clients(_) | SessionControlReply::Detach(_) => {
+            Err(answered_another_request(REPLY))
         }
     }
 }
@@ -587,12 +547,12 @@ mod tests {
     /// A box on disk, held as a running one, with a fake agent bound to its
     /// socket. The fake speaks just enough of the wire for the host's side to
     /// be driven: hello, the `SessionControl` frame, the request the host
-    /// actually sends, and the canned replies - so the retry loop, the hello
+    /// actually sends, and the canned reply - so the retry loop, the hello
     /// check, and the frame parsing all run for real.
     fn spawn_fake_agent(
         project_dir: &std::path::Path,
-        expected: protocol::ControlRequest,
-        replies: Vec<protocol::ControlReply>,
+        expected: protocol::SessionControlRequest,
+        reply: &SessionControlReply,
     ) -> (
         BoxRef,
         std::fs::File,
@@ -604,6 +564,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         let lock = bx.lock_run().unwrap();
         let listener = LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
+        let reply = protocol::encode_frame(reply).unwrap();
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             conn.write_all(&protocol::AGENT_HELLO).unwrap();
@@ -613,14 +574,11 @@ mod tests {
                 "the host dialed a different service"
             );
             assert_eq!(
-                protocol::read_frame::<protocol::ControlRequest>(&mut conn).unwrap(),
+                protocol::read_frame::<protocol::SessionControlRequest>(&mut conn).unwrap(),
                 Some(expected),
                 "the host sent a different request"
             );
-            for rep in replies {
-                conn.write_all(&protocol::encode_frame(&rep).unwrap())
-                    .unwrap();
-            }
+            conn.write_all(&reply).unwrap();
             conn.flush().unwrap();
         });
         (bx, lock, home, agent)
@@ -686,56 +644,44 @@ mod tests {
     #[tokio::test]
     async fn list_clients_parses_the_roster_and_keeps_nosize_clients() {
         let dir = tempfile::tempdir().unwrap();
+        let clients = vec![
+            SessionClient {
+                id: 0,
+                reported_size: Some(TermSize {
+                    rows: 30,
+                    cols: 100,
+                }),
+            },
+            SessionClient {
+                id: 1,
+                reported_size: None,
+            },
+        ];
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            protocol::ControlRequest::List,
-            vec![
-                protocol::ControlReply::Client {
-                    id: 0,
-                    size: Some(TermSize {
-                        rows: 30,
-                        cols: 100,
-                    }),
-                },
-                protocol::ControlReply::Client { id: 1, size: None },
-                protocol::ControlReply::Done,
-            ],
+            protocol::SessionControlRequest::List,
+            &SessionControlReply::Clients(clients.clone()),
         );
-        assert_eq!(
-            list_clients(&bx, None).await.unwrap(),
-            vec![
-                SessionClient {
-                    id: 0,
-                    reported_term_size: Some(TermSize {
-                        rows: 30,
-                        cols: 100
-                    })
-                },
-                SessionClient {
-                    id: 1,
-                    reported_term_size: None
-                },
-            ]
-        );
+        assert_eq!(list_clients(&bx, None).await.unwrap(), clients);
         agent.join().unwrap();
     }
 
+    /// A detach answered with another request's reply is a protocol fault, not a detach - even
+    /// an empty listing, the reply closest in shape to a successful detach.
     #[tokio::test]
-    async fn detach_replies_must_name_the_requested_client() {
-        for reply in [
-            protocol::ControlReply::Detached { id: 8 },
-            protocol::ControlReply::Missing { id: 8 },
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let (bx, _lock, _home, agent) = spawn_fake_agent(
-                dir.path(),
-                protocol::ControlRequest::Detach { id: 9 },
-                vec![reply],
-            );
-            let error = detach_client(&bx, 9, None).await.unwrap_err().to_string();
-            assert!(error.contains("client 9 with client 8"), "{error}");
-            agent.join().unwrap();
-        }
+    async fn detach_refuses_another_requests_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bx, _lock, _home, agent) = spawn_fake_agent(
+            dir.path(),
+            protocol::SessionControlRequest::Detach { id: 9 },
+            &SessionControlReply::Clients(Vec::new()),
+        );
+        let error = detach_client(&bx, 9, None).await.unwrap_err();
+        assert!(
+            error.to_string().contains("answered another request"),
+            "{error:#}"
+        );
+        agent.join().unwrap();
     }
 
     /// The guest answers a detach of a client that was never there with
@@ -746,8 +692,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            protocol::ControlRequest::Detach { id: 9 },
-            vec![protocol::ControlReply::Missing { id: 9 }],
+            protocol::SessionControlRequest::Detach { id: 9 },
+            &SessionControlReply::Detach(protocol::DetachOutcome::Missing),
         );
         let err = detach_client(&bx, 9, None).await.unwrap_err().to_string();
         assert!(err.contains("no client 9"), "{err}");
@@ -762,26 +708,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            protocol::ControlRequest::DetachAll,
-            vec![
-                protocol::ControlReply::Detached { id: 0 },
-                protocol::ControlReply::Detached { id: 1 },
-                protocol::ControlReply::Done,
-            ],
+            protocol::SessionControlRequest::DetachAll,
+            &SessionControlReply::DetachedAll(2),
         );
         assert_eq!(detach_all(&bx, None).await.unwrap(), 2);
         agent.join().unwrap();
     }
 
-    /// An empty session is answered with just `Done` - nothing dropped is
+    /// An empty session is answered with a count of zero - nothing dropped is
     /// still an honest answer, not an error.
     #[tokio::test]
     async fn detach_all_on_an_empty_session_counts_zero() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            protocol::ControlRequest::DetachAll,
-            vec![protocol::ControlReply::Done],
+            protocol::SessionControlRequest::DetachAll,
+            &SessionControlReply::DetachedAll(0),
         );
         assert_eq!(detach_all(&bx, None).await.unwrap(), 0);
         agent.join().unwrap();

@@ -4,36 +4,18 @@ use std::time::{Duration, Instant};
 
 use terra_platform::local_socket::{LocalListener, LocalStream};
 
+use super::yamux;
 use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::agent::Agent;
 use crate::component::vsock::streams::StreamEndpoint;
 use std::collections::BTreeMap;
 use terra_protocol::AgentCommand;
 
-const YAMUX_HEADER_BYTES: usize = 12;
-
 struct GuestTransport {
     endpoint: StreamEndpoint,
     connection_number: u64,
     carrier_bytes: Vec<u8>,
     stream_bytes: BTreeMap<u32, Vec<u8>>,
-}
-
-fn field<const N: usize>(bytes: &[u8], offset: usize) -> wasmtime::Result<[u8; N]> {
-    bytes
-        .get(offset..offset + N)
-        .ok_or_else(|| wasmtime::Error::msg("short agent device suite frame"))?
-        .try_into()
-        .map_err(wasmtime::Error::from)
-}
-
-fn yamux_frame(kind: u8, flags: u16, stream: u32, payload: &[u8]) -> wasmtime::Result<Vec<u8>> {
-    let mut bytes = vec![0, kind];
-    bytes.extend_from_slice(&flags.to_be_bytes());
-    bytes.extend_from_slice(&stream.to_be_bytes());
-    bytes.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
-    bytes.extend_from_slice(payload);
-    Ok(bytes)
 }
 
 impl GuestTransport {
@@ -57,39 +39,25 @@ impl GuestTransport {
             }
             self.carrier_bytes.extend(bytes);
         }
-        while self.carrier_bytes.len() >= YAMUX_HEADER_BYTES {
-            let kind = self.carrier_bytes[1];
-            let flags = u16::from_be_bytes(field(&self.carrier_bytes, 2)?);
-            let stream = u32::from_be_bytes(field(&self.carrier_bytes, 4)?);
-            let length = if kind == 0 {
-                usize::try_from(u32::from_be_bytes(field(&self.carrier_bytes, 8)?))?
-            } else {
-                0
-            };
-            wasmtime::ensure!(
-                length <= terra_protocol::mux::MAX_STREAM_FRAME_BYTES,
-                "agent device suite Yamux frame limit"
-            );
-            let end = YAMUX_HEADER_BYTES + length;
-            if self.carrier_bytes.len() < end {
-                break;
-            }
-            let mut frame: Vec<_> = self.carrier_bytes.drain(..end).collect();
-            if kind == 0 {
+        while let Some(frame) = yamux::take_frame(&mut self.carrier_bytes)? {
+            if frame.kind == yamux::DATA {
                 self.stream_bytes
-                    .entry(stream)
+                    .entry(frame.stream)
                     .or_default()
-                    .extend(&frame[YAMUX_HEADER_BYTES..]);
+                    .extend(frame.payload);
             }
-            if flags & 1 != 0 {
-                if kind == 2 {
-                    frame[2..4].copy_from_slice(&2_u16.to_be_bytes());
-                    self.send_bytes(&frame).await?;
+            if frame.flags & yamux::SYN != 0 {
+                let acknowledgement = if frame.kind == yamux::PING {
+                    yamux::encode(yamux::PING, yamux::ACK, frame.stream, frame.value, &[])
                 } else {
-                    self.send_bytes(&yamux_frame(1, 2, stream, &[])?).await?;
-                }
+                    yamux::encode(yamux::WINDOW_UPDATE, yamux::ACK, frame.stream, 0, &[])
+                };
+                self.send_bytes(&acknowledgement).await?;
             }
-            wasmtime::ensure!(kind != 3, "agent device suite peer sent GoAway");
+            wasmtime::ensure!(
+                frame.kind != yamux::GO_AWAY,
+                "agent device suite peer sent GoAway"
+            );
         }
         Ok(())
     }
@@ -110,9 +78,17 @@ impl GuestTransport {
             .await
     }
 
+    async fn read_control_message<T: terra_protocol::Message>(&mut self) -> wasmtime::Result<T> {
+        let prefix = <[u8; 4]>::try_from(self.read_control(4).await?)
+            .map_err(|_| wasmtime::Error::msg("device suite control frame prefix"))?;
+        let length = terra_protocol::frame_payload_len::<T>(prefix)?;
+        Ok(terra_protocol::decode_frame_payload(
+            &self.read_control(length).await?,
+        )?)
+    }
+
     async fn send_control(&mut self, bytes: &[u8]) -> wasmtime::Result<()> {
-        self.send_bytes(&yamux_frame(
-            0,
+        self.send_bytes(&yamux::data(
             0,
             terra_protocol::mux::CONTROL_STREAM_ID,
             bytes,
@@ -251,40 +227,44 @@ async fn run_with_clients(
 }
 
 async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> {
-    for stream in [
-        terra_protocol::mux::CONTROL_STREAM_ID,
-        terra_protocol::mux::DIAGNOSTIC_STREAM_ID,
-    ] {
-        guest.send_bytes(&yamux_frame(0, 1, stream, &[])?).await?;
+    for stream in terra_protocol::mux::RESERVED_STREAM_IDS {
+        guest
+            .send_bytes(&yamux::encode(yamux::DATA, yamux::SYN, stream, 0, &[]))
+            .await?;
     }
-    let length = u32::from_le_bytes(field(&guest.read_control(4).await?, 0)?);
-    let plan = guest.read_control(usize::try_from(length)?).await?;
-    let decoded: terra_protocol::Plan = terra_protocol::decode_frame_payload(&plan)?;
+    let _: terra_protocol::Plan = guest.read_control_message().await?;
+    let host_state: terra_protocol::HostState = guest.read_control_message().await?;
     wasmtime::ensure!(
-        decoded.host_time.is_some() && decoded.host_seed.is_some(),
-        "agent device suite host plan enrichment"
+        host_state.time.nanoseconds < 1_000_000_000 && host_state.seed != [0; 32],
+        "agent device suite host state follows the plan"
     );
     guest
         .send_control(&terra_protocol::encode_frame(
             &terra_protocol::LifecycleEvent::AgentReady,
         )?)
         .await?;
-    let input = guest.read_stream_bytes(2, b"guestless input".len()).await?;
+    let input = guest
+        .read_stream_bytes(yamux::FIRST_CLIENT_STREAM_ID, b"guestless input".len())
+        .await?;
     wasmtime::ensure!(
         input == b"guestless input",
         "agent device suite local input"
     );
     guest
-        .send_bytes(&yamux_frame(0, 0, 2, b"guestless output")?)
+        .send_bytes(&yamux::data(
+            0,
+            yamux::FIRST_CLIENT_STREAM_ID,
+            b"guestless output",
+        )?)
         .await?;
     loop {
-        let prefix = <[u8; 4]>::try_from(guest.read_control(4).await?)
-            .map_err(|_| wasmtime::Error::msg("device suite control frame prefix"))?;
-        let length = terra_protocol::frame_payload_len::<AgentCommand>(prefix)?;
-        match terra_protocol::decode_frame_payload(&guest.read_control(length).await?)? {
+        match guest.read_control_message().await? {
             AgentCommand::Stop => break,
-            AgentCommand::SyncClock { nanoseconds, .. } => {
-                wasmtime::ensure!(nanoseconds < 1_000_000_000, "device suite clock update");
+            AgentCommand::SyncClock(time) => {
+                wasmtime::ensure!(
+                    time.nanoseconds < 1_000_000_000,
+                    "device suite clock update"
+                );
             }
         }
     }

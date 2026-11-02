@@ -9,7 +9,8 @@ use futures_util::stream;
 use terra_platform::local_socket::{
     AsyncLocalListener as Listener, AsyncLocalStream, LocalListener, LocalStream, shutdown_write,
 };
-use terra_protocol::{MAX_PLAN_HOST_STATE_BYTES, STOP_SIGNAL};
+use terra_protocol::STOP_SIGNAL;
+use terra_protocol::mux::{MAX_CLIENT_STREAMS, MAX_STREAM_FRAME_BYTES};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wasmtime::Engine;
 use wasmtime::component::{Access, FutureReader, Resource, ResourceTable, StreamReader};
@@ -75,9 +76,6 @@ pub fn agent_component_linker<T: WasiView + AsMut<AgentHost> + 'static>(
     Ok(linker)
 }
 
-const MAX_CLIENTS: usize = terra_protocol::mux::MAX_CLIENT_STREAMS;
-const CHUNK_BYTES: usize = terra_protocol::mux::MAX_STREAM_FRAME_BYTES;
-
 type Lease = Arc<OwnedSemaphorePermit>;
 type Socket = Arc<AsyncLocalStream>;
 
@@ -112,7 +110,7 @@ impl AgentHostService {
     ) -> io::Result<Self> {
         Ok(Self {
             listener: listener.map(Listener::from_std).transpose()?,
-            plan: Some(enrich_plan(plan)?),
+            plan: Some(append_host_state(plan.to_vec())?),
             stop: StopClaim::Unclaimed(stop.map(prepare_socket).transpose()?),
             ..Self::default()
         })
@@ -120,7 +118,7 @@ impl AgentHostService {
 
     #[must_use]
     pub fn live_clients(&self) -> usize {
-        MAX_CLIENTS - self.client_slots.available_permits()
+        MAX_CLIENT_STREAMS - self.client_slots.available_permits()
     }
 
     fn client_mut(
@@ -140,7 +138,7 @@ impl Default for AgentHostService {
             plan: Some(Vec::new()),
             stop: StopClaim::Unclaimed(None),
             resources: ResourceTable::new(),
-            client_slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
+            client_slots: Arc::new(Semaphore::new(MAX_CLIENT_STREAMS)),
         }
     }
 }
@@ -186,7 +184,10 @@ impl<T: Send + 'static> terra::agent::host_service::HostClientWithStore<T> for A
             socket: Some(socket),
             _lease: Some(lease),
         };
-        StreamReader::new(&mut access, DirectSource::new(input, CHUNK_BYTES))
+        StreamReader::new(
+            &mut access,
+            DirectSource::new(input, MAX_STREAM_FRAME_BYTES),
+        )
     }
 }
 
@@ -243,7 +244,7 @@ fn accept_clients(
     })
 }
 
-/// Connections beyond `MAX_CLIENTS` are accepted and closed at once, so the client sees EOF.
+/// Connections beyond `MAX_CLIENT_STREAMS` are accepted and closed at once, so the client sees EOF.
 async fn accept_client(listener: &Listener, slots: &Arc<Semaphore>) -> io::Result<ClientState> {
     loop {
         let stream = listener.accept().await?;
@@ -350,54 +351,22 @@ fn client_state(stream: LocalStream, lease: Lease) -> io::Result<ClientState> {
     })
 }
 
-fn enrich_plan(frame: &[u8]) -> io::Result<Vec<u8>> {
+/// Appends the host's clock and a fresh seed, sampled now, after the boot plan frame.
+fn append_host_state(mut plan: Vec<u8>) -> io::Result<Vec<u8>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(io::Error::other)?;
     let mut seed = [0; 32];
     wasmtime_wasi::random::thread_rng().fill_bytes(&mut seed);
-    enrich_plan_with_host_state(
-        frame,
-        i64::try_from(now.as_secs()).map_err(io::Error::other)?,
-        now.subsec_nanos(),
+    let state = terra_protocol::HostState {
+        time: terra_protocol::HostTime {
+            seconds: i64::try_from(now.as_secs()).map_err(io::Error::other)?,
+            nanoseconds: now.subsec_nanos(),
+        },
         seed,
-    )
-}
-
-pub(crate) fn enrich_plan_with_host_state(
-    frame: &[u8],
-    seconds: i64,
-    nanoseconds: u32,
-    seed: [u8; 32],
-) -> io::Result<Vec<u8>> {
-    let mut remaining = frame;
-    let mut plan: terra_protocol::Plan = terra_protocol::read_frame(&mut remaining)?
-        .filter(|_| remaining.is_empty())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "boot plan frame length is invalid",
-            )
-        })?;
-    if nanoseconds >= 1_000_000_000 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "host clock nanoseconds are invalid",
-        ));
-    }
-    plan.host_time = Some(terra_protocol::HostTime {
-        seconds,
-        nanoseconds,
-    });
-    plan.host_seed = Some(seed);
-    let enriched = terra_protocol::encode_frame(&plan)?;
-    if enriched.len().saturating_sub(frame.len()) > MAX_PLAN_HOST_STATE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "enriched boot plan exceeds its host-state bound",
-        ));
-    }
-    Ok(enriched)
+    };
+    plan.extend(terra_protocol::encode_frame(&state)?);
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -463,7 +432,7 @@ mod tests {
     #[test]
     fn client_leases_bound_open_host_streams_after_resource_drop() {
         let service = AgentHostService::default();
-        let leases = (0..MAX_CLIENTS)
+        let leases = (0..MAX_CLIENT_STREAMS)
             .map(|_| reserve_client(&service.client_slots).expect("available client lease"))
             .collect::<Vec<_>>();
         assert!(reserve_client(&service.client_slots).is_none());
@@ -476,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn output_reaches_the_client_then_shuts_down_and_releases_the_lease() {
         use std::io::Read;
-        let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
+        let slots = Arc::new(Semaphore::new(MAX_CLIENT_STREAMS));
         let (server, mut client) = terra_platform::local_socket::create_local_pair().unwrap();
         let output = SocketOutput {
             socket: prepare_socket(server).unwrap(),
@@ -491,7 +460,7 @@ mod tests {
         store
             .run_concurrent(async |_| {
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                    while slots.available_permits() != MAX_CLIENTS {
+                    while slots.available_permits() != MAX_CLIENT_STREAMS {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -508,8 +477,8 @@ mod tests {
     #[tokio::test]
     async fn clients_beyond_capacity_see_eof_and_the_listener_accepts_after_release() {
         use tokio::io::AsyncReadExt;
-        let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
-        let leases = (0..MAX_CLIENTS)
+        let slots = Arc::new(Semaphore::new(MAX_CLIENT_STREAMS));
+        let leases = (0..MAX_CLIENT_STREAMS)
             .map(|_| reserve_client(&slots).unwrap())
             .collect::<Vec<_>>();
         let root = tempfile::tempdir().unwrap();
@@ -529,61 +498,8 @@ mod tests {
             .await
             .expect("capacity rejection must preserve the listener")
             .unwrap();
-        assert_eq!(slots.available_permits(), MAX_CLIENTS - 1);
+        assert_eq!(slots.available_permits(), MAX_CLIENT_STREAMS - 1);
         drop(client);
-        assert_eq!(slots.available_permits(), MAX_CLIENTS);
-    }
-}
-
-#[cfg(test)]
-mod enrichment_tests {
-    use super::*;
-
-    fn test_plan() -> terra_protocol::Plan {
-        terra_protocol::Plan {
-            workdir: Some("/work".into()),
-            shares: vec![terra_protocol::Share {
-                tag: "work".into(),
-                guest: "/work".into(),
-                readonly: false,
-            }],
-            host_tz: Some(vec![1, 2, 3]),
-            ..terra_protocol::Plan::bare_run(vec!["sh".into()])
-        }
-    }
-
-    #[test]
-    fn plan_enrichment_preserves_plan_fields_and_adds_host_state() {
-        let mut plan = test_plan();
-        let frame = terra_protocol::encode_frame(&plan.clone()).unwrap();
-        let seed = std::array::from_fn(|index| u8::try_from(index).unwrap());
-        let frame = enrich_plan_with_host_state(&frame, 12, 34, seed).unwrap();
-        let decoded: terra_protocol::Plan = terra_protocol::read_frame(&mut frame.as_slice())
-            .unwrap()
-            .unwrap();
-        plan.host_time = Some(terra_protocol::HostTime {
-            seconds: 12,
-            nanoseconds: 34,
-        });
-        plan.host_seed = Some(seed);
-        assert_eq!(decoded, plan);
-    }
-
-    #[test]
-    fn maximum_host_plan_fits_after_host_state_enrichment() {
-        let limit = terra_protocol::MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES;
-        let mut plan = test_plan();
-        plan.sandbox_info = "x".repeat(limit);
-        let overhead = terra_protocol::encode_frame(&plan).unwrap().len() - 4 - limit;
-        plan.sandbox_info.truncate(limit - overhead);
-        let frame = terra_protocol::encode_frame(&plan).unwrap();
-        assert_eq!(frame.len(), limit + 4);
-        let frame =
-            enrich_plan_with_host_state(&frame, i64::MIN, 999_999_999, [u8::MAX; 32]).unwrap();
-        assert!(frame.len() <= terra_protocol::MAX_PLAN_BYTES + 4);
-        let decoded: terra_protocol::Plan = terra_protocol::read_frame(&mut frame.as_slice())
-            .unwrap()
-            .unwrap();
-        assert_eq!(decoded.sandbox_info, plan.sandbox_info);
+        assert_eq!(slots.available_permits(), MAX_CLIENT_STREAMS);
     }
 }

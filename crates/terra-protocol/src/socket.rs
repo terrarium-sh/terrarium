@@ -1,9 +1,8 @@
-//! Shared network endpoint layout and defined errors.
+//! Socket error codes and the host-service addresses guests see.
 
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-pub const MAX_DNS_BYTES: usize = 4096;
 pub const HOST_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 1);
 pub const HOST_SERVICE_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1);
 
@@ -13,29 +12,24 @@ pub enum Error {
     AccessDenied = 1,
     InvalidArgument = 2,
     InvalidState = 3,
-    StaleHandle = 4,
-    WrongKind = 5,
-    Busy = 6,
-    LimitExceeded = 7,
-    DuplicateRequest = 8,
-    Cancelled = 9,
-    ConnectionRefused = 10,
-    ConnectionReset = 11,
-    TimedOut = 12,
-    NameUnresolvable = 13,
-    ResolverBusy = 14,
-    DatagramTooLarge = 15,
-    Closed = 16,
-    Io = 17,
-    NotSupported = 18,
-    NotReady = 19,
-    Protocol = 20,
+    LimitExceeded = 4,
+    Cancelled = 5,
+    ConnectionRefused = 6,
+    ConnectionReset = 7,
+    TimedOut = 8,
+    NameUnresolvable = 9,
+    ResolverBusy = 10,
+    DatagramTooLarge = 11,
+    Closed = 12,
+    Io = 13,
+    NotReady = 14,
+    Protocol = 15,
 }
 
 impl Error {
     /// Postcard encodes a variant as its declaration index, which is the wire code minus one.
     #[must_use]
-    pub fn decode(value: u64) -> Option<Self> {
+    pub(crate) fn decode(value: u16) -> Option<Self> {
         let index = u8::try_from(value.checked_sub(1)?).ok()?;
         postcard::from_bytes(&[index]).ok()
     }
@@ -46,11 +40,8 @@ impl Error {
             Self::AccessDenied => "EACCES",
             Self::InvalidArgument => "EINVAL",
             Self::InvalidState => "ENOTCONN",
-            Self::StaleHandle => "ESTALE",
-            Self::WrongKind => "EPROTOTYPE",
-            Self::Busy | Self::ResolverBusy => "EAGAIN",
+            Self::ResolverBusy => "EAGAIN",
             Self::LimitExceeded => "ENOBUFS",
-            Self::DuplicateRequest => "EALREADY",
             Self::Cancelled => "ECANCELED",
             Self::ConnectionRefused => "ECONNREFUSED",
             Self::ConnectionReset => "ECONNRESET",
@@ -59,7 +50,6 @@ impl Error {
             Self::DatagramTooLarge => "EMSGSIZE",
             Self::Closed => "EPIPE",
             Self::Io => "EIO",
-            Self::NotSupported => "EOPNOTSUPP",
             Self::NotReady => "ENETDOWN",
             Self::Protocol => "EPROTO",
         }
@@ -76,15 +66,15 @@ mod tests {
     fn defined_errors_preserve_codes_and_reject_raw_errno() {
         let mut code = 1;
         while let Some(error) = Error::decode(code) {
-            assert_eq!(u64::from(error as u16), code);
+            assert_eq!(error as u16, code);
             assert_eq!(
                 postcard::to_allocvec(&error).unwrap(),
                 [u8::try_from(code - 1).unwrap()]
             );
             code += 1;
         }
-        assert_eq!(code, 21);
-        for value in [0, 21, 111, 129, u64::MAX] {
+        assert_eq!(code, 16);
+        for value in [0, 16, 111, 129, u16::MAX] {
             assert_eq!(Error::decode(value), None);
         }
     }

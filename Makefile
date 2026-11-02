@@ -45,13 +45,14 @@ ALPINE_SOURCE_DIST := $(BUILD)/alpine-corresponding-source.tar.gz
 include pins.mk
 
 KERNEL_GZ := $(BUILD)/vmlinux.gz
-# terra embeds the kernel and boot disk repacked as chunked LZ4: the kernel then
+# terra embeds the kernel and boot disk packed as chunked LZ4: the kernel then
 # decodes in a few milliseconds per boot, and the boot disk is read in place.
-# The marked gzip files stay the build's artifacts, so the kernel cache and its
-# input hash do not depend on the embedded format.
+# The marked vmlinux.gz stays the kernel build's artifact, so the kernel cache and
+# its input hash do not depend on the embedded format.
 KERNEL_IMAGE := $(BUILD)/vmlinux.tlz4
-PACKED_IMAGE_INPUTS := crates/terra-protocol/src/packed_image.rs crates/terra-protocol/examples/repack-guest-image.rs
-REPACK_GUEST_IMAGE := $(CARGO_LOCKED) run -p terra-protocol --features packer --example repack-guest-image --
+PACKED_IMAGE_INPUTS := crates/terra-protocol/src/packed_image.rs crates/terra-protocol/src/guest_image.rs \
+	crates/terra-protocol/src/kernel_abi.rs crates/terra-protocol/examples/pack-guest-image.rs
+PACK_GUEST_IMAGE := $(CARGO_LOCKED) run -p terra-protocol --features packer --example pack-guest-image --
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
@@ -72,7 +73,7 @@ LIBCAP_TARBALL := $(BUILD)/libcap-$(LIBCAP_VERSION).tar.xz
 # with no filesystem tooling on the host at all. The guest (always Alpine Linux)
 # grows the fs to the configured size on first boot.
 ROOTFS_TREE := $(BUILD)/rootfs-tree
-ROOTFS_IDENTITY_INPUTS := crates/terra-protocol/src/guest_root.rs crates/terra-protocol/src/plan.rs crates/terra-protocol/examples/guest-identity.rs
+ROOTFS_IDENTITY_INPUTS := crates/terra-protocol/src/guest_root.rs crates/terra-protocol/examples/guest-identity.rs
 ROOTFS_IMG := $(BUILD)/rootfs.img.gz
 VOLUME_IMG := $(BUILD)/volume.img.gz
 VOLUME_IMG_MIB := 4
@@ -117,7 +118,7 @@ KERNEL_FRAGMENTS := kernel/terra.config kernel/$(ARCH).config
 KERNEL_PATCHES := $(sort $(wildcard kernel/patches/*.patch))
 KERNEL_OVERLAY := $(shell find kernel/overlay -type f | sort)
 KERNEL_PACKAGING_INPUTS := crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/kernel_abi.rs \
-	crates/terra-protocol/examples/package-guest-image.rs
+	crates/terra-protocol/examples/package-kernel.rs
 KERNEL_INPUTS := $(BUILD)/.kernel-inputs
 KERNEL_PATCH_STAMP := $(KERNEL_SOURCE)/.terra-patches
 KERNEL_JOBS ?= $(shell nproc)
@@ -179,7 +180,7 @@ $(KERNEL_GZ): $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(KERNEL_PACKAGING_INPUT
 	python3 scripts/kernel/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
 	$(KERNEL_MAKE) -j$(KERNEL_JOBS) $(notdir $(KERNEL_BINARY))
 	scripts/kernel/kernel-container.sh $(if $(filter x86_64,$(ARCH)),objcopy --strip-all,cp) $(KERNEL_OUTPUT)/$(KERNEL_BINARY) $(BUILD)/vmlinux
-	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- kernel $(BUILD)/vmlinux $@.tmp
+	$(CARGO_LOCKED) run -p terra-protocol --example package-kernel -- $(BUILD)/vmlinux $@.tmp
 	mv $@.tmp $@
 endif
 
@@ -190,7 +191,7 @@ kernel-export: $(KERNEL_GZ)
 	sha256sum $(BUILD)/terra-kernel-$(ARCH).tar.gz > $(BUILD)/terra-kernel-$(ARCH).tar.gz.sha256
 
 $(KERNEL_IMAGE): $(KERNEL_GZ) $(PACKED_IMAGE_INPUTS)
-	$(REPACK_GUEST_IMAGE) kernel $< $@
+	$(PACK_GUEST_IMAGE) kernel $< $@
 
 ## Static mke2fs — a *build-time* tool only: it bakes the prebaked images below.
 ## It is not shipped in the binary; the guest grows those images with resize2fs.
@@ -318,10 +319,9 @@ $(SOCKET_PROBE): crates/terra/tests/assets/socket_probe.c $(PIN_STAMP) Makefile 
 
 # Built-in drivers let the kernel boot directly from this small read-only disk.
 BOOT_TREE := $(BUILD)/boot-tree
-BOOT_GZ := $(BUILD)/boot.img.gz
 BOOT_IMAGE := $(BUILD)/boot.img.tlz4
 BOOT_IMG_MIB := 3
-$(BOOT_GZ): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/kernel_abi.rs crates/terra-protocol/examples/package-guest-image.rs
+$(BOOT_IMAGE): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile $(PACKED_IMAGE_INPUTS)
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
 	# is what gives init a console and the disk nodes; /proc, /sys and /mnt are
@@ -332,10 +332,7 @@ $(BOOT_GZ): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/ter
 	rm -f $(BUILD)/boot.img
 	truncate -s $(BOOT_IMG_MIB)M $(BUILD)/boot.img
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -m 0 -O ^has_journal -d $(BOOT_TREE) $(BUILD)/boot.img
-	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- boot $(BUILD)/boot.img $(BOOT_GZ)
-
-$(BOOT_IMAGE): $(BOOT_GZ) $(PACKED_IMAGE_INPUTS)
-	$(REPACK_GUEST_IMAGE) boot $< $@
+	$(PACK_GUEST_IMAGE) boot $(BUILD)/boot.img $@
 
 ## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
 ## component artifacts).
@@ -456,11 +453,12 @@ verify-workspace:
 	$(MAKE) verify-platform || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy -p terra-sandbox --features generator --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
-	$(CARGO_LOCKED) clippy -p terra-protocol --features packer --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) clippy -p terra-protocol --features packer,futures-io --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-sandbox --features generator --lib --target $(MUSL) || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-protocol --features futures-io --lib --target $(MUSL) || $(CHECK_FAILURE); \
 	exit $$status
 
 verify-dependency-boundaries:

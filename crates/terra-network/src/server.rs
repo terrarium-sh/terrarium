@@ -11,14 +11,14 @@ use self::tcp::bind_tcp_listener_socket;
 use self::udp::adopt_udp;
 pub(crate) use self::udp::bind_udp_socket;
 use crate::config::{Config, PublishedListener, Ready};
-use crate::{Error, ResourceKind, SocketSource};
+use crate::{Error, SocketSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::io;
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use terra_policy::BoxPolicy;
-use terra_protocol::network::{ListenerGrant, Open, Opened};
+use terra_protocol::network::{ListenerGrant, Open, Resolved, ResourceKind};
+use terra_protocol::network_control::MAX_DNS_QUERIES;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -92,7 +92,7 @@ impl Drop for GrantOwner {
     }
 }
 
-/// An admitted stream, ready for its `Opened` reply and its relay.
+/// An admitted stream, ready for its reply and its relay.
 enum Prepared {
     Tcp {
         tcp: TcpStream,
@@ -103,7 +103,6 @@ enum Prepared {
         permit: OwnedSemaphorePermit,
         grant: Option<GrantOwner>,
     },
-    Resolved(Vec<IpAddr>),
 }
 
 /// Binds the configured published listeners natively, in `config.listeners` order, for the
@@ -252,7 +251,7 @@ impl Broker {
             listeners: self.listeners,
             udp_listeners: self.udp_listeners,
             resources: Arc::new(Semaphore::new(self.max_resources)),
-            dns_requests: Arc::new(Semaphore::new(crate::MAX_DNS_REQUESTS)),
+            dns_requests: Arc::new(Semaphore::new(MAX_DNS_QUERIES)),
             resolvers: Arc::new(Semaphore::new(crate::MAX_RESOLVERS)),
             grant_owners: Arc::default(),
         });
@@ -285,13 +284,19 @@ async fn handle_stream(shared: Arc<Shared>, mut stream: Compat<yamux::Stream>) {
     let Ok(Some(open)) = terra_protocol::read_frame_async::<Open>(&mut stream).await else {
         return;
     };
+    let open = match open {
+        Open::Resolve(name) => {
+            if let Some(reply) = until_client_leaves(&mut stream, shared.resolve(&name)).await {
+                let _ = terra_protocol::write_frame_async(&mut stream, &reply).await;
+            }
+            return;
+        }
+        Open::Tcp { .. } | Open::Accept(_) | Open::Udp | Open::PublishedUdp(_) => open,
+    };
     let Some(prepared) = until_client_leaves(&mut stream, shared.prepare(open)).await else {
         return;
     };
-    let reply = prepared
-        .as_ref()
-        .map(Prepared::opened)
-        .map_err(|error| *error);
+    let reply = prepared.as_ref().map(|_| ()).map_err(|error| *error);
     if terra_protocol::write_frame_async(&mut stream, &reply)
         .await
         .is_err()
@@ -307,11 +312,11 @@ async fn handle_stream(shared: Arc<Shared>, mut stream: Compat<yamux::Stream>) {
             udp::serve(stream, udp, shared.policy.clone()).await;
             drop((permit, grant));
         }
-        Ok(Prepared::Resolved(_)) | Err(_) => {}
+        Err(_) => {}
     }
 }
 
-/// Runs `work` unless the client resets or writes before the `Opened` reply, which abandons it.
+/// Runs `work` unless the client resets or writes before the reply, which abandons it.
 async fn until_client_leaves<T>(
     stream: &mut (impl AsyncRead + Unpin),
     work: impl Future<Output = T>,
@@ -320,16 +325,6 @@ async fn until_client_leaves<T>(
     tokio::select! {
         output = work => Some(output),
         _ = stream.read(&mut unexpected) => None,
-    }
-}
-
-impl Prepared {
-    fn opened(&self) -> Opened {
-        match self {
-            Self::Tcp { .. } => Opened::Tcp,
-            Self::Udp { .. } => Opened::Udp,
-            Self::Resolved(addresses) => Opened::Resolved(addresses.clone()),
-        }
     }
 }
 
@@ -373,16 +368,19 @@ impl Shared {
                     grant: Some(owner),
                 })
             }
-            Open::Resolve(name) => {
-                let _request = self
-                    .dns_requests
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| Error::LimitExceeded)?;
-                dns::resolve(&name, &self.policy, self.resolvers.clone(), &self.sockets)
-                    .await
-                    .map(Prepared::Resolved)
-            }
+            // handle_stream answers a resolve itself: it has no flow to prepare.
+            Open::Resolve(_) => Err(Error::InvalidState),
         }
+    }
+
+    async fn resolve(&self, name: &str) -> Result<Resolved, Error> {
+        let _request = self
+            .dns_requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::LimitExceeded)?;
+        dns::resolve(name, &self.policy, self.resolvers.clone(), &self.sockets)
+            .await
+            .map(Resolved)
     }
 }

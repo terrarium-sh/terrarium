@@ -16,7 +16,8 @@ use std::{
 };
 use terra::network::broker::{self, IpAddress as HostIpAddress, SocketAddress};
 use terra_protocol::Message;
-use terra_protocol::application::{Frame as _, HostFrame, OPEN_TIMEOUT_SECS};
+use terra_protocol::application::{HostFrame, OPEN_TIMEOUT_SECS};
+use terra_protocol::network::MAX_NETWORK_CHUNK_BYTES;
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, Role};
 
@@ -24,8 +25,6 @@ mod control;
 mod publish;
 mod tcp;
 mod udp;
-
-const CHUNK_BYTES: usize = terra_protocol::network::MAX_NETWORK_CHUNK_BYTES;
 
 pub(crate) struct Flow {
     pub(crate) connection: ConnectionId,
@@ -159,7 +158,7 @@ fn parse_config(
 ) -> Result<NetworkConfig, crate::terra::network::types::Error> {
     use crate::terra::network::types::{Error, Transport};
     if config.flow_capacity == 0
-        || config.flow_capacity as usize > terra_vsock_device::MAX_NETWORK_SOCKETS
+        || config.flow_capacity as usize > terra_protocol::vsock::MAX_NETWORK_SOCKETS
         || config.host_service_ports.len() > terra_policy::MAX_EXPANDED_RULES
         || config.host_service_ports.contains(&Some(0))
         || config.published_ports.len() > terra_protocol::MAX_PUBLISHED_PORTS
@@ -338,7 +337,7 @@ pub(crate) async fn deliver_bytes(
     mut bytes: Vec<u8>,
 ) -> Result<(), SocketError> {
     while !bytes.is_empty() {
-        let capacity = wait_capacity(connection, 1, terra_vsock_device::MAX_DATA_BYTES as usize)
+        let capacity = wait_capacity(connection, 1, MAX_NETWORK_CHUNK_BYTES)
             .await
             .map_err(|()| SocketError::Cancelled)?;
         if capacity == 0 {
@@ -354,20 +353,12 @@ pub(crate) async fn deliver_bytes(
     Ok(())
 }
 
-fn frame_bytes(frame: &HostFrame) -> Result<Vec<u8>, SocketError> {
-    frame.encode().map_err(|_| SocketError::Protocol)
-}
-
 fn message_bytes<T: Message>(message: &T) -> Result<Vec<u8>, SocketError> {
     terra_protocol::encode_frame(message).map_err(|_| SocketError::Protocol)
 }
 
-async fn deliver_frame(connection: ConnectionId, frame: &HostFrame) -> Result<(), SocketError> {
-    deliver_bytes(connection, frame_bytes(frame)?).await
-}
-
 async fn deliver_opening(connection: ConnectionId, bytes: Vec<u8>) -> Result<(), SocketError> {
-    if wait_capacity(connection, bytes.len(), CHUNK_BYTES)
+    if wait_capacity(connection, bytes.len(), MAX_NETWORK_CHUNK_BYTES)
         .await
         .map_err(|()| SocketError::Cancelled)?
         == 0
@@ -390,7 +381,8 @@ async fn open_socket<T>(
     let opening = async {
         let outcome = open.await;
         let reply = HostFrame::Opened(outcome.as_ref().map(|_| ()).map_err(|error| *error));
-        deliver_opening(connection, frame_bytes(&reply)?).await?;
+        let reply = reply.encode().map_err(|_| SocketError::Protocol)?;
+        deliver_opening(connection, reply).await?;
         outcome
     };
     match run_before_deadline(OPEN_TIMEOUT_SECS, opening).await {
@@ -427,16 +419,17 @@ async fn read_message<T: Message>(connection: ConnectionId) -> Result<Option<T>,
         return Ok(None);
     }
     let prefix = <[u8; 4]>::try_from(prefix).map_err(|_| SocketError::Protocol)?;
-    let frame_bytes =
+    let frame_len =
         4 + terra_protocol::frame_payload_len::<T>(prefix).map_err(|_| SocketError::Protocol)?;
-    let frame = wait_upstream(connection, frame_bytes, frame_bytes)
+    let frame = wait_upstream(connection, frame_len, frame_len)
         .await
         .map_err(|()| SocketError::Cancelled)?;
-    let message = terra_protocol::read_frame(&mut frame.as_slice())
-        .ok()
-        .flatten()
-        .ok_or(SocketError::Protocol)?;
-    consume_upstream(connection, frame_bytes).map_err(|()| SocketError::Cancelled)?;
+    if frame.len() != frame_len {
+        return Err(SocketError::Protocol);
+    }
+    let message =
+        terra_protocol::decode_frame_payload(&frame[4..]).map_err(|_| SocketError::Protocol)?;
+    consume_upstream(connection, frame_len).map_err(|()| SocketError::Cancelled)?;
     Ok(Some(message))
 }
 
@@ -446,8 +439,8 @@ async fn run_before_deadline<T>(
 ) -> Result<T, SocketError> {
     let timer = monotonic_clock::wait_for(seconds * 1_000_000_000);
     match select(future.boxed_local(), timer.boxed_local()).await {
-        futures_util::future::Either::Left((result, _)) => Ok(result),
-        futures_util::future::Either::Right(_) => Err(SocketError::TimedOut),
+        Either::Left((result, _)) => Ok(result),
+        Either::Right(_) => Err(SocketError::TimedOut),
     }
 }
 
@@ -477,11 +470,7 @@ fn broker_error(error: broker::Error) -> SocketError {
         broker::Error::AccessDenied => SocketError::AccessDenied,
         broker::Error::InvalidArgument => SocketError::InvalidArgument,
         broker::Error::InvalidState => SocketError::InvalidState,
-        broker::Error::StaleHandle => SocketError::StaleHandle,
-        broker::Error::WrongKind => SocketError::WrongKind,
-        broker::Error::Busy => SocketError::Busy,
         broker::Error::LimitExceeded => SocketError::LimitExceeded,
-        broker::Error::DuplicateRequest => SocketError::DuplicateRequest,
         broker::Error::Cancelled => SocketError::Cancelled,
         broker::Error::ConnectionRefused => SocketError::ConnectionRefused,
         broker::Error::ConnectionReset => SocketError::ConnectionReset,
@@ -644,7 +633,7 @@ pub(crate) async fn pump_upstream(
     mut writer: wit_bindgen::StreamWriter<u8>,
 ) -> Result<(), broker::Error> {
     loop {
-        let bytes = wait_upstream(connection, 1, CHUNK_BYTES)
+        let bytes = wait_upstream(connection, 1, MAX_NETWORK_CHUNK_BYTES)
             .await
             .map_err(|()| broker::Error::Cancelled)?;
         if bytes.is_empty() {
@@ -680,10 +669,7 @@ pub(crate) async fn pump_downstream(
     output: wit_bindgen::StreamReader<u8>,
     completion: Option<wit_bindgen::FutureReader<Result<(), broker::Error>>>,
 ) -> Result<(), broker::Error> {
-    let mut chunks = std::pin::pin!(batches(
-        output,
-        terra_protocol::network::MAX_NETWORK_CHUNK_BYTES
-    ));
+    let mut chunks = std::pin::pin!(batches(output, MAX_NETWORK_CHUNK_BYTES));
     loop {
         let closed = std::pin::pin!(wait_receive_closed(connection));
         let chunk = match select(chunks.next(), closed).await {
@@ -724,7 +710,7 @@ mod tests {
         let first = ConnectionId {
             role: Role::Tcp,
             guest_port: u32::MAX - 1,
-            host_port: terra_vsock_device::TCP_VSOCK_PORT,
+            host_port: terra_protocol::vsock::TCP_PORT,
             number: u64::MAX - 1,
         };
         let second = ConnectionId {

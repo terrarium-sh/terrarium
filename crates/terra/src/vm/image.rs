@@ -14,11 +14,25 @@ static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 
 /// The guest kernel from the pinned kernel source; the Makefile sets
 /// `TERRA_KERNEL_IMAGE`.
-static KERNEL_PACKED: &[u8] = include_bytes!(env!("TERRA_KERNEL_IMAGE"));
+static KERNEL_PACKED: &[u8] = marked_image(
+    include_bytes!(env!("TERRA_KERNEL_IMAGE")),
+    GuestImage::Kernel,
+);
 
 /// A read-only ext4 with the guest agent and `resize2fs`. The guest's root
 /// filesystem is this volume, never a host directory.
-static BOOT_PACKED: &[u8] = include_bytes!(env!("TERRA_BOOT_IMAGE"));
+static BOOT_PACKED: &[u8] =
+    marked_image(include_bytes!(env!("TERRA_BOOT_IMAGE")), GuestImage::Boot);
+
+/// Fails the build, not the first boot, when `make` has not rebuilt an embedded image for this
+/// protocol.
+const fn marked_image(bytes: &'static [u8], kind: GuestImage) -> &'static [u8] {
+    assert!(
+        terra_protocol::packed_image::has_marker(bytes, kind),
+        "an embedded guest image is stale; run `make` to rebuild the kernel and boot images"
+    );
+    bytes
+}
 
 pub(crate) const BYTES_PER_MIB: u64 = 1024 * 1024;
 

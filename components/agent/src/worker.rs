@@ -18,7 +18,7 @@ use futures_util::{
 use std::{pin::pin, task::Poll};
 use terra_protocol::{
     AgentCommand, encode_frame,
-    mux::{MAX_CLIENT_STREAMS, MAX_STREAM_FRAME_BYTES},
+    mux::{CONTROL_STREAM_ID, DIAGNOSTIC_STREAM_ID, MAX_CLIENT_STREAMS, MAX_STREAM_FRAME_BYTES},
 };
 
 type FutureReader<T> = wit_bindgen::rt::async_support::FutureReader<T>;
@@ -93,10 +93,10 @@ fn clock_syncs() -> impl Stream<Item = AgentCommand> {
                 continue;
             }
             previous = Some(sample);
-            let command = AgentCommand::SyncClock {
+            let command = AgentCommand::SyncClock(terra_protocol::HostTime {
                 seconds: instant.seconds,
                 nanoseconds: instant.nanoseconds,
-            };
+            });
             return Some((command, previous));
         }
     })
@@ -183,11 +183,15 @@ fn poll_new_client(
     connection.poll_new_outbound(context).map_err(|_| ())
 }
 
-async fn next_inbound(connection: &mut yamux::Connection<ByteStream>) -> Option<yamux::Stream> {
-    match poll_fn(|context| connection.poll_next_inbound(context)).await {
-        Some(Ok(stream)) => Some(stream),
-        Some(Err(_)) | None => None,
-    }
+/// The guest's next stream, if it is the reserved stream `id`.
+async fn next_reserved(
+    connection: &mut yamux::Connection<ByteStream>,
+    id: u32,
+) -> Option<yamux::Stream> {
+    poll_fn(|context| connection.poll_next_inbound(context))
+        .await?
+        .ok()
+        .filter(|stream| stream.id().val() == id)
 }
 
 async fn run_mux(
@@ -200,15 +204,12 @@ async fn run_mux(
 ) {
     let mut connection = yamux::Connection::new(
         carrier,
-        terra_protocol::mux::yamux_config(),
+        terra_protocol::mux::agent_yamux_config(),
         yamux::Mode::Server,
     );
-    let Some(control) = next_inbound(&mut connection).await else {
+    let Some(control) = next_reserved(&mut connection, CONTROL_STREAM_ID).await else {
         return;
     };
-    if control.id().val() != terra_protocol::mux::CONTROL_STREAM_ID {
-        return;
-    }
     let (control_reader, control_writer) = AsyncReadExt::split(control);
     let control = async {
         future::select(
@@ -218,12 +219,10 @@ async fn run_mux(
         .await;
     };
     let clients = async move {
-        let Some(diagnostic_stream) = next_inbound(&mut connection).await else {
+        let Some(diagnostic_stream) = next_reserved(&mut connection, DIAGNOSTIC_STREAM_ID).await
+        else {
             return;
         };
-        if diagnostic_stream.id().val() != terra_protocol::mux::DIAGNOSTIC_STREAM_ID {
-            return;
-        }
         alongside(
             serve_clients(connection, listener),
             read_diagnostics(diagnostic_stream, diagnostics),

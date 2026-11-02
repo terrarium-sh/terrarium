@@ -7,7 +7,7 @@ use std::num::NonZeroU16;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use terra_protocol::{AgentOutput, TermSize};
+use terra_protocol::{AgentOutput, DetachOutcome, TermSize};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -118,12 +118,6 @@ struct Client {
     id: u64,
     conn: ClientConn,
     size: Option<(u16, u16)>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DetachOutcome {
-    Missing,
-    Detached,
 }
 
 impl Session {

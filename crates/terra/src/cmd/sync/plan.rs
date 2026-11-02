@@ -1,6 +1,7 @@
+use super::SyncDirection;
 use super::exec::{COPY_DATA_TIMEOUT, read_reply, send_request};
 use super::names::HostNames;
-use super::scan::{optional_metadata, scan_host_directory};
+use super::scan::{join_relative, optional_metadata, scan_host_directory};
 use super::security::{effective_mode, validate_download_links, validate_manifest};
 use crate::sys;
 use anyhow::{Context, Result};
@@ -9,9 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
-use terra_protocol::{
-    MAX_FILE_BYTES, SyncDirection, SyncEntry, SyncEntryKind, SyncReply, SyncRequest,
-};
+use terra_protocol::{MAX_SYNC_FILE_BYTES, SyncEntry, SyncEntryKind, SyncReply, SyncRequest};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -85,7 +84,7 @@ fn hash_file_worker(path: &Path) -> Result<[u8; 32]> {
     let mut buf = [0u8; 16 * 1024];
     loop {
         anyhow::ensure!(
-            Instant::now() < deadline && total_bytes <= MAX_FILE_BYTES,
+            Instant::now() < deadline && total_bytes <= MAX_SYNC_FILE_BYTES,
             "hashing exceeded its limit"
         );
         match file.read(&mut buf) {
@@ -151,21 +150,19 @@ async fn compute_checksum_pair(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn plan_file_update(
     rel_path: &str,
     src: &SyncEntry,
+    src_size: u64,
     dst: &SyncEntry,
     is_checksum: bool,
-    direction: SyncDirection,
+    direction: SyncDirection<'_>,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    host_target_root: &Path,
-    host_source_root: &Path,
 ) -> Result<PlanAction> {
-    if dst.kind != SyncEntryKind::File || src.size != dst.size {
+    if dst.kind != (SyncEntryKind::File { size: src_size }) {
         return Ok(PlanAction::TransferFile {
             rel_path: rel_path.to_string(),
-            size: src.size,
+            size: src_size,
             mode: src.mode,
             mtime_secs: src.mtime_secs,
             mtime_nanos: src.mtime_nanos,
@@ -174,22 +171,8 @@ async fn plan_file_update(
 
     let is_identical = if is_checksum {
         let (host_file_path, guest_is_src) = match direction {
-            SyncDirection::HostToGuest => (
-                if rel_path.is_empty() {
-                    host_source_root.to_path_buf()
-                } else {
-                    host_source_root.join(rel_path)
-                },
-                false,
-            ),
-            SyncDirection::GuestToHost => (
-                if rel_path.is_empty() {
-                    host_target_root.to_path_buf()
-                } else {
-                    host_target_root.join(rel_path)
-                },
-                true,
-            ),
+            SyncDirection::HostToGuest { source } => (join_relative(source, rel_path), false),
+            SyncDirection::GuestToHost { target } => (join_relative(target, rel_path), true),
         };
         let (src_sha, dst_sha) =
             compute_checksum_pair(stream, rel_path, &host_file_path, guest_is_src).await?;
@@ -216,7 +199,7 @@ async fn plan_file_update(
     } else {
         Ok(PlanAction::TransferFile {
             rel_path: rel_path.to_string(),
-            size: src.size,
+            size: src_size,
             mode: src.mode,
             mtime_secs: src.mtime_secs,
             mtime_nanos: src.mtime_nanos,
@@ -241,25 +224,25 @@ fn find_changed_parent(action: &PlanAction) -> Option<String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub(super) async fn build_plan(
     source_entries: &BTreeMap<String, SyncEntry>,
     target_entries: &BTreeMap<String, SyncEntry>,
     is_checksum: bool,
     is_delete: bool,
-    direction: SyncDirection,
+    direction: SyncDirection<'_>,
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    host_target_root: &Path,
-    host_source_root: &Path,
 ) -> Result<Vec<PlanAction>> {
     validate_plan_conflicts(source_entries, target_entries)?;
-    if direction == SyncDirection::GuestToHost {
+    if let SyncDirection::GuestToHost {
+        target: host_target_root,
+    } = direction
+    {
         let standalone_source;
         let sibling_entries;
         let (link_root, link_source, link_target) = if let Some(entry) = source_entries
             .get("")
-            .filter(|entry| entry.kind == SyncEntryKind::Symlink)
+            .filter(|entry| matches!(entry.kind, SyncEntryKind::Symlink { .. }))
         {
             let parent = host_target_root
                 .parent()
@@ -293,7 +276,7 @@ pub(super) async fn build_plan(
     let mut actions = Vec::new();
     for (rel_path, src) in source_entries {
         match target_entries.get(rel_path) {
-            None => match src.kind {
+            None => match &src.kind {
                 SyncEntryKind::Directory => {
                     actions.push(PlanAction::CreateDir {
                         rel_path: rel_path.clone(),
@@ -306,26 +289,23 @@ pub(super) async fn build_plan(
                         mtime_nanos: src.mtime_nanos,
                     });
                 }
-                SyncEntryKind::File => {
+                SyncEntryKind::File { size } => {
                     actions.push(PlanAction::TransferFile {
                         rel_path: rel_path.clone(),
-                        size: src.size,
+                        size: *size,
                         mode: src.mode,
                         mtime_secs: src.mtime_secs,
                         mtime_nanos: src.mtime_nanos,
                     });
                 }
-                SyncEntryKind::Symlink => {
-                    let target = src.link_target.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("symlink entry missing target: {rel_path}")
-                    })?;
+                SyncEntryKind::Symlink { target } => {
                     actions.push(PlanAction::CreateSymlink {
                         rel_path: rel_path.clone(),
                         target: target.clone(),
                     });
                 }
             },
-            Some(dst) => match src.kind {
+            Some(dst) => match &src.kind {
                 SyncEntryKind::Directory => {
                     let mode_differs = effective_mode(src.mode, direction) != dst.mode;
                     let mtime_differs =
@@ -343,34 +323,22 @@ pub(super) async fn build_plan(
                         });
                     }
                 }
-                SyncEntryKind::Symlink => {
-                    if dst.kind != SyncEntryKind::Symlink || src.link_target != dst.link_target {
-                        let target = src.link_target.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("symlink entry missing target: {rel_path}")
-                        })?;
+                SyncEntryKind::Symlink { target } => {
+                    if dst.kind == src.kind {
+                        actions.push(PlanAction::Skip {
+                            rel_path: rel_path.clone(),
+                        });
+                    } else {
                         actions.push(PlanAction::CreateSymlink {
                             rel_path: rel_path.clone(),
                             target: target.clone(),
                         });
-                    } else {
-                        actions.push(PlanAction::Skip {
-                            rel_path: rel_path.clone(),
-                        });
                     }
                 }
-                SyncEntryKind::File => {
+                SyncEntryKind::File { size } => {
                     actions.push(
-                        plan_file_update(
-                            rel_path,
-                            src,
-                            dst,
-                            is_checksum,
-                            direction,
-                            stream,
-                            host_target_root,
-                            host_source_root,
-                        )
-                        .await?,
+                        plan_file_update(rel_path, src, *size, dst, is_checksum, direction, stream)
+                            .await?,
                     );
                 }
             },
@@ -422,21 +390,35 @@ mod tests {
     async fn directory_updates_follow_actual_child_mutations() {
         use super::super::test_support::entry;
 
-        for direction in [SyncDirection::HostToGuest, SyncDirection::GuestToHost] {
+        for is_download in [false, true] {
             let root = tempfile::tempdir().unwrap();
+            let direction = if is_download {
+                SyncDirection::GuestToHost {
+                    target: root.path(),
+                }
+            } else {
+                SyncDirection::HostToGuest {
+                    source: root.path(),
+                }
+            };
             let mut unchanged = BTreeMap::new();
             for path in ["", "changed", "changed/nested", "untouched"] {
                 std::fs::create_dir_all(root.path().join(path)).unwrap();
-                unchanged.insert(path.into(), entry(path, SyncEntryKind::Directory, None));
+                unchanged.insert(path.into(), entry(path, SyncEntryKind::Directory));
             }
             let path = "changed/nested/file";
-            let file = entry(path, SyncEntryKind::File, None);
+            let file = entry(path, SyncEntryKind::File { size: 0 });
             let mut replaced = file.clone();
             replaced.mtime_secs += 1;
             let mut metadata_only = file.clone();
             metadata_only.mode = 0o644;
-            let directory = entry(path, SyncEntryKind::Directory, None);
-            let link = entry(path, SyncEntryKind::Symlink, Some("../nested"));
+            let directory = entry(path, SyncEntryKind::Directory);
+            let link = entry(
+                path,
+                SyncEntryKind::Symlink {
+                    target: "../nested".into(),
+                },
+            );
             for (source_file, target_file, is_delete, expected) in [
                 (Some(file.clone()), Some(file.clone()), false, vec![]),
                 (
@@ -466,8 +448,6 @@ mod tests {
                     is_delete,
                     direction,
                     &mut peer(&[]),
-                    root.path(),
-                    root.path(),
                 )
                 .await
                 .unwrap();
@@ -488,24 +468,27 @@ mod tests {
         use super::super::test_support::entry;
 
         let target: BTreeMap<_, _> = [
-            entry("", SyncEntryKind::Directory, None),
-            entry("metadata", SyncEntryKind::Directory, None),
+            entry("", SyncEntryKind::Directory),
+            entry("metadata", SyncEntryKind::Directory),
         ]
         .into_iter()
         .map(|entry| (entry.relative_path.clone(), entry))
         .collect();
         let mut source = target.clone();
         source.get_mut("metadata").unwrap().mtime_secs += 1;
-        source.insert("file".into(), entry("file", SyncEntryKind::File, None));
+        source.insert(
+            "file".into(),
+            entry("file", SyncEntryKind::File { size: 0 }),
+        );
         let actions = build_plan(
             &source,
             &target,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("."),
+            },
             &mut peer(&[]),
-            Path::new("."),
-            Path::new("."),
         )
         .await
         .unwrap();
@@ -528,9 +511,9 @@ mod tests {
         std::fs::create_dir(root.path().join("nested")).unwrap();
         std::fs::write(root.path().join("nested/file"), []).unwrap();
         let source: BTreeMap<_, _> = [
-            entry("", SyncEntryKind::Directory, None),
-            entry("nested", SyncEntryKind::Directory, None),
-            entry("nested/file", SyncEntryKind::File, None),
+            entry("", SyncEntryKind::Directory),
+            entry("nested", SyncEntryKind::Directory),
+            entry("nested/file", SyncEntryKind::File { size: 0 }),
         ]
         .into_iter()
         .map(|entry| (entry.relative_path.clone(), entry))
@@ -540,10 +523,10 @@ mod tests {
             &source,
             true,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: root.path(),
+            },
             &mut peer(&[SyncReply::Digest { sha256: [0; 32] }]),
-            root.path(),
-            root.path(),
         )
         .await
         .unwrap();
@@ -566,10 +549,10 @@ mod tests {
         for path in
             std::iter::once(String::new()).chain((0..10_000).map(|index| format!("dir{index:05}")))
         {
-            source.insert(path.clone(), entry(&path, SyncEntryKind::Directory, None));
+            source.insert(path.clone(), entry(&path, SyncEntryKind::Directory));
         }
         let path = "dir00000/file";
-        source.insert(path.into(), entry(path, SyncEntryKind::File, None));
+        source.insert(path.into(), entry(path, SyncEntryKind::File { size: 0 }));
         let mut target = source.clone();
         target.get_mut(path).unwrap().mtime_secs += 1;
         for sample in 0..11 {
@@ -579,10 +562,10 @@ mod tests {
                 &target,
                 false,
                 false,
-                SyncDirection::HostToGuest,
+                SyncDirection::HostToGuest {
+                    source: Path::new("."),
+                },
                 &mut peer(&[]),
-                Path::new("."),
-                Path::new("."),
             )
             .await
             .unwrap();
@@ -612,10 +595,10 @@ mod tests {
             let (result, requests) = tokio::join!(
                 execute_plan(
                     &updates,
-                    SyncDirection::HostToGuest,
+                    SyncDirection::HostToGuest {
+                        source: Path::new(".")
+                    },
                     &mut client,
-                    Path::new("."),
-                    Path::new("."),
                     false
                 ),
                 respond,
@@ -640,11 +623,9 @@ mod tests {
             SyncEntry {
                 relative_path: "conflict".to_string(),
                 kind: SyncEntryKind::Directory,
-                size: 0,
                 mode: 0o755,
                 mtime_secs: 100,
                 mtime_nanos: 0,
-                link_target: None,
             },
         );
         let mut target = BTreeMap::new();
@@ -652,12 +633,10 @@ mod tests {
             "conflict".to_string(),
             SyncEntry {
                 relative_path: "conflict".to_string(),
-                kind: SyncEntryKind::File,
-                size: 10,
+                kind: SyncEntryKind::File { size: 10 },
                 mode: 0o644,
                 mtime_secs: 100,
                 mtime_nanos: 0,
-                link_target: None,
             },
         );
 
@@ -667,10 +646,10 @@ mod tests {
             &target,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap_err()
@@ -683,10 +662,10 @@ mod tests {
             &source,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap_err()
@@ -702,12 +681,10 @@ mod tests {
             "extra.txt".to_string(),
             SyncEntry {
                 relative_path: "extra.txt".to_string(),
-                kind: SyncEntryKind::File,
-                size: 10,
+                kind: SyncEntryKind::File { size: 10 },
                 mode: 0o644,
                 mtime_secs: 100,
                 mtime_nanos: 0,
-                link_target: None,
             },
         );
 
@@ -718,10 +695,10 @@ mod tests {
             &target,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap();
@@ -738,10 +715,10 @@ mod tests {
             &target,
             false,
             true,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap();
@@ -758,12 +735,10 @@ mod tests {
     async fn plan_skips_when_metadata_matches_and_updates_when_it_differs() {
         let make_entry = |mode: u32, mtime_secs: i64| SyncEntry {
             relative_path: "file.txt".to_string(),
-            kind: SyncEntryKind::File,
-            size: 42,
+            kind: SyncEntryKind::File { size: 42 },
             mode,
             mtime_secs,
             mtime_nanos: 0,
-            link_target: None,
         };
 
         let mut source = BTreeMap::new();
@@ -779,10 +754,10 @@ mod tests {
             &target_match,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap();
@@ -802,10 +777,10 @@ mod tests {
             &target_mode_diff,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap();
@@ -828,10 +803,10 @@ mod tests {
             &target_mtime_diff,
             false,
             false,
-            SyncDirection::HostToGuest,
+            SyncDirection::HostToGuest {
+                source: Path::new("/dummy"),
+            },
             &mut dummy,
-            Path::new("/dummy"),
-            Path::new("/dummy"),
         )
         .await
         .unwrap();

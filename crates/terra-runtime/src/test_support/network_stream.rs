@@ -35,7 +35,7 @@ fn receive_window(stream: Stream) -> u32 {
     if is_fixed(stream) {
         65536
     } else {
-        u32::try_from(FLOW_REPLY_BYTES).unwrap_or(u32::MAX)
+        FLOW_REPLY_BYTES
     }
 }
 
@@ -172,7 +172,7 @@ impl GuestStream {
         let chunk_bytes = if is_fixed(stream) {
             997
         } else {
-            FLOW_UPSTREAM_BYTES
+            FLOW_UPSTREAM_BYTES as usize
         };
         let mut remaining = bytes;
         while !remaining.is_empty() {
@@ -274,7 +274,7 @@ impl GuestStream {
         let length = application::frame_len(bytes.as_slice().try_into()?)?;
         bytes.extend(self.read_bytes(stream, length - HEADER_BYTES).await?);
         HostFrame::decode(&bytes)?
-            .map(|(frame, _)| frame)
+            .map(|(frame, _)| frame.into_owned())
             .ok_or_else(|| wasmtime::Error::msg("network device suite incomplete frame"))
     }
 
@@ -282,11 +282,11 @@ impl GuestStream {
         &mut self,
         stream: Stream,
     ) -> wasmtime::Result<T> {
-        let mut frame = self.read_bytes(stream, 4).await?;
-        let length = terra_protocol::frame_payload_len::<T>(frame.as_slice().try_into()?)?;
-        frame.extend(self.read_bytes(stream, length).await?);
-        terra_protocol::read_frame(&mut frame.as_slice())?
-            .ok_or_else(|| wasmtime::Error::msg("network device suite incomplete message"))
+        let prefix = self.read_bytes(stream, 4).await?;
+        let length = terra_protocol::frame_payload_len::<T>(prefix.as_slice().try_into()?)?;
+        Ok(terra_protocol::decode_frame_payload(
+            &self.read_bytes(stream, length).await?,
+        )?)
     }
 
     pub(super) async fn finish_input(&mut self, stream: Stream) -> wasmtime::Result<()> {

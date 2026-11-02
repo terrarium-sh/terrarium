@@ -13,9 +13,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use terra_policy::BoxPolicy;
+use terra_protocol::application::MAX_NETWORK_DATAGRAM_BYTES;
 use terra_protocol::network::{
-    DatagramBatch, MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BYTES, SendFailure, UdpReply,
-    UdpRequest,
+    DatagramBatch, ListenerGrant, MAX_NETWORK_CHUNK_BYTES, SendFailure, UdpReply, UdpRequest,
 };
 use tokio::io::{Interest, ReadHalf};
 use tokio::net::UdpSocket;
@@ -118,7 +118,7 @@ pub(super) struct UdpResource {
     pub(super) ipv4: Option<Arc<OffloadSocket>>,
     pub(super) ipv6: Option<Arc<OffloadSocket>>,
     pub(super) peers: Arc<Mutex<UdpPeers>>,
-    pub(super) publication_grant: Option<crate::ListenerGrant>,
+    pub(super) publication_grant: Option<ListenerGrant>,
     pub(super) receiving: Arc<tokio::sync::Mutex<ReceiveState>>,
 }
 
@@ -523,13 +523,13 @@ pub(super) fn open(sockets: &SocketSource) -> Result<UdpResource, Error> {
 
 pub(super) fn open_published(
     socket: Arc<OffloadSocket>,
-    grant: crate::ListenerGrant,
+    grant: ListenerGrant,
 ) -> Result<UdpResource, Error> {
     let is_ipv4 = socket.local_addr().map_err(map_io_error)?.is_ipv4();
     Ok(UdpResource {
         ipv4: is_ipv4.then(|| socket.clone()),
         ipv6: (!is_ipv4).then_some(socket),
-        peers: UdpPeers::shared(crate::MAX_UDP_PUBLICATION_PEERS),
+        peers: UdpPeers::shared(terra_protocol::network::MAX_UDP_PUBLICATION_PEERS),
         publication_grant: Some(grant),
         receiving: Arc::default(),
     })

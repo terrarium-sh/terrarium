@@ -14,19 +14,18 @@ tokio = { version = "1", default-features = false, features = ["io-util"], optio
 futures-util = { version = "0.3", default-features = false, features = ["std", "io"], optional = true }
 yamux = { version = "=0.14.1", optional = true }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"], optional = true }
-crc32fast = { version = "1", features = ["std"], optional = true }
 lz4 = { version = "1", optional = true }
 
 [features]
 tokio = ["dep:tokio"]
 futures-io = ["dep:futures-util"]
 mux = ["dep:yamux"]
-packed-image = ["dep:lz4_flex", "dep:crc32fast"]
+packed-image = ["dep:lz4_flex"]
 packer = ["packed-image", "dep:lz4"]
-test-support = ["packed-image"]
+test-support = []
 
 [[example]]
-name = "repack-guest-image"
+name = "pack-guest-image"
 required-features = ["packer"]
 
 [[example]]

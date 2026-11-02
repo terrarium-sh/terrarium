@@ -1,18 +1,15 @@
-//! The guest root image's fixed layout, shared by the image build and the agent.
-
-/// First subordinate uid and gid the workload user owns, for rootless containers.
-pub const SUBORDINATE_ID_START: u32 = 100_000;
-pub const SUBORDINATE_ID_COUNT: u32 = 65_536;
+//! The guest root image's fixed layout and workload identity, shared by the image build and the agent.
 
 /// tmpfs directory the agent fills from the plan on every boot.
 pub const PER_BOOT_DIR: &str = "/run/terra";
-pub const PER_BOOT_RESOLV_CONF: &str = "/run/terra/resolv.conf";
-pub const PER_BOOT_DOAS_CONF: &str = "/run/terra/doas.conf";
-pub const PER_BOOT_DOAS_DIR: &str = "/run/terra/doas.d";
-pub const PER_BOOT_LOCALTIME: &str = "/run/terra/localtime";
-pub const PER_BOOT_SANDBOX_INFO: &str = "/run/terra/README.md";
+// The per-boot files' names inside `PER_BOOT_DIR`.
+pub const PER_BOOT_RESOLV_CONF: &str = "resolv.conf";
+pub const PER_BOOT_DOAS_CONF: &str = "doas.conf";
+pub const PER_BOOT_DOAS_DIR: &str = "doas.d";
+pub const PER_BOOT_LOCALTIME: &str = "localtime";
+pub const PER_BOOT_SANDBOX_INFO: &str = "README.md";
 
-/// Root paths linked to per-boot files on tmpfs.
+/// Root paths linked to the per-boot file of that name in [`PER_BOOT_DIR`].
 pub const PER_BOOT_LINKS: [(&str, &str); 5] = [
     ("/etc/resolv.conf", PER_BOOT_RESOLV_CONF),
     ("/etc/doas.conf", PER_BOOT_DOAS_CONF),
@@ -24,7 +21,7 @@ pub const PER_BOOT_LINKS: [(&str, &str); 5] = [
 /// Restores [`PER_BOOT_LINKS`] after commands such as `sed -i` replace the symlinks.
 #[cfg(unix)]
 pub fn link_per_boot_files(root: &std::path::Path) -> std::io::Result<()> {
-    for (link, target) in PER_BOOT_LINKS {
+    for (link, name) in PER_BOOT_LINKS {
         let link = root.join(link.trim_start_matches('/'));
         match std::fs::symlink_metadata(&link) {
             Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&link)?,
@@ -35,23 +32,33 @@ pub fn link_per_boot_files(root: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::os::unix::fs::symlink(target, &link)?;
+        std::os::unix::fs::symlink(std::path::Path::new(PER_BOOT_DIR).join(name), &link)?;
     }
     Ok(())
 }
+
+/// Workload user name (cosmetic, for shell prompts).
+pub const WORKLOAD_USER_NAME: &str = "terri";
+
+/// The non-root workload user's uid and gid.
+pub const WORKLOAD_ID: u32 = 1000;
+
+pub const WORKLOAD_HOME: &str = "/home/terri";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn every_link_points_into_the_per_boot_dir_and_none_repeats() {
+    fn match_workload_home_to_user() {
+        assert_eq!(WORKLOAD_HOME, format!("/home/{WORKLOAD_USER_NAME}"));
+    }
+
+    #[test]
+    fn every_link_names_a_per_boot_file_and_none_repeats() {
         let mut links = std::collections::BTreeSet::new();
-        for (link, target) in PER_BOOT_LINKS {
-            assert!(
-                target.starts_with(&format!("{PER_BOOT_DIR}/")),
-                "{link} -> {target}"
-            );
+        for (link, name) in PER_BOOT_LINKS {
+            assert!(!name.is_empty() && !name.contains('/'), "{link} -> {name}");
             assert!(link.starts_with('/') && !link.starts_with(PER_BOOT_DIR));
             assert!(links.insert(link), "{link} repeats");
         }

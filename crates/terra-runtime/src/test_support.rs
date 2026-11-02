@@ -21,6 +21,7 @@ pub(crate) mod network;
 mod network_stream;
 pub mod virtio;
 mod vsock;
+pub mod yamux;
 
 pub struct StandaloneHost<H> {
     host: H,

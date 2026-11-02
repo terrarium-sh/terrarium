@@ -12,12 +12,10 @@ use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::network::{NetworkBackend, PortMapping};
 use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
-use terra_protocol::application::{
-    Frame as _, GuestFrame, HostFrame, TcpKeepalive, TcpOpenOptions, UdpRun,
-};
-use terra_protocol::network_control::{
-    AgentControl, DnsPayload, DnsTransport, FrontendControl, Publication,
-};
+use terra_protocol::application::{GuestFrame, HostFrame, TcpKeepalive, TcpOpenOptions, UdpRun};
+use terra_protocol::dns::DnsTransport;
+use terra_protocol::network::ResourceKind;
+use terra_protocol::network_control::{DnsQuery, DnsResult, FrontendControl, Publication};
 use terra_protocol::socket::{self, Error};
 use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, PUBLICATION_PORT, TCP_PORT, UDP_PORT,
@@ -55,22 +53,22 @@ fn create_backend(
         PublishedListener {
             grant: 1,
             address: (Ipv4Addr::LOCALHOST, endpoints.published).into(),
-            transport: terra_network::ResourceKind::Tcp,
+            transport: ResourceKind::Tcp,
         },
         PublishedListener {
             grant: 2,
             address: (std::net::Ipv6Addr::LOCALHOST, endpoints.published).into(),
-            transport: terra_network::ResourceKind::Tcp,
+            transport: ResourceKind::Tcp,
         },
         PublishedListener {
             grant: 3,
             address: (Ipv4Addr::LOCALHOST, endpoints.published).into(),
-            transport: terra_network::ResourceKind::Udp,
+            transport: ResourceKind::Udp,
         },
         PublishedListener {
             grant: 4,
             address: (std::net::Ipv6Addr::LOCALHOST, endpoints.published).into(),
-            transport: terra_network::ResourceKind::Udp,
+            transport: ResourceKind::Udp,
         },
     ];
     let broker = terra_network::Broker::bind(&Config {
@@ -293,7 +291,7 @@ async fn serve_many_addresses(endpoint: tokio::io::DuplexStream) -> wasmtime::Re
 
     let mut connection = yamux::Connection::new(
         endpoint.compat(),
-        yamux::Config::default(),
+        terra_network::broker_yamux_config(),
         yamux::Mode::Server,
     );
     let mut answers = tokio::task::JoinSet::new();
@@ -311,7 +309,7 @@ async fn serve_many_addresses(endpoint: tokio::io::DuplexStream) -> wasmtime::Re
 }
 
 async fn answer_many_addresses(stream: yamux::Stream) -> wasmtime::Result<()> {
-    use terra_protocol::network::{Open, Opened};
+    use terra_protocol::network::{Open, Resolved};
     use tokio::io::AsyncWriteExt;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
@@ -321,7 +319,7 @@ async fn answer_many_addresses(stream: yamux::Stream) -> wasmtime::Result<()> {
         open == Some(Open::Resolve("many.test".into())),
         "DNS fallback broker resolves only the configured fixture"
     );
-    let reply: Result<Opened, terra_network::Error> = Ok(Opened::Resolved(
+    let reply: Result<Resolved, terra_network::Error> = Ok(Resolved(
         (1..=32)
             .map(|last| Ipv4Addr::new(192, 0, 2, last).into())
             .collect(),
@@ -582,8 +580,9 @@ fn serve_stalled_streams(listener: &TcpListener) -> wasmtime::Result<()> {
             let listener = tokio::net::TcpListener::from_std(listener.try_clone()?)?;
             let payload = vec![
                 47;
-                terra_protocol::vsock::FLOW_REPLY_BYTES
-                    + terra_protocol::vsock::FLOW_UPSTREAM_BYTES
+                (terra_protocol::vsock::FLOW_REPLY_BYTES
+                    + terra_protocol::vsock::FLOW_UPSTREAM_BYTES)
+                    as usize
             ];
             let mut streams = Vec::with_capacity(STALLED_TCP_COUNT);
             for _ in 0..STALLED_TCP_COUNT {
@@ -685,7 +684,7 @@ async fn run_socket_streams(
             PortMapping {
                 host: endpoints.published,
                 guest: 8081,
-                transport: terra_network::ResourceKind::Udp,
+                transport: ResourceKind::Udp,
             },
         ],
     )
@@ -760,7 +759,10 @@ async fn exercise_admission_pressure(
         stalled.push(guest.open_tcp(host_service(tcp_port)).await?);
     }
     for &stream in &stalled {
-        guest.stream.wait_buffered(stream, FLOW_REPLY_BYTES).await?;
+        guest
+            .stream
+            .wait_buffered(stream, FLOW_REPLY_BYTES as usize)
+            .await?;
     }
     for refused in [(19000, TCP_PORT), (19000, UDP_PORT)] {
         guest
@@ -800,7 +802,7 @@ async fn exercise_admission_pressure(
             "capacity denial preserves admitted TCP flows"
         );
         wasmtime::ensure!(
-            guest.stream.buffered_bytes(stream) == FLOW_REPLY_BYTES,
+            guest.stream.buffered_bytes(stream) == FLOW_REPLY_BYTES as usize,
             "unread TCP payload stays within the advertised guest receive window"
         );
         wasmtime::ensure!(
@@ -1040,10 +1042,6 @@ impl GuestNetwork {
             udp_publications: Vec::new(),
         };
         guest.stream.connect(CONTROL).await?;
-        guest
-            .stream
-            .send_control(CONTROL, &AgentControl::Hello)
-            .await?;
         wasmtime::ensure!(
             guest
                 .stream
@@ -1493,22 +1491,18 @@ impl GuestNetwork {
     ) -> wasmtime::Result<u32> {
         let id = self.next_query;
         self.next_query += 1;
-        let query = AgentControl::DnsQuery(DnsPayload {
+        let query = DnsQuery {
             id,
             transport,
             bytes,
-        });
+        };
         self.stream.send_control(CONTROL, &query).await?;
         Ok(id)
     }
 
-    async fn read_dns(&mut self) -> wasmtime::Result<(u32, DnsTransport, Vec<u8>)> {
+    async fn read_dns(&mut self) -> wasmtime::Result<DnsResult> {
         match self.stream.read_message(CONTROL).await? {
-            FrontendControl::DnsResult(DnsPayload {
-                id,
-                transport,
-                bytes,
-            }) => Ok((id, transport, bytes)),
+            FrontendControl::DnsResult(result) => Ok(result),
             FrontendControl::Ready => wasmtime::bail!("unexpected control message Ready"),
         }
     }
@@ -1519,12 +1513,9 @@ impl GuestNetwork {
         bytes: Vec<u8>,
     ) -> wasmtime::Result<Vec<u8>> {
         let id = self.query_dns(transport, bytes).await?;
-        let (answered, answered_transport, bytes) = self.read_dns().await?;
-        wasmtime::ensure!(
-            answered == id && answered_transport == transport,
-            "DNS result identity"
-        );
-        Ok(bytes)
+        let result = self.read_dns().await?;
+        wasmtime::ensure!(result.id == id, "DNS result identity");
+        Ok(result.bytes)
     }
 
     async fn exercise_dns(&mut self) -> wasmtime::Result<()> {
@@ -1536,15 +1527,14 @@ impl GuestNetwork {
             );
         }
         while !pending.is_empty() {
-            let (id, transport, bytes) = self.read_dns().await?;
+            let DnsResult { id, bytes } = self.read_dns().await?;
             let position = pending
                 .iter()
                 .position(|query| *query == id)
                 .ok_or_else(|| wasmtime::Error::msg("unknown DNS result identity"))?;
             pending.remove(position);
             wasmtime::ensure!(
-                transport == DnsTransport::Datagram
-                    && bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
+                bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
                 "concurrent DNS broker result"
             );
         }

@@ -10,12 +10,10 @@ const BOOT_CHUNK_BYTES: u32 = 64 * 1024;
 
 const MAGIC_RANGE: Range<usize> = 0..MAGIC.len();
 const MARKER_RANGE: Range<usize> = MAGIC_RANGE.end..MAGIC_RANGE.end + MARKER_BYTES;
-const CHUNK_BYTES_RANGE: Range<usize> = MARKER_RANGE.end..MARKER_RANGE.end + 4;
-const IMAGE_BYTES_RANGE: Range<usize> = CHUNK_BYTES_RANGE.end..CHUNK_BYTES_RANGE.end + 8;
-const CHUNK_COUNT_RANGE: Range<usize> = IMAGE_BYTES_RANGE.end..IMAGE_BYTES_RANGE.end + 4;
-const HEADER_BYTES: usize = CHUNK_COUNT_RANGE.end;
-const TABLE_ENTRY_BYTES: usize = 8;
-const ENTRY_CRC_AT: usize = 4;
+const IMAGE_BYTES_RANGE: Range<usize> = MARKER_RANGE.end..MARKER_RANGE.end + 8;
+const HEADER_BYTES: usize = IMAGE_BYTES_RANGE.end;
+/// A chunk table entry: the chunk's compressed size.
+const TABLE_ENTRY_BYTES: usize = 4;
 
 #[must_use]
 pub const fn chunk_bytes(kind: GuestImage) -> u32 {
@@ -25,52 +23,37 @@ pub const fn chunk_bytes(kind: GuestImage) -> u32 {
     }
 }
 
+/// Whether `bytes` carries `kind`'s marker where a packed image does.
+#[must_use]
+pub const fn has_marker(bytes: &[u8], kind: GuestImage) -> bool {
+    if bytes.len() < MARKER_RANGE.end {
+        return false;
+    }
+    let (_, rest) = bytes.split_at(MARKER_RANGE.start);
+    let (marker, _) = rest.split_at(MARKER_BYTES);
+    kind.is_marker(marker)
+}
+
 fn invalid_data_error(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
-fn le_u32(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(std::array::from_fn(|index| bytes[index]))
-}
-
-fn le_u64(bytes: &[u8]) -> u64 {
-    u64::from_le_bytes(std::array::from_fn(|index| bytes[index]))
-}
-
-#[derive(Clone, Copy)]
-struct Chunk {
-    payload_start: usize,
-    compressed_bytes: usize,
-    crc32: u32,
-}
-
-/// A parsed container whose chunks are decoded on demand.
+/// A parsed container whose chunks are decoded on demand, keeping the last partly read chunk.
 #[derive(Clone)]
 pub struct PackedImage<'a> {
     image_bytes: u64,
     chunk_bytes: usize,
-    chunks: Vec<Chunk>,
+    /// Each chunk's LZ4 block within `payload`.
+    blocks: Vec<Range<usize>>,
     payload: &'a [u8],
-}
-
-/// The one decoded chunk that [`PackedImage::read_at`] keeps between reads.
-pub struct ChunkCache {
-    index: Option<usize>,
-    bytes: Vec<u8>,
-}
-
-impl ChunkCache {
-    #[must_use]
-    pub fn new(image: &PackedImage<'_>) -> Self {
-        Self {
-            index: None,
-            bytes: vec![0; image.chunk_bytes],
-        }
-    }
+    cached_index: Option<usize>,
+    cached_bytes: Vec<u8>,
 }
 
 impl<'a> PackedImage<'a> {
-    /// Validates the whole layout without decompressing anything.
+    /// Validates the whole layout without decompressing anything. The content carries no checksum:
+    /// packed images are trusted build artifacts, embedded in the binary and round-tripped when
+    /// packed, so a block that decodes to the right length is used as is.
     pub fn parse(bytes: &'a [u8], kind: GuestImage) -> io::Result<Self> {
         let header = bytes
             .get(..HEADER_BYTES)
@@ -81,49 +64,39 @@ impl<'a> PackedImage<'a> {
             ));
         }
         kind.validate(Some(&header[MARKER_RANGE]))?;
-        let expected_chunk_bytes = chunk_bytes(kind);
-        if le_u32(&header[CHUNK_BYTES_RANGE]) != expected_chunk_bytes {
-            return Err(invalid_data_error(
-                "packed image chunk size does not match its kind",
-            ));
-        }
-        let image_bytes = le_u64(&header[IMAGE_BYTES_RANGE]);
+        let image_bytes = u64::from_le_bytes(
+            header[IMAGE_BYTES_RANGE]
+                .try_into()
+                .map_err(io::Error::other)?,
+        );
         if image_bytes == 0 {
             return Err(invalid_data_error("packed image is empty"));
         }
-        let chunk_count = le_u32(&header[CHUNK_COUNT_RANGE]);
-        if u64::from(chunk_count) != image_bytes.div_ceil(u64::from(expected_chunk_bytes)) {
-            return Err(invalid_data_error(
-                "packed image chunk count does not match its length",
-            ));
-        }
-        let chunk_bytes = expected_chunk_bytes as usize;
-        let table_end = (chunk_count as usize)
-            .checked_mul(TABLE_ENTRY_BYTES)
+        let chunk_size = chunk_bytes(kind) as usize;
+        let table_end = usize::try_from(image_bytes.div_ceil(chunk_size as u64))
+            .ok()
+            .and_then(|chunk_count| chunk_count.checked_mul(TABLE_ENTRY_BYTES))
             .and_then(|table| table.checked_add(HEADER_BYTES))
             .ok_or_else(|| invalid_data_error("packed image chunk table overflows"))?;
         let table = bytes
             .get(HEADER_BYTES..table_end)
             .ok_or_else(|| invalid_data_error("packed image chunk table is truncated"))?;
-        let max_compressed = lz4_flex::block::get_maximum_output_size(chunk_bytes);
+        let max_compressed = lz4_flex::block::get_maximum_output_size(chunk_size);
         let (entries, _) = table.as_chunks::<TABLE_ENTRY_BYTES>();
-        let mut chunks = Vec::with_capacity(entries.len());
+        let mut blocks = Vec::with_capacity(entries.len());
         let mut payload_bytes = 0usize;
         for entry in entries {
-            let compressed_bytes = le_u32(&entry[..ENTRY_CRC_AT]) as usize;
+            let compressed_bytes = u32::from_le_bytes(*entry) as usize;
             if compressed_bytes == 0 || compressed_bytes > max_compressed {
                 return Err(invalid_data_error(
                     "packed image chunk has an invalid compressed size",
                 ));
             }
-            chunks.push(Chunk {
-                payload_start: payload_bytes,
-                compressed_bytes,
-                crc32: le_u32(&entry[ENTRY_CRC_AT..]),
-            });
-            payload_bytes = payload_bytes
+            let end = payload_bytes
                 .checked_add(compressed_bytes)
                 .ok_or_else(|| invalid_data_error("packed image payload size overflows"))?;
+            blocks.push(payload_bytes..end);
+            payload_bytes = end;
         }
         let payload = &bytes[table_end..];
         if payload.len() != payload_bytes {
@@ -133,9 +106,11 @@ impl<'a> PackedImage<'a> {
         }
         Ok(Self {
             image_bytes,
-            chunk_bytes,
-            chunks,
+            chunk_bytes: chunk_size,
+            blocks,
             payload,
+            cached_index: None,
+            cached_bytes: Vec::new(),
         })
     }
 
@@ -152,26 +127,9 @@ impl<'a> PackedImage<'a> {
         })
     }
 
-    fn decode_chunk(&self, index: usize, out: &mut [u8]) -> io::Result<()> {
-        let chunk = self.chunks[index];
-        let block =
-            &self.payload[chunk.payload_start..chunk.payload_start + chunk.compressed_bytes];
-        let decoded = lz4_flex::block::decompress_into(block, out)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if decoded != out.len() {
-            return Err(invalid_data_error(
-                "packed image chunk decodes to the wrong length",
-            ));
-        }
-        if crc32fast::hash(out) != chunk.crc32 {
-            return Err(invalid_data_error("packed image chunk fails its checksum"));
-        }
-        Ok(())
-    }
-
-    /// Fills `buf` from `offset`, decoding only the chunks `cache` does not hold.
-    /// `cache` must come from [`ChunkCache::new`] on this image.
-    pub fn read_at(&self, offset: u64, buf: &mut [u8], cache: &mut ChunkCache) -> io::Result<()> {
+    /// Fills `buf` from `offset`. A read covering a whole chunk decodes it straight into `buf`;
+    /// a partly read chunk is decoded into the cache unless it is already there.
+    pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let in_range = u64::try_from(buf.len())
             .ok()
             .and_then(|len| offset.checked_add(len))
@@ -182,25 +140,47 @@ impl<'a> PackedImage<'a> {
                 "read lies outside the packed image",
             ));
         }
+        let payload = self.payload;
         let mut position = offset;
         let mut copied = 0;
+        let chunk_size = self.chunk_bytes as u64;
         while copied < buf.len() {
-            let chunk_bytes = self.chunk_bytes as u64;
-            let index = usize::try_from(position / chunk_bytes).map_err(io::Error::other)?;
-            let within = usize::try_from(position % chunk_bytes).map_err(io::Error::other)?;
+            let index = usize::try_from(position / chunk_size).map_err(io::Error::other)?;
+            let within = usize::try_from(position % chunk_size).map_err(io::Error::other)?;
             let chunk_len = self.chunk_len(index);
-            if cache.index != Some(index) {
-                cache.index = None;
-                self.decode_chunk(index, &mut cache.bytes[..chunk_len])?;
-                cache.index = Some(index);
-            }
-            let take = (chunk_len - within).min(buf.len() - copied);
-            buf[copied..copied + take].copy_from_slice(&cache.bytes[within..within + take]);
+            let block = &payload[self.blocks[index].clone()];
+            let wanted = buf.len() - copied;
+            let take = if within == 0 && wanted >= chunk_len {
+                decode_block(block, &mut buf[copied..copied + chunk_len])?;
+                chunk_len
+            } else {
+                if self.cached_index != Some(index) {
+                    self.cached_index = None;
+                    self.cached_bytes.resize(self.chunk_bytes, 0);
+                    decode_block(block, &mut self.cached_bytes[..chunk_len])?;
+                    self.cached_index = Some(index);
+                }
+                let take = (chunk_len - within).min(wanted);
+                buf[copied..copied + take]
+                    .copy_from_slice(&self.cached_bytes[within..within + take]);
+                take
+            };
             copied += take;
             position += take as u64;
         }
         Ok(())
     }
+}
+
+fn decode_block(block: &[u8], out: &mut [u8]) -> io::Result<()> {
+    let decoded = lz4_flex::block::decompress_into(block, out)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if decoded != out.len() {
+        return Err(invalid_data_error(
+            "packed image chunk decodes to the wrong length",
+        ));
+    }
+    Ok(())
 }
 
 /// Builds the container; `compress_block` compresses one chunk to an LZ4 block.
@@ -212,10 +192,8 @@ pub fn pack(
     if image.is_empty() {
         return Err(invalid_data_error("cannot pack an empty image"));
     }
-    let chunk_bytes = chunk_bytes(kind);
-    let chunk_size = chunk_bytes as usize;
+    let chunk_size = chunk_bytes(kind) as usize;
     let max_compressed = lz4_flex::block::get_maximum_output_size(chunk_size);
-    let chunk_count = u32::try_from(image.len().div_ceil(chunk_size)).map_err(io::Error::other)?;
     let mut table = Vec::new();
     let mut payload = Vec::new();
     for chunk in image.chunks(chunk_size) {
@@ -225,15 +203,12 @@ pub fn pack(
         }
         let block_len = u32::try_from(block.len()).map_err(io::Error::other)?;
         table.extend_from_slice(&block_len.to_le_bytes());
-        table.extend_from_slice(&crc32fast::hash(chunk).to_le_bytes());
         payload.extend_from_slice(&block);
     }
     let mut packed = Vec::with_capacity(HEADER_BYTES + table.len() + payload.len());
     packed.extend_from_slice(&MAGIC);
     packed.extend_from_slice(&kind.marker());
-    packed.extend_from_slice(&chunk_bytes.to_le_bytes());
     packed.extend_from_slice(&(image.len() as u64).to_le_bytes());
-    packed.extend_from_slice(&chunk_count.to_le_bytes());
     packed.extend_from_slice(&table);
     packed.extend_from_slice(&payload);
     Ok(packed)
@@ -265,9 +240,9 @@ mod tests {
         pack(image, kind, compress_fast).unwrap()
     }
 
-    fn read_all(image: &PackedImage<'_>) -> io::Result<Vec<u8>> {
+    fn read_all(image: &mut PackedImage<'_>) -> io::Result<Vec<u8>> {
         let mut out = vec![0; usize::try_from(image.image_bytes()).unwrap()];
-        image.read_at(0, &mut out, &mut ChunkCache::new(image))?;
+        image.read_at(0, &mut out)?;
         Ok(out)
     }
 
@@ -290,12 +265,12 @@ mod tests {
             ),
         ] {
             let packed = pack_lz4(&image, kind);
-            let parsed = PackedImage::parse(&packed, kind).unwrap();
+            let mut parsed = PackedImage::parse(&packed, kind).unwrap();
             assert_eq!(parsed.image_bytes(), image.len() as u64);
-            assert_eq!(parsed.chunks.len(), 3);
+            assert_eq!(parsed.blocks.len(), 3);
             assert_eq!(parsed.chunk_len(0), parsed.chunk_bytes);
             assert_eq!(parsed.chunk_len(2), image.len() - 2 * parsed.chunk_bytes);
-            assert_eq!(read_all(&parsed).unwrap(), image);
+            assert_eq!(read_all(&mut parsed).unwrap(), image);
         }
     }
 
@@ -305,24 +280,23 @@ mod tests {
     fn read_at_matches_the_image_and_refuses_out_of_range() {
         let image = boot_image();
         let packed = pack_lz4(&image, GuestImage::Boot);
-        let parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
-        let mut cache = ChunkCache::new(&parsed);
+        let mut parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
         let chunk = parsed.chunk_bytes;
         for (offset, len) in [
             (0, 512),
             (chunk - 10, 20),
             (chunk - 10, chunk + 20),
+            (0, chunk),
+            (chunk, chunk + 50),
             (image.len() - 7, 7),
             (image.len(), 0),
         ] {
             let mut bytes = vec![0; len];
-            parsed
-                .read_at(offset as u64, &mut bytes, &mut cache)
-                .unwrap();
+            parsed.read_at(offset as u64, &mut bytes).unwrap();
             assert_eq!(bytes, image[offset..offset + len], "{offset}+{len}");
         }
         for offset in [image.len() as u64 - 7, u64::MAX] {
-            let error = parsed.read_at(offset, &mut [0; 8], &mut cache).unwrap_err();
+            let error = parsed.read_at(offset, &mut [0; 8]).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
     }
@@ -342,16 +316,23 @@ mod tests {
     #[test]
     fn parse_rejects_wrong_marker_and_kind() {
         let packed = pack_lz4(&boot_image(), GuestImage::Boot);
+        assert!(has_marker(&packed, GuestImage::Boot));
+        assert!(!has_marker(&packed, GuestImage::Kernel));
+        assert!(!has_marker(
+            &packed[..MARKER_RANGE.end - 1],
+            GuestImage::Boot
+        ));
         let error = PackedImage::parse(&packed, GuestImage::Kernel)
             .err()
             .unwrap();
         assert!(error.to_string().contains("rebuild"), "{error}");
         let mut bytes = packed;
         bytes[MARKER_RANGE.start] ^= 1;
+        assert!(!has_marker(&bytes, GuestImage::Boot));
         assert_invalid(PackedImage::parse(&bytes, GuestImage::Boot));
     }
 
-    /// Header fields that disagree with the kind or with each other are refused.
+    /// An image length whose chunk count disagrees with the chunk table is refused.
     #[test]
     fn parse_rejects_inconsistent_header_fields() {
         let packed = pack_lz4(&boot_image(), GuestImage::Boot);
@@ -361,11 +342,16 @@ mod tests {
             bytes
         };
         for bytes in [
-            patched(CHUNK_BYTES_RANGE, &KERNEL_CHUNK_BYTES.to_le_bytes()),
             patched(IMAGE_BYTES_RANGE, &0u64.to_le_bytes()),
             patched(IMAGE_BYTES_RANGE, &u64::MAX.to_le_bytes()),
-            patched(CHUNK_COUNT_RANGE, &2u32.to_le_bytes()),
-            patched(CHUNK_COUNT_RANGE, &u32::MAX.to_le_bytes()),
+            patched(
+                IMAGE_BYTES_RANGE,
+                &u64::from(2 * BOOT_CHUNK_BYTES).to_le_bytes(),
+            ),
+            patched(
+                IMAGE_BYTES_RANGE,
+                &u64::from(3 * BOOT_CHUNK_BYTES + 1).to_le_bytes(),
+            ),
         ] {
             assert_invalid(PackedImage::parse(&bytes, GuestImage::Boot));
         }
@@ -398,18 +384,18 @@ mod tests {
         }
     }
 
-    /// A chunk whose checksum differs from the table is refused; the others still read.
+    /// A read covering a whole chunk decodes it without evicting the partly read chunk.
     #[test]
-    fn read_rejects_a_crc_mismatch() {
+    fn whole_chunk_reads_leave_the_cached_chunk_in_place() {
         let image = boot_image();
-        let mut packed = pack_lz4(&image, GuestImage::Boot);
-        packed[HEADER_BYTES + ENTRY_CRC_AT] ^= 1;
-        let parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
-        let mut cache = ChunkCache::new(&parsed);
-        let chunk = parsed.chunk_bytes as u64;
-        assert!(parsed.read_at(0, &mut [0; 1], &mut cache).is_err());
-        parsed.read_at(chunk, &mut [0; 1], &mut cache).unwrap();
-        assert!(read_all(&parsed).is_err());
+        let packed = pack_lz4(&image, GuestImage::Boot);
+        let mut parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
+        let chunk = parsed.chunk_bytes;
+        parsed.read_at(10, &mut [0; 1]).unwrap();
+        let mut whole = vec![0; chunk];
+        parsed.read_at(chunk as u64, &mut whole).unwrap();
+        assert_eq!(whole, image[chunk..2 * chunk]);
+        assert_eq!(parsed.cached_index, Some(0));
     }
 
     /// Damaged LZ4 data is refused, and the failed decode leaves no cached chunk behind.
@@ -417,14 +403,17 @@ mod tests {
     fn read_rejects_corrupt_blocks_and_invalidates_the_cache() {
         let image = boot_image();
         let mut packed = pack_lz4(&image, GuestImage::Boot);
-        let last = packed.len() - 1;
-        packed[last - 10..=last].fill(0xff);
-        let parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
-        let mut cache = ChunkCache::new(&parsed);
+        let last_block = PackedImage::parse(&packed, GuestImage::Boot)
+            .unwrap()
+            .blocks[2]
+            .len();
+        let payload_end = packed.len();
+        packed[payload_end - last_block..].fill(0xff);
+        let mut parsed = PackedImage::parse(&packed, GuestImage::Boot).unwrap();
         let last_chunk = 2 * parsed.chunk_bytes as u64;
-        parsed.read_at(0, &mut [0; 1], &mut cache).unwrap();
-        assert!(parsed.read_at(last_chunk, &mut [0; 1], &mut cache).is_err());
-        assert_eq!(cache.index, None);
+        parsed.read_at(0, &mut [0; 1]).unwrap();
+        assert!(parsed.read_at(last_chunk, &mut [0; 1]).is_err());
+        assert_eq!(parsed.cached_index, None);
     }
 
     /// Packing refuses an empty image, a compressor that exceeds the bound and one that fails.

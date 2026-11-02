@@ -124,6 +124,27 @@ fn security_docs_quote_the_enforced_bounds() {
                 terra_limits::MAX_BATCH_GUEST_COPY_BYTES >> 10,
             ),
         ),
+        (
+            "recipe.md",
+            format!(
+                "at most {} network flows at once",
+                terra_protocol::vsock::MAX_NETWORK_SOCKETS
+            ),
+        ),
+        (
+            "recipe.md",
+            format!(
+                "carries at most {} KiB",
+                terra_protocol::application::MAX_NETWORK_DATAGRAM_BYTES >> 10
+            ),
+        ),
+        (
+            "recipe.md",
+            format!(
+                "allows new connections for {} seconds",
+                terra_policy::LEARNED_DNS_TTL_SECS
+            ),
+        ),
     ];
     for (doc, quote) in quotes {
         assert!(
@@ -138,6 +159,7 @@ fn security_docs_quote_the_enforced_bounds() {
 #[test]
 fn dev_guide_quotes_the_enforced_network_bounds() {
     use terra_protocol::vsock::{
+        AGENT_REPLY_BYTES, AGENT_UPSTREAM_BYTES, CONTROL_REPLY_BYTES, CONTROL_UPSTREAM_BYTES,
         FLOW_REPLY_BYTES, FLOW_UPSTREAM_BYTES, MAX_FLOW_REPLY_BYTES, MAX_FLOW_UPSTREAM_BYTES,
         MAX_NETWORK_SOCKETS,
     };
@@ -167,16 +189,103 @@ fn dev_guide_quotes_the_enforced_network_bounds() {
         ),
         format!(
             "grants each stream a {} KiB receive window, so {MAX_NETWORK_SOCKETS} flows can queue about {} MiB in each direction",
-            terra_network::YAMUX_STREAM_WINDOW_BYTES >> 10,
-            (terra_network::YAMUX_STREAM_WINDOW_BYTES * MAX_NETWORK_SOCKETS) >> 20,
+            terra_protocol::mux::MAX_STREAM_WINDOW_BYTES >> 10,
+            (terra_protocol::mux::MAX_STREAM_WINDOW_BYTES * MAX_NETWORK_SOCKETS) >> 20,
         ),
         format!(
             "The broker admits {} resources and {} DNS lookups at once",
             terra_network::MAX_RESOURCES,
-            terra_network::MAX_DNS_REQUESTS
+            terra_protocol::network_control::MAX_DNS_QUERIES
+        ),
+        format!(
+            "forwards queries ({} in flight)",
+            terra_protocol::network_control::MAX_DNS_QUERIES
+        ),
+        format!(
+            "Each datagram carries at most {} bytes",
+            terra_protocol::application::MAX_NETWORK_DATAGRAM_BYTES
+        ),
+        format!("share a {MAX_NETWORK_SOCKETS}-stream admission limit"),
+        format!(
+            "The opening deadline is {} seconds",
+            terra_protocol::application::OPEN_TIMEOUT_SECS
+        ),
+        format!(
+            "sends up to {} such segments",
+            terra_protocol::application::MAX_DATAGRAM_SEGMENTS
+        ),
+        format!("(at most {} mappings)", terra_protocol::MAX_PUBLISHED_PORTS),
+        format!(
+            "| Agent | {} KiB | {} KiB |",
+            AGENT_UPSTREAM_BYTES >> 10,
+            AGENT_REPLY_BYTES >> 10
+        ),
+        format!(
+            "| Control | {} KiB | {} KiB |",
+            CONTROL_UPSTREAM_BYTES >> 10,
+            CONTROL_REPLY_BYTES >> 10
         ),
     ];
     for quote in quotes {
         assert!(guide.contains(&quote), "README.dev.md must say: {quote}");
+    }
+}
+
+/// The vsock device README quotes the per-flow windows and the flow totals; a changed constant
+/// fails here until it says the same.
+#[test]
+fn vsock_device_readme_quotes_the_enforced_limits() {
+    use terra_protocol::vsock::{
+        FLOW_REPLY_BYTES, FLOW_UPSTREAM_BYTES, MAX_FLOW_REPLY_BYTES, MAX_FLOW_UPSTREAM_BYTES,
+        MAX_NETWORK_SOCKETS,
+    };
+    let readme = read_repo_text("components/vsock-device/README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quotes = [
+        format!(
+            "| {} KiB per flow | {} KiB per flow |",
+            FLOW_UPSTREAM_BYTES >> 10,
+            FLOW_REPLY_BYTES >> 10
+        ),
+        format!("at most {MAX_NETWORK_SOCKETS} sockets"),
+        format!(
+            "Flow input windows total at most {} MiB; flow replies and outstanding send credits total at most {} MiB",
+            MAX_FLOW_UPSTREAM_BYTES >> 20,
+            MAX_FLOW_REPLY_BYTES >> 20
+        ),
+    ];
+    for quote in quotes {
+        assert!(
+            readme.contains(&quote),
+            "components/vsock-device/README.md must say: {quote}"
+        );
+    }
+}
+
+/// The frontend README quotes its control and opening limits; a changed constant fails here until
+/// the README says the same.
+#[test]
+fn frontend_readme_quotes_the_enforced_limits() {
+    let readme = read_repo_text("components/vsock-frontend/README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quotes = [
+        format!(
+            "Control allows {} concurrent DNS queries",
+            terra_protocol::network_control::MAX_DNS_QUERIES
+        ),
+        format!(
+            "publication headers have a {}-second deadline",
+            terra_protocol::application::OPEN_TIMEOUT_SECS
+        ),
+    ];
+    for quote in quotes {
+        assert!(
+            readme.contains(&quote),
+            "components/vsock-frontend/README.md must say: {quote}"
+        );
     }
 }

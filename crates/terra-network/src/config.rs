@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 pub use terra_policy::config::{Network, NetworkMode, StaticDnsRecord};
+use terra_protocol::network::{ListenerGrant, ResourceKind};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishedListener {
-    pub grant: crate::ListenerGrant,
+    pub grant: ListenerGrant,
     pub address: SocketAddr,
-    pub transport: crate::ResourceKind,
+    pub transport: ResourceKind,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

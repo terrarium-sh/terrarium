@@ -48,8 +48,11 @@ VM behavior.
   suspend/resume, and clock jumps on every native backend. Define Windows
   timezone behavior and test TZif/DST handling. Audit early-kernel entropy and
   backend entropy readiness before hooks, TLS, or key generation. The wire
-  contract is [`crates/terra-protocol/src/plan.rs`](../crates/terra-protocol/src/plan.rs)
-  and delivery is [`components/agent`](../components/agent).
+  contract is `HostState` and `AgentCommand::SyncClock` in
+  [`crates/terra-protocol/src/control.rs`](../crates/terra-protocol/src/control.rs);
+  the runtime sends `HostState` after the plan
+  ([`component/agent/host.rs`](../crates/terra-runtime/src/component/agent/host.rs)) and
+  [`components/agent`](../components/agent) sends clock corrections.
 
 - [ ] **Measured performance:** use matched previous/current binaries and real
   Git/build, parallel CPU, concurrent network, storage, and multi-box workloads

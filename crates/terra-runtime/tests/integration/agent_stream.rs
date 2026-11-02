@@ -2,8 +2,9 @@ use crate::support::agent as support;
 use std::assert_matches;
 
 use std::time::Duration;
-use support::{AgentGuest, plan_frame, yamux_frame};
+use support::{AgentGuest, plan_frame};
 use terra_runtime::component::vsock::streams::stream_types::StreamError;
+use terra_runtime::test_support::yamux;
 
 /// Fragmenting every Yamux header and lifecycle frame preserves boot-plan
 /// delivery and readiness.
@@ -25,14 +26,10 @@ async fn fragmented_stream_delivers_plan_and_lifecycle() {
         .endpoint
         .connect(agent.connection_number)
         .expect("connect");
-    let mut frames = yamux_frame(0, 1, terra_protocol::mux::CONTROL_STREAM_ID, 0, &[]);
-    frames.extend(yamux_frame(
-        0,
-        1,
-        terra_protocol::mux::DIAGNOSTIC_STREAM_ID,
-        0,
-        &[],
-    ));
+    let frames: Vec<u8> = terra_protocol::mux::RESERVED_STREAM_IDS
+        .into_iter()
+        .flat_map(|stream| yamux::encode(yamux::DATA, yamux::SYN, stream, 0, &[]))
+        .collect();
     for byte in frames {
         agent.send_session(&[byte]).await;
     }
@@ -56,20 +53,22 @@ async fn fragmented_stream_delivers_plan_and_lifecycle() {
 /// stream with a client command stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_direction_stream_cannot_select_agent_services() {
-    for stream in [2, 5] {
+    for stream in [yamux::FIRST_CLIENT_STREAM_ID, 5] {
         let mut agent = AgentGuest::create(plan_frame(), None, None).await;
         agent
             .endpoint
             .connect(agent.connection_number)
             .expect("connect");
-        agent.send_session(&yamux_frame(0, 1, stream, 0, &[])).await;
-        if stream == 2 {
+        agent
+            .send_session(&yamux::encode(yamux::DATA, yamux::SYN, stream, 0, &[]))
+            .await;
+        if stream == yamux::FIRST_CLIENT_STREAM_ID {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if let Some(frame) = agent
                         .drain_yamux()
                         .into_iter()
-                        .find(|frame| frame.kind == 3)
+                        .find(|frame| frame.kind == yamux::GO_AWAY)
                     {
                         assert_eq!(frame.value, 1);
                         break;
@@ -79,7 +78,9 @@ async fn wrong_direction_stream_cannot_select_agent_services() {
             })
             .await
             .expect("wrong-direction stream gets protocol GoAway");
-            agent.send_session(&yamux_frame(3, 0, 0, 0, &[])).await;
+            agent
+                .send_session(&yamux::encode(yamux::GO_AWAY, 0, 0, 0, &[]))
+                .await;
         }
         let failure = agent.wait_for_failure().await;
         assert!(failure.contains("disconnected"), "{failure}");
@@ -166,9 +167,9 @@ async fn connection_loss_before_diagnostic_stream_terminates_worker() {
         .connect(agent.connection_number)
         .expect("connect");
     agent
-        .send_session(&yamux_frame(
-            0,
-            1,
+        .send_session(&yamux::encode(
+            yamux::DATA,
+            yamux::SYN,
             terra_protocol::mux::CONTROL_STREAM_ID,
             0,
             &[],

@@ -11,6 +11,10 @@ use std::{
 use terra_protocol::mux::MAX_STREAM_FRAME_BYTES;
 use wit_bindgen::rt::async_support::{StreamReader, StreamResult, StreamWriter};
 
+/// yamux writes each frame's header and body separately and flushes after every frame, so writes
+/// gather here and cross to the host once per flush.
+const WRITE_BUFFER_BYTES: usize = 64 << 10;
+
 type Chunks = Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>>>>;
 type ChunkSink = Pin<Box<dyn Sink<Vec<u8>, Error = io::Error>>>;
 
@@ -18,7 +22,7 @@ type ChunkSink = Pin<Box<dyn Sink<Vec<u8>, Error = io::Error>>>;
 pub(crate) struct ByteStream {
     input: IntoAsyncRead<Chunks>,
     output: Option<ChunkSink>,
-    pending_write_length: Option<usize>,
+    unsent: Vec<u8>,
 }
 
 impl ByteStream {
@@ -26,7 +30,7 @@ impl ByteStream {
         Self {
             input: read_chunks(input).into_async_read(),
             output: Some(write_chunks(output)),
-            pending_write_length: None,
+            unsent: Vec::new(),
         }
     }
 
@@ -83,34 +87,36 @@ impl AsyncRead for ByteStream {
 
 impl AsyncWrite for ByteStream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let Self {
-            output,
-            pending_write_length,
-            ..
-        } = self.get_mut();
-        let output = output.as_mut().ok_or_else(closed)?;
-        if pending_write_length.is_none() {
-            ready!(output.poll_ready_unpin(context))?;
-            let count = bytes.len().min(MAX_STREAM_FRAME_BYTES);
-            output.start_send_unpin(bytes[..count].to_vec())?;
-            *pending_write_length = Some(count);
+        if self.output.is_none() {
+            return Poll::Ready(Err(closed()));
         }
-        ready!(output.poll_flush_unpin(context))?;
-        Poll::Ready(pending_write_length.take().ok_or_else(closed))
+        if self.unsent.len() >= WRITE_BUFFER_BYTES {
+            ready!(self.as_mut().poll_flush(context))?;
+        }
+        let count = bytes.len().min(WRITE_BUFFER_BYTES - self.unsent.len());
+        self.unsent.extend_from_slice(&bytes[..count]);
+        Poll::Ready(Ok(count))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.output.as_mut().map_or(Poll::Ready(Ok(())), |output| {
-            output.poll_flush_unpin(context)
-        })
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Self { output, unsent, .. } = self.get_mut();
+        let Some(output) = output.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        if !unsent.is_empty() {
+            ready!(output.poll_ready_unpin(context))?;
+            output.start_send_unpin(std::mem::take(unsent))?;
+        }
+        output.poll_flush_unpin(context)
     }
 
-    /// Drops the writer so the reading side sees the end of the stream.
+    /// Sends what is buffered, then drops the writer so the reading side sees the end of the stream.
     fn poll_close(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(context))?;
         if let Some(output) = self.output.as_mut() {
             ready!(output.poll_close_unpin(context))?;
         }

@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 terra-policy = { path = "../terra-policy" }
-terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
+terra-protocol = { path = "../terra-protocol", features = ["tokio", "mux"] }
 terra-limits = { path = "../terra-limits" }
 serde.workspace = true
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
@@ -26,6 +26,7 @@ libc.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
+terra-protocol = { path = "../terra-protocol", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 
 [lints]

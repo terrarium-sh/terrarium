@@ -1,14 +1,15 @@
 //! Agent session, file transfer, and exec services.
 
 use crate::AsyncFile;
-use crate::session::{ClientConn, DetachOutcome, Session};
+use crate::session::{ClientConn, Session};
 use crate::workload::GuestUser;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::Duration;
 use terra_protocol::{
-    AGENT_HELLO, AgentService, ClientInput, ControlReply, ControlRequest, TermSize,
+    AGENT_HELLO, AgentService, ClientInput, SessionClient, SessionControlReply,
+    SessionControlRequest, TermSize,
 };
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, watch};
@@ -222,43 +223,38 @@ async fn serve_client(
 async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
     let request = tokio::time::timeout(
         CONTROL_TIMEOUT,
-        terra_protocol::read_frame_async::<ControlRequest>(&mut conn),
+        terra_protocol::read_frame_async::<SessionControlRequest>(&mut conn),
     )
     .await;
     let Ok(Ok(Some(request))) = request else {
         return;
     };
-    let replies: Vec<ControlReply> = match request {
-        ControlRequest::List => session
-            .list_clients()
-            .await
-            .into_iter()
-            .map(|(id, size)| ControlReply::Client {
-                id,
-                size: size.map(|(rows, cols)| TermSize { rows, cols }),
-            })
-            .chain([ControlReply::Done])
-            .collect(),
-        ControlRequest::Detach { id } => vec![match session.detach_client(id).await {
-            DetachOutcome::Detached => ControlReply::Detached { id },
-            DetachOutcome::Missing => ControlReply::Missing { id },
-        }],
-        ControlRequest::DetachAll => session
-            .detach_all_clients()
-            .await
-            .into_iter()
-            .map(|id| ControlReply::Detached { id })
-            .chain([ControlReply::Done])
-            .collect(),
-    };
-    for reply in &replies {
-        if write_control_reply(&mut conn, reply).await.is_err() {
-            return;
+    let reply = match request {
+        SessionControlRequest::List => SessionControlReply::Clients(
+            session
+                .list_clients()
+                .await
+                .into_iter()
+                .map(|(id, size)| SessionClient {
+                    id,
+                    reported_size: size.map(|(rows, cols)| TermSize { rows, cols }),
+                })
+                .collect(),
+        ),
+        SessionControlRequest::Detach { id } => {
+            SessionControlReply::Detach(session.detach_client(id).await)
         }
-    }
+        SessionControlRequest::DetachAll => {
+            SessionControlReply::DetachedAll(session.detach_all_clients().await.len() as u64)
+        }
+    };
+    let _ = write_control_reply(&mut conn, &reply).await;
 }
 
-async fn write_control_reply(conn: &mut AsyncFile, reply: &ControlReply) -> std::io::Result<()> {
+async fn write_control_reply(
+    conn: &mut AsyncFile,
+    reply: &SessionControlReply,
+) -> std::io::Result<()> {
     tokio::time::timeout(
         CONTROL_TIMEOUT,
         terra_protocol::write_frame_async(conn, reply),
@@ -364,20 +360,17 @@ mod tests {
         terra_protocol::write_frame_async(&mut host, &AgentService::SessionControl)
             .await
             .unwrap();
-        terra_protocol::write_frame_async(&mut host, &ControlRequest::List)
+        terra_protocol::write_frame_async(&mut host, &SessionControlRequest::List)
             .await
             .unwrap();
         assert_eq!(
-            terra_protocol::read_frame_async::<ControlReply>(&mut host)
+            terra_protocol::read_frame_async::<SessionControlReply>(&mut host)
                 .await
                 .unwrap(),
-            Some(ControlReply::Client { id: 0, size: None })
-        );
-        assert_eq!(
-            terra_protocol::read_frame_async::<ControlReply>(&mut host)
-                .await
-                .unwrap(),
-            Some(ControlReply::Done)
+            Some(SessionControlReply::Clients(vec![SessionClient {
+                id: 0,
+                reported_size: None,
+            }]))
         );
         serving.await.unwrap();
     }

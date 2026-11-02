@@ -1,4 +1,4 @@
-//! Agent connection control, lifecycle events, and clock updates.
+//! Agent connection control, lifecycle events, and the host's clock and entropy.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,7 @@ impl crate::Message for AgentService {
     const MAX_PAYLOAD_BYTES: usize = 64;
 }
 
+/// The byte written to a running box's stop socket; the guest receives [`AgentCommand::Stop`].
 pub const STOP_SIGNAL: u8 = b'S';
 
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
@@ -48,24 +49,59 @@ impl crate::Message for LifecycleEvent {
 
 pub const MAX_DIAGNOSTIC_EVENT_BYTES: usize = 64 << 10;
 
-/// What the host sends the agent on its control stream after the boot plan.
+/// What the host sends the agent on its control stream after the boot plan and [`HostState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentCommand {
     Stop,
     /// The host's wall clock, for an agent whose clock has drifted.
-    SyncClock {
-        seconds: i64,
-        nanoseconds: u32,
-    },
+    SyncClock(HostTime),
 }
 
 impl crate::Message for AgentCommand {
     const MAX_PAYLOAD_BYTES: usize = 32;
 }
 
+/// Time since the Unix epoch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostTime {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+/// The host's clock and entropy for the guest, sampled when the box's agent service starts:
+/// the frame after the [`crate::Plan`] on the agent control stream.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostState {
+    pub time: HostTime,
+    pub seed: [u8; 32],
+}
+
+impl crate::Message for HostState {
+    const MAX_PAYLOAD_BYTES: usize = 64;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extreme clock sample with any seed fits its frame.
+    #[test]
+    fn host_state_round_trips_at_its_extremes() {
+        for seconds in [i64::MIN, i64::MAX] {
+            let state = HostState {
+                time: HostTime {
+                    seconds,
+                    nanoseconds: 999_999_999,
+                },
+                seed: [u8::MAX; 32],
+            };
+            let frame = crate::encode_frame(&state).unwrap();
+            assert_eq!(
+                crate::read_frame::<HostState>(&mut frame.as_slice()).unwrap(),
+                Some(state)
+            );
+        }
+    }
 
     #[test]
     fn diagnostic_limit_is_enforced_when_decoding() {
@@ -83,10 +119,10 @@ mod tests {
     fn agent_commands_round_trip_within_their_limit() {
         for command in [
             AgentCommand::Stop,
-            AgentCommand::SyncClock {
+            AgentCommand::SyncClock(HostTime {
                 seconds: i64::MIN,
                 nanoseconds: u32::MAX,
-            },
+            }),
         ] {
             let frame = crate::encode_frame(&command).unwrap();
             assert_eq!(
