@@ -153,6 +153,7 @@ exit /b 91
                 foreach ($file in @("GPL-2.0.txt", "applevisor-MIT.txt", "uds_windows-MIT.txt", "uds_windows-THIRDPARTYNOTICES.txt")) {
                     [IO.File]::WriteAllBytes((Join-Path $licenseDirectory $file), [byte[]](1))
                 }
+                [IO.File]::WriteAllBytes((Join-Path $archiveRoot "packaging/install.ps1"), [byte[]](1))
                 $expectedExecutable = Join-Path $releaseDirectory "terra.exe"
                 [IO.File]::WriteAllBytes($expectedExecutable, [byte[]](1, 2, 3))
                 & ./scripts/toolchain/build-host.ps1 -Target $archiveTarget -ComponentsDirectory $prebuiltComponents

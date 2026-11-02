@@ -514,6 +514,7 @@ dist host-dist:
 	# binary (ETXTBSY) never blocks a rebuild.
 	install -m 755 target/$(TERRA_TARGET)/release/terra $(DIST)/terra
 	install -m 644 LICENSE NOTICE $(DIST)
+	install -m 755 packaging/install.sh $(DIST)/install.sh
 	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt packaging/licenses/bubblewrap-LGPL-2.1.txt packaging/licenses/libcap-License.txt packaging/licenses/seccompiler-BSD-3-Clause.txt packaging/licenses/syscalls-BSD-2-Clause.txt $(DIST)/LICENSES
 	cp -R packaging/man $(DIST)
 	@echo "assembled $(DIST)/terra for $(TERRA_TARGET)"

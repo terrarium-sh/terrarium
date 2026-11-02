@@ -52,7 +52,7 @@ if [ "$1" = -d ]; then
   exit 0
 fi
 case "$4" in
-  */terra) cp "$3" "$INSTALL_DEST" ;;
+  */terra) [ "$1 $2" = "-m 755" ] && cp "$3" "$INSTALL_DEST" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -106,3 +106,21 @@ rm "$tmp/release/terra-x86_64-linux.tar.gz"
 HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
   INSTALL_OS=Darwin INSTALL_ARCH=arm64 TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null
 cmp "$tmp/original-terra" "$tmp/installed-terra"
+
+# The archive's own installer runs offline from any directory; a GitHub artifact
+# drops the executable bit, so the extracted terra may not be executable.
+mkdir "$tmp/extracted"
+cp "$tmp/original-terra" "$tmp/extracted/terra"
+chmod -x "$tmp/extracted/terra"
+cp "$root/packaging/install.sh" "$tmp/extracted/install.sh"
+rm -f "$tmp/installed-terra"
+(cd "$tmp" && PATH="$tmp/bin:$PATH" INSTALL_DEST="$tmp/installed-terra" sh extracted/install.sh) > "$tmp/output"
+grep -q " at /usr/local/bin/terra\$" "$tmp/output"
+cmp "$tmp/original-terra" "$tmp/installed-terra"
+
+rm "$tmp/extracted/terra" "$tmp/installed-terra"
+if PATH="$tmp/bin:$PATH" INSTALL_DEST="$tmp/installed-terra" sh "$tmp/extracted/install.sh" >/dev/null 2>&1; then
+  echo 'archive installer ran without terra beside it' >&2
+  exit 1
+fi
+test ! -e "$tmp/installed-terra"

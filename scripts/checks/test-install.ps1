@@ -70,6 +70,15 @@ try {
     try { & $installer -Version 1.2.3 | Out-Null } catch { $refused = $_.Exception.Message -like "*CHECKSUM MISMATCH*" }
     Assert $refused "a checksum mismatch was not refused"
     Assert (-not (Test-Path -LiteralPath $installed)) "a checksum mismatch still installed terra.exe"
+
+    # The archive's own installer runs offline from beside terra.exe.
+    $urls.Clear()
+    $extracted = Join-Path $tmp "extracted"
+    New-Item -ItemType Directory -Path $extracted | Out-Null
+    Copy-Item -LiteralPath (Join-Path $release "terra.exe"), (Join-Path $root "packaging\install.ps1") -Destination $extracted
+    & (Join-Path $extracted "install.ps1") | Out-Null
+    Assert ((Get-Content -Raw -LiteralPath $installed) -eq (Get-Content -Raw -LiteralPath (Join-Path $release "terra.exe"))) "the archive installer did not place terra.exe"
+    Assert ($urls.Count -eq 0) "the archive installer reached the network"
     Write-Host "install.ps1 checks passed"
 } finally {
     $env:LOCALAPPDATA = $originalLocalAppData

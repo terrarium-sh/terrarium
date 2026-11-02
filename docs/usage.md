@@ -49,8 +49,9 @@ A set-up box boots without the network, so you can prepare it online and use it
 offline. On a connected machine, run `setup` so `on_create` installs the harness
 and its tools, then `terra dev storage export dev.terra`. Copy `dev.terra` and
 the `terra` release archive for the offline host's platform. The offline host
-needs the same CPU architecture. There, install `terra` from the archive and
-run `terra dev storage import dev.terra`. The import skips setup, so
+needs the same CPU architecture. There, install `terra` from the archive (see
+[Install from an archive](#install-from-an-archive)) and run
+`terra dev storage import dev.terra`. The import skips setup, so
 `on_create` never runs offline. Keep downloads out of `on_start`, which runs on
 every boot. See [Stop, storage and removal](#stop-storage-and-removal) for what
 the file carries.
@@ -87,6 +88,22 @@ To verify a downloaded archive yourself:
 
 ```sh
 gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
+```
+
+### Install from an archive
+
+Each release archive carries an installer that needs no network, for hosts the
+web installers cannot reach. Extract the archive and run the installer inside.
+It puts `terra` where the web installer does.
+
+```sh
+mkdir terra && tar -xzf terra-x86_64-linux.tar.gz -C terra
+sh terra/install.sh
+```
+
+```powershell
+mkdir terra; tar -xzf terra-x86_64-pc-windows-msvc.tar.gz -C terra
+powershell -ExecutionPolicy Bypass -File terra\install.ps1
 ```
 
 ## Set up and start
