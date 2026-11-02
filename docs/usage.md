@@ -43,6 +43,18 @@ reads `readonly`, and allow the registries and APIs it calls. Detach with
 `Ctrl-\`, rejoin with `terra dev`, and run one-off commands with
 `terra dev exec`. The [quickstart](../README.md#quickstart) builds this setup.
 
+### Air-gapped machines
+
+A set-up box boots without the network, so you can prepare it online and use it
+offline. On a connected machine, run `setup` so `on_create` installs the harness
+and its tools, then `terra dev storage export dev.terra`. Copy `dev.terra` and
+the `terra` release archive for the offline host's platform. The offline host
+needs the same CPU architecture. There, install `terra` from the archive and
+run `terra dev storage import dev.terra`. The import skips setup, so
+`on_create` never runs offline. Keep downloads out of `on_start`, which runs on
+every boot. See [Stop, storage and removal](#stop-storage-and-removal) for what
+the file carries.
+
 ### Let an agent build the box
 
 The [terra-box skill](../skills/terra-box/SKILL.md) teaches Claude Code, Codex

@@ -1,8 +1,8 @@
-FROM docker.io/library/debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM docker.io/library/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
     printf '%s\n' \
-      'deb http://snapshot.debian.org/archive/debian/20261026T082512Z/ bookworm main' \
-      'deb http://snapshot.debian.org/archive/debian-security/20261026T044319Z/ bookworm-security main' \
+      'deb http://snapshot.debian.org/archive/debian/20261102T142815Z/ bookworm main' \
+      'deb http://snapshot.debian.org/archive/debian-security/20261102T162415Z/ bookworm-security main' \
       > /etc/apt/sources.list && \
     apt-get -o Acquire::Check-Valid-Until=false update && \
     apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \

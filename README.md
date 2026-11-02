@@ -28,6 +28,10 @@ a short YAML recipe.
 - **Try things you don't trust.** Unknown installers, untrusted builds and
   one-off scripts run in a box. You can also publish a box's services on host
   loopback.
+- **Take a box to an air-gapped machine.** Set up the box where there is
+  network and export it to one file. Then import it offline: it boots with its
+  tools installed and downloads nothing.
+  [Carry one over →](docs/usage.md#air-gapped-machines)
 
 ## Install
 
