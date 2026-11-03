@@ -289,7 +289,7 @@ run probe exec --no-tty -- sh -c 'printf extra > /tmp/synced/extra'
 run probe sync --delete --checksum ./sync-source/ :/tmp/synced/
 run probe exec --no-tty -- sh -c 'test ! -e /tmp/synced/extra'
 run probe sync ./sync-source/ :/tmp/owned/deep/
-run probe exec --no-tty -- sh -c 'test "$(stat -c %u /tmp/owned)" = "$(id -u)"'
+run probe exec --no-tty -- sh -c 'test $(stat -c %u /tmp/owned) = $(id -u)'
 passed
 
 begin "network: published ports, allowlist, local DNS, denial"

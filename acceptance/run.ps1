@@ -134,6 +134,9 @@ function Write-Note($Text) {
 }
 
 function Get-TerraOutput([string[]]$Arguments, [int]$ExitCode = 0, [switch]$Fails) {
+    # Windows PowerShell 5.1, which CI runs this script under, splits a native argument at embedded double quotes; PowerShell 7 does not, so the suite writes every argument quote-free.
+    $quoted = @($Arguments | Where-Object { $_.Contains('"') })
+    if ($quoted.Count -gt 0) { throw "Windows PowerShell would split terra argument $($quoted[0]); write it without double quotes" }
     $ErrorActionPreference = "Continue"
     # A console on stdin would make terra prompt instead of refusing, as it does in CI.
     $output = ($null | & $Terra @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
@@ -293,7 +296,7 @@ try {
     Invoke-Terra @("probe", "sync", "--delete", "--checksum", "./sync-source/", ":/tmp/synced/")
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "test ! -e /tmp/synced/extra")
     Invoke-Terra @("probe", "sync", "./sync-source/", ":/tmp/owned/deep/")
-    Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", 'test "$(stat -c %u /tmp/owned)" = "$(id -u)"')
+    Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", 'test $(stat -c %u /tmp/owned) = $(id -u)')
     Complete-Step
 
     Start-Step "network: published ports, allowlist, local DNS, denial"
