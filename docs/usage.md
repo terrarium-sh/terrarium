@@ -128,6 +128,11 @@ The workload has one shared session. Press `Ctrl-\` to detach without stopping
 it and `terra <box>` to rejoin. `terra <box> sessions` lists attached clients;
 `terra <box> detach ID` or `--all` disconnects them.
 
+For a browser terminal, run the attach under [ttyd](https://github.com/tsl0922/ttyd):
+`ttyd -W -i lo terra dev` serves it on `http://localhost:7681`, and each tab is one
+more client of the shared session. ttyd's `-c user:pass` and `--ssl` secure a
+wider bind.
+
 ## Work with a running box
 
 ```sh

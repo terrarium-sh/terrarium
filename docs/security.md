@@ -54,6 +54,9 @@ The default is an empty allowlist: nothing is reachable until a rule allows it.
 - Rules match destination addresses, not which machine is behind them. A public
   address that NATs back to the host stays reachable unless it is one of the
   host's own interface addresses.
+- A hostname rule grants the addresses that name resolves to. Behind a shared
+  CDN address, other sites on that address are reachable too. For name-level
+  filtering, allow only a [proxy](recipe.md#proxies).
 - The host's interface addresses are collected once, when the VM starts.
 - An allowed service is trusted with everything the guest sends it. Terra
   filters destinations, not protocols.

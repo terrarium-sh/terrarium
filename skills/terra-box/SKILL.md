@@ -348,6 +348,29 @@ Limits:
   a new lookup renews it; open connections are unaffected.
 - `ping` to external hosts does not work: there is no ICMP forwarding.
 
+#### Proxies
+
+Rules match addresses, not TLS names or request contents. To filter by
+hostname, or to keep API keys out of the box, allow only a proxy and point the
+guest at it:
+
+```yaml
+network:
+  allow: [proxy.local:3128]
+  hosts:
+    - { name: proxy.local, addr: HOST_LOOPBACK }
+env:
+  HTTPS_PROXY: http://proxy.local:3128
+  HTTP_PROXY: http://proxy.local:3128
+  https_proxy: http://proxy.local:3128
+  http_proxy: http://proxy.local:3128
+```
+
+The proxy decides which names the guest reaches, and it can add credentials to
+requests so the real key never enters the box. Setup hooks use the proxy too.
+Adding headers to HTTPS requests needs a proxy that terminates TLS, with its CA
+installed in the guest. Tools that ignore the proxy variables cannot connect.
+
 ### Processes
 
 - Setup prepares the root image in an isolated VM with the recipe's volumes but

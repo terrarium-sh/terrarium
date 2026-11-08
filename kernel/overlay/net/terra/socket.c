@@ -247,7 +247,7 @@ static int terra_bind_external(struct terra_tsi_socket *state)
 
 	if (inet_sk(state->sk)->inet_num)
 		return 0;
-	return state->native_ops->bind(state->socket, (struct sockaddr_unsized *)&local,
+	return state->native_ops->bind(state->socket, (struct sockaddr *)&local,
 		state->sk->sk_family == AF_INET ? sizeof(struct sockaddr_in) :
 						 sizeof(struct sockaddr_in6));
 }
@@ -302,7 +302,7 @@ static int terra_create_stream(struct terra_tsi_socket *state, u64 receive_bytes
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &state->stream);
 	if (error)
 		return error;
-	error = kernel_bind(state->stream, (struct sockaddr_unsized *)&local, sizeof(local));
+	error = kernel_bind(state->stream, (struct sockaddr *)&local, sizeof(local));
 	port = vsock_sk(state->stream->sk)->local_addr.svm_port;
 	/* A dynamic carrier port must not shadow Terra's fixed vsock ports. */
 	if (!error && port >= TERRA_AGENT_PORT && port <= TERRA_PUBLICATION_PORT)
