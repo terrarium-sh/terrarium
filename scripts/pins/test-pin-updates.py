@@ -318,7 +318,7 @@ class BuildToolsTest(unittest.TestCase):
             "scripts/toolchain/build-host.ps1": "",
             "pins.mk": "ALPINE_VERSION := 3.24.1\n",
             "scripts/sources/alpine-sources.sh": "image='docker.io/library/alpine@sha256:" + "a" * 64 + "'\napk add abuild=3.17.0-r0\n",
-            "kernel/Containerfile": "FROM docker.io/library/debian:bookworm-slim@sha256:" + "a" * 64 + "\nhttp://snapshot.debian.org/archive/debian/20260101T000000Z/\nhttp://snapshot.debian.org/archive/debian-security/20260101T000000Z/\n",
+            "kernel/Containerfile": "FROM docker.io/library/debian:trixie-slim@sha256:" + "a" * 64 + "\nhttp://snapshot.debian.org/archive/debian/20260101T000000Z/\nhttp://snapshot.debian.org/archive/debian-security/20260101T000000Z/\n",
         }
         self.feeds = {}
         self.fetch = patch.object(tools, "fetch", side_effect=self.feeds.__getitem__)
@@ -369,14 +369,14 @@ class BuildToolsTest(unittest.TestCase):
             tools.update_rust(original)
 
     def test_containers_update_digests_abuild_and_each_snapshot(self):
-        for image, tag in (("alpine", "3.24"), ("debian", "bookworm-slim")):
+        for image, tag in (("alpine", "3.24"), ("debian", "trixie-slim")):
             self.feeds[f"https://hub.docker.com/v2/repositories/library/{image}/tags/{tag}"] = json.dumps({"digest": "sha256:" + "b" * 64}).encode()
         self.feeds["https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/APKINDEX.tar.gz"] = package_index({"abuild": "3.18.0-r1"})
         self.feeds["https://snapshot.debian.org/mr/timestamp/"] = b'{"result": {"debian": ["20260201T000000Z"], "debian-security": ["20260202T000000Z"]}}'
         tools.update_containers(self.files)
         self.assertIn("alpine:3.24@sha256:" + "b" * 64, self.files["scripts/sources/alpine-sources.sh"])
         self.assertIn("abuild=3.18.0-r1", self.files["scripts/sources/alpine-sources.sh"])
-        self.assertIn("debian:bookworm-slim@sha256:" + "b" * 64, self.files["kernel/Containerfile"])
+        self.assertIn("debian:trixie-slim@sha256:" + "b" * 64, self.files["kernel/Containerfile"])
         self.assertIn("debian/20260201T000000Z/", self.files["kernel/Containerfile"])
         self.assertIn("debian-security/20260202T000000Z/", self.files["kernel/Containerfile"])
 
