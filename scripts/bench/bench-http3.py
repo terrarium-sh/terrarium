@@ -138,7 +138,7 @@ def main():
                                     "network": {"allow": ["HOST_LOOPBACK:" + port]},
                                     "mounts": [{"host": str(probe.parent), "guest": "/probe", "readonly": True},
                                                {"host": str(fixture), "guest": "/fixture", "readonly": True}],
-                                    "workload": {"entrypoint": "/bin/sh", "args": ["-ec", "while :; do sleep 60; done"]},
+                                    "workload": {"run": "while :; do sleep 60; done"},
                                 }))
                                 cell["recipe"] = json.loads(recipe.read_text())
                                 run([binary, recipe, "setup", "--project", project], env)

@@ -1,6 +1,6 @@
 //! `terra <box> storage` - the box's guest filesystem and volume images.
 
-use crate::approval::{Approval, request_recipe_approval};
+use crate::approval::{ApplyEffect, Approval, review_recipe};
 use crate::cli::{StorageArgs, StorageCmd, StorageFileArgs, StorageImportArgs};
 use crate::recipe::resolve;
 use crate::recipe::{MAX_RECIPE_BYTES, Recipe, Volume, VolumeLifetime, load_path};
@@ -25,10 +25,10 @@ pub fn run(
     project_dir: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let pinned_box = || resolve::resolve_box(name, project_dir, resolve::Existence::MustExist);
+    let applied_box = || resolve::resolve_box(name, project_dir, resolve::Existence::MustExist);
     match &args.cmd {
-        StorageCmd::Show(show_args) => show(&pinned_box()?, show_args.json),
-        StorageCmd::Export(StorageFileArgs { file }) => export(&pinned_box()?, file),
+        StorageCmd::Show(show_args) => show(&applied_box()?, show_args.json),
+        StorageCmd::Export(StorageFileArgs { file }) => export(&applied_box()?, file),
         StorageCmd::Import(StorageImportArgs {
             file: StorageFileArgs { file },
             trust_recipe,
@@ -39,14 +39,14 @@ pub fn run(
             };
             import(&bx, file, &approval, is_at_a_terminal)
         }
-        StorageCmd::Prune => prune(&pinned_box()?),
+        StorageCmd::Prune => prune(&applied_box()?),
     }?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn list_recipe_volumes(bx: &BoxRef) -> Result<Vec<Volume>> {
     let recipe = load_path(&bx.get_dir().join(RECIPE_FILE), bx.get_project_dir())
-        .context("reading the pinned recipe")?;
+        .context("reading the applied recipe")?;
     Ok(recipe.volumes)
 }
 
@@ -125,7 +125,7 @@ fn show(bx: &BoxRef, json: bool) -> Result<()> {
 fn list_image_entries(bx: &BoxRef) -> Result<Vec<StorageImageEntry>> {
     let images = bx.list_images()?;
     if images.is_empty() {
-        // A box with no images may have no pin to name its volumes by.
+        // A box with no images may have no applied recipe to name its volumes by.
         return Ok(Vec::new());
     }
     let unused = bx.list_unused_volume_images(&list_recipe_volume_names(bx)?)?;
@@ -323,15 +323,12 @@ fn import(bx: &BoxRef, from: &Path, approval: &Approval, is_at_a_terminal: bool)
         text: read_artifact_recipe(&mut artifact, from)?,
     };
     let held = bx.lock_if_present()?;
-    let approved = request_recipe_approval(
-        resolve::ResolvedRecipe {
-            bx: bx.clone(),
-            source: resolve::Source::Artifact(recipe),
-            manifest: None,
-        },
-        approval,
-        is_at_a_terminal,
-    )?;
+    let approved = review_recipe(resolve::ResolvedRecipe {
+        bx: bx.clone(),
+        source: resolve::Source::Artifact(recipe),
+        manifest: None,
+    })?
+    .approve(approval, ApplyEffect::Import, is_at_a_terminal)?;
     let _lock = match held {
         Some(lock) => lock,
         None => bx.lock_and_repair()?,
@@ -340,7 +337,7 @@ fn import(bx: &BoxRef, from: &Path, approval: &Approval, is_at_a_terminal: bool)
     let staging_dir = bx.begin_import()?;
     let staged = stage_images(bx, from, &approved.recipe, &mut artifact, &staging_dir).and_then(
         |mut staged| {
-            for name in approved.write_pin(&staging_dir)? {
+            for name in approved.write_applied_recipe(&staging_dir)? {
                 staged.push(StagedImportFile {
                     live: bx.get_dir().join(name),
                     stage: staging_dir.join(name),
@@ -547,7 +544,7 @@ mod tests {
         import_trusting(bx, from, true)
     }
 
-    /// A set-up box with a pinned recipe, a root filesystem and the volumes
+    /// A set-up box with an applied recipe, a root filesystem and the volumes
     /// named.
     fn build_box_ref(project_dir: &Path, volumes: &[&str]) -> BoxRef {
         use std::fmt::Write as _;

@@ -47,13 +47,7 @@ pub struct BrokerMetadata {
 }
 
 impl BootSpec {
-    pub fn resolve(
-        mut recipe: Recipe,
-        args: &BootArgs,
-        project_dir: PathBuf,
-        boot: BootMode,
-    ) -> Self {
-        override_workload(&mut recipe, &args.command);
+    pub fn resolve(recipe: Recipe, args: &BootArgs, project_dir: PathBuf, boot: BootMode) -> Self {
         Self {
             root: args.root,
             recipe,
@@ -520,13 +514,6 @@ pub(super) fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
     serde_json::from_slice(&json).context("decoding the boot to run")
 }
 
-fn override_workload(recipe: &mut Recipe, command: &[String]) {
-    if let Some((entrypoint, args)) = command.split_first() {
-        recipe.workload.entrypoint = PathBuf::from(entrypoint);
-        recipe.workload.args = args.to_vec();
-    }
-}
-
 /// The byte the VM process writes to its startup pipe once the guest agent is ready.
 pub(super) const AGENT_READY_NOTIFICATION: u8 = b'R';
 
@@ -646,7 +633,6 @@ fn read_log_tail(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::Workload;
 
     #[test]
     fn sandbox_identity_publishes_the_host_pid_before_boot() {
@@ -867,10 +853,10 @@ mod tests {
         use clap::Parser;
         let recipe: Recipe = yaml_serde::from_str(
             "hw:\n  cpus: 4\n  mem_mib: 2048\nenv:\n  API_KEY: sk-secret\n\
-             workload:\n  entrypoint: /bin/sh\n",
+             workload:\n  run: make\n",
         )
         .unwrap();
-        let boot = crate::cli::Cli::parse_from(["terra", "--", "npm", "test"]).boot;
+        let boot = crate::cli::Cli::parse_from(["terra"]).boot;
 
         let spec = BootSpec::resolve(recipe, &boot, PathBuf::from("/proj"), BootMode::Detached);
         let back = read_boot_spec(serde_json::to_vec(&spec).unwrap().as_slice()).unwrap();
@@ -886,8 +872,7 @@ mod tests {
         );
         assert_eq!(back.recipe.hw.mem_mib, 2048);
         assert_eq!(back.recipe.env["API_KEY"], "sk-secret");
-        assert_eq!(back.recipe.workload.entrypoint, PathBuf::from("npm"));
-        assert_eq!(back.recipe.workload.args, ["test"]);
+        assert_eq!(back.recipe.workload.run.as_deref(), Some("make"));
     }
 
     /// Foreground supervision and the workload's terminal use the same flag,
@@ -913,22 +898,5 @@ mod tests {
             assert!(!foreground_of(&[], spawned), "{spawned:?}");
             assert!(!foreground_of(&["--foreground"], spawned), "{spawned:?}");
         }
-    }
-
-    #[test]
-    fn trailing_args_override_the_workload() {
-        use clap::Parser;
-        let c = crate::cli::Cli::parse_from(["terra", "--", "npm", "test", "--watch"]);
-        assert!(c.cmd.is_none(), "using a box has no verb");
-        assert_eq!(c.boot.command, ["npm", "test", "--watch"]);
-
-        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
-        override_workload(&mut recipe, &c.boot.command);
-        assert_eq!(recipe.workload.entrypoint, PathBuf::from("npm"));
-        assert_eq!(recipe.workload.args, ["test", "--watch"]);
-
-        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
-        override_workload(&mut recipe, &[]);
-        assert_eq!(recipe.workload, Workload::default());
     }
 }

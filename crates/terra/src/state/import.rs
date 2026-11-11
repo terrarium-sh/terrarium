@@ -186,7 +186,7 @@ impl BoxRef {
         std::fs::remove_file(journal).context("removing import recovery journal")
     }
 
-    /// The box file a journal entry names: an image, or the pin an import carries.
+    /// The box file a journal entry names: an image, or the applied recipe an import carries.
     fn find_journaled_file(&self, name: &str) -> Option<PathBuf> {
         match name {
             RECIPE_FILE | PINNED_PATHS_FILE => Some(self.get_dir().join(name)),
@@ -212,7 +212,6 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest as _, Sha256};
 
     #[test]
     fn a_late_import_commit_failure_restores_all_original_images() {
@@ -429,7 +428,7 @@ mod tests {
                 assert_eq!(
                     std::fs::read(&stamp).unwrap(),
                     if committed {
-                        Sha256::digest(b"new").to_vec()
+                        super::super::setup_state::digest_setup_boot_inputs("new")
                     } else {
                         Vec::new()
                     }

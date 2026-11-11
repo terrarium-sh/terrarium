@@ -4,5 +4,4 @@ volumes:
   - {name: kept, guest: /kept, size_mib: 64}
   - {name: scratch, guest: /scratch, size_mib: 64, lifetime: boot}
 workload:
-  entrypoint: /bin/sh
-  args: ['-ec', 'while true; do sleep 60; done']
+  run: while true; do sleep 60; done

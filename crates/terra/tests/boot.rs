@@ -104,7 +104,7 @@ impl Suite {
         PathBuf::from(files)
     }
 
-    /// Boot `recipe` in a fresh box named `name` under WORK: `setup` pins the
+    /// Boot `recipe` in a fresh box named `name` under WORK: `setup` applies the
     /// recipe and bakes `on_create` with its console on setup's stdout, then
     /// the bare form boots it. The
     /// recipes live outside any share, so nothing is ever asked about.
@@ -171,7 +171,7 @@ impl Suite {
         std::fs::write(
             &recipe,
             format!(
-                "network:\n  mode: unrestricted-public\nhooks:\n  on_create:\n    - apk add --no-cache git python3\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
+                "network:\n  mode: unrestricted-public\nhooks:\n  on_create:\n    - apk add --no-cache git python3\nworkload:\n  run: |\n      set -e\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
                 host.display()
             ),
         )
@@ -345,7 +345,7 @@ fn pending_network_reads_do_not_block_other_downloads() {
     std::fs::write(
         &recipe,
         format!(
-            "network:\n  allow: [\"buffer.test:{port}\"]\n  hosts:\n    - {{name: buffer.test, addr: HOST_LOOPBACK}}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [\"buffer.test:{port}\"]\n  hosts:\n    - {{name: buffer.test, addr: HOST_LOOPBACK}}\nworkload:\n  run: |\n      set -e\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
             payloads.display()
         ),
     )
@@ -363,22 +363,19 @@ fn select_socket_probe_flags() -> &'static [&'static str] {
     }
 }
 
-fn render_socket_probe_workload(arguments: Vec<String>) -> String {
+fn render_socket_probe_workload(arguments: &[String]) -> String {
     let collect_kernel_log = !select_socket_probe_flags().is_empty();
-    let (entrypoint, arguments) = if collect_kernel_log {
-        let mut shell_arguments = vec![
-            "-c".into(),
-            "mknod /dev/kmsg c 1 11 2>/dev/null || true; /work/kmsg-reader & kernel_log_reader=$!; /work/terra-socket-probe \"$@\"; status=$?; kill \"$kernel_log_reader\"; wait \"$kernel_log_reader\" || true; dmesg; exit \"$status\"".into(),
-            "socket-probe".into(),
-        ];
-        shell_arguments.extend(arguments);
-        ("/bin/sh", shell_arguments)
+    let arguments = arguments.join(" ");
+    let run = if collect_kernel_log {
+        format!(
+            "mknod /dev/kmsg c 1 11 2>/dev/null || true; /work/kmsg-reader & kernel_log_reader=$!; /work/terra-socket-probe {arguments}; status=$?; kill \"$kernel_log_reader\"; wait \"$kernel_log_reader\" || true; dmesg; exit \"$status\""
+        )
     } else {
-        ("/work/terra-socket-probe", arguments)
+        format!("exec /work/terra-socket-probe {arguments}")
     };
     format!(
-        "workload:\n  entrypoint: {entrypoint}\n  args: {}\n",
-        serde_json::to_string(&arguments).unwrap()
+        "workload:\n  run: {}\n",
+        serde_json::to_string(&run).unwrap()
     )
 }
 
@@ -469,8 +466,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
         "mounts": [{"host": directory, "guest": "/work", "readonly": false}],
         "workload": {
-            "entrypoint": "/bin/sh",
-            "args": ["-ec", "exec /work/terra-vsock-probe receive-credit-lowat > /work/VSOCK_CREDIT_PROBE_LOG 2>&1"],
+            "run": "exec /work/terra-vsock-probe receive-credit-lowat > /work/VSOCK_CREDIT_PROBE_LOG 2>&1",
         },
     });
     std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
@@ -508,7 +504,7 @@ fn static_vsock_endpoint_classes_reject_unknown_duplicate_and_malformed_connecti
         };
         let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
         std::fs::write(&recipe, format!(
-            "network:\n  enabled: {enabled}\nworkload:\n  entrypoint: /work/terra-vsock-probe\n  args: [{mode}]\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n", probe.parent().unwrap().display()
+            "network:\n  enabled: {enabled}\nworkload:\n  run: exec /work/terra-vsock-probe {mode}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n", probe.parent().unwrap().display()
         )).unwrap();
         let output = suite.boot_recipe(&recipe, name, &["--root"]);
         assert!(
@@ -539,7 +535,7 @@ fn static_socket_selection_preserves_local_and_namespace_routes() {
             &recipe,
             format!(
                 "network:\n  enabled: {enabled}\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
-                render_socket_probe_workload(vec![mode.into()]),
+                render_socket_probe_workload(&[mode.into()]),
                 probe.parent().unwrap().display()
             ),
         )
@@ -557,7 +553,7 @@ fn static_libc_dns_resolves_configured_names() {
     let probe = suite.compile_probe("socket");
     let recipe = suite.get_work_dir().join("socket-dns.yaml");
     let text = format!(
-        "network:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nworkload:\n  entrypoint: /work/terra-socket-probe\n  args: [--dns]\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+        "network:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nworkload:\n  run: exec /work/terra-socket-probe --dns\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
         probe.parent().unwrap().display()
     );
     std::fs::write(&recipe, text).unwrap();
@@ -698,7 +694,7 @@ fn static_tcp_send_limits_preserve_user_overrides_and_queued_fin() {
         let recipe = suite.get_work_dir().join("socket-send-limits.yaml");
         std::fs::write(&recipe, format!(
             "network:\n  allow: [HOST_LOOPBACK:{port}, HOST_LOOPBACK:{refused_port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: false\n",
-            render_socket_probe_workload(vec!["--send-limits".into(), "100.96.0.1".into(), port.to_string(), refused_port.to_string()]),
+            render_socket_probe_workload(&["--send-limits".into(), "100.96.0.1".into(), port.to_string(), refused_port.to_string()]),
             directory.display()
         )).unwrap();
         let mut flags = select_socket_probe_flags().to_vec();
@@ -730,7 +726,7 @@ fn static_udp_error_queue_consumption_resumes_buffered_reply() {
         let recipe = suite.get_work_dir().join("socket-udp-error-budget.yaml");
         std::fs::write(&recipe, format!(
             "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
-            render_socket_probe_workload(vec!["--udp-error-budget".into(), "100.96.0.1".into(), port.to_string()]),
+            render_socket_probe_workload(&["--udp-error-budget".into(), "100.96.0.1".into(), port.to_string()]),
             probe.parent().unwrap().display()
         )).unwrap();
         let output = suite.boot_recipe(
@@ -767,7 +763,7 @@ fn static_quic_socket_options_and_gso_preserve_udp_boundaries() {
         let recipe = suite.get_work_dir().join("socket-quic.yaml");
         std::fs::write(&recipe, format!(
             "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
-            render_socket_probe_workload(vec!["--quic-socket".into(), "100.96.0.1".into(), port.to_string()]),
+            render_socket_probe_workload(&["--quic-socket".into(), "100.96.0.1".into(), port.to_string()]),
             probe.parent().unwrap().display()
         )).unwrap();
         let output = suite.boot_recipe(&recipe, "socket-quic", select_socket_probe_flags());
@@ -845,7 +841,7 @@ fn static_quic_gso_requests_credit_for_an_atomic_batch() {
         let recipe = suite.get_work_dir().join("socket-quic-credit.yaml");
         std::fs::write(&recipe, format!(
             "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
-            render_socket_probe_workload(vec!["--quic-credit".into(), "100.96.0.1".into(), port.to_string()]),
+            render_socket_probe_workload(&["--quic-credit".into(), "100.96.0.1".into(), port.to_string()]),
             directory.display()
         )).unwrap();
         let output = suite.boot_recipe(&recipe, "socket-quic-credit", select_socket_probe_flags());
@@ -881,7 +877,7 @@ fn static_socket_calls_forward_tcp_and_udp_through_authorized_broker() {
         std::fs::write(&recipe, format!(
             "network:\n  allow: [HOST_LOOPBACK:{}, HOST_LOOPBACK:{}, HOST_LOOPBACK:{}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
             ports[0], ports[1], ports[2],
-            render_socket_probe_workload(vec!["--external".into(), "100.96.0.1".into(), ports[0].to_string(), ports[1].to_string(), ports[2].to_string()]),
+            render_socket_probe_workload(&["--external".into(), "100.96.0.1".into(), ports[0].to_string(), ports[1].to_string(), ports[2].to_string()]),
             probe.parent().unwrap().display()
         )).unwrap();
         let output = suite.boot_recipe(&recipe, "socket-external", select_socket_probe_flags());
@@ -930,7 +926,7 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
             "/work/terra-socket-probe --published-udp-loopback 18084 > /tmp/udp-loopback.log 2>&1",
             "while true; do printf 'TCP_PUBLICATION' | busybox nc -l -p 18085; done",
         ],
-        "workload": {"entrypoint": "/bin/sleep", "args": ["infinity"]},
+        "workload": {"run": "exec /bin/sleep infinity"},
     });
     std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let project = project.to_str().unwrap();
@@ -1139,7 +1135,7 @@ fn native_tcp_reset_after_fin_preserves_the_socket_error() {
     let recipe_json = serde_json::json!({
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
         "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
-        "workload": {"entrypoint": "/work/terra-socket-probe", "args": ["--reset-after-fin", "100.96.0.1", port.to_string()]},
+        "workload": {"run": format!("exec /work/terra-socket-probe --reset-after-fin 100.96.0.1 {port}")},
     });
     std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let output = suite.boot_recipe(
@@ -1158,11 +1154,7 @@ fn sequential_execs_reuse_agent_client_slots() {
     let suite = Suite::new();
     let project = suite.create_project_dir("server");
     let recipe = suite.get_work_dir().join("server.yaml");
-    std::fs::write(
-        &recipe,
-        "workload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
-    )
-    .unwrap();
+    std::fs::write(&recipe, "workload:\n  run: exec /bin/sleep infinity\n").unwrap();
     let project = project.to_str().unwrap();
     assert_eq!(
         suite
@@ -1255,7 +1247,7 @@ fn run_boot_suite() {
         "wildcard reached the apex:\n{out}"
     );
 
-    // == on_create: runs once on the fresh root, never again ==
+    // == on_create: runs once per fresh root; only a changed recipe rebuilds it ==
     let first = s.boot("bake", &[]);
     let second = s.boot("bake", &[]);
     let when = |out: &str| {
@@ -1271,34 +1263,56 @@ fn run_boot_suite() {
     let edited_dir = s.create_project_dir("bake-edited");
     let edited = edited_dir.join("bake.yaml");
     let source = std::fs::read_to_string(assets_dir().join("bake.yaml")).unwrap();
-    std::fs::write(
-        &edited,
-        source.replace("mkdir -p /opt/baked", "mkdir -p /opt/baked2"),
-    )
-    .unwrap();
     let bake_project = s.get_work_dir().join("bake");
-    let resetup = s.run_terra_output(&[
-        edited.to_str().unwrap(),
-        "setup",
-        "--project",
-        bake_project.to_str().unwrap(),
-    ]);
-    let resetup_stderr = String::from_utf8_lossy(&resetup.stderr);
-    assert!(resetup.status.success(), "{resetup_stderr}");
+    let setup_with = |recipe_text: &str| {
+        std::fs::write(&edited, recipe_text).unwrap();
+        let out = s.run_terra_output(&[
+            edited.to_str().unwrap(),
+            "setup",
+            "--project",
+            bake_project.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{stderr}");
+        stderr
+    };
+    let boot_when = || {
+        when(&s.run_terra_command(&[
+            "bake",
+            "--foreground",
+            "--project",
+            bake_project.to_str().unwrap(),
+        ]))
+    };
+    let rebuilt = "from scratch: the recipe changed";
+
+    let stderr = setup_with(&source);
     assert!(
-        resetup_stderr.contains("--rebuild"),
-        "a changed on_create went unreported:\n{resetup_stderr}"
+        !stderr.contains(rebuilt),
+        "unedited recipe rebuilt:\n{stderr}"
     );
-    let third = s.run_terra_command(&[
-        "bake",
-        "--foreground",
-        "--project",
-        bake_project.to_str().unwrap(),
-    ]);
     assert!(
-        when(&third) == when(&first),
-        "setup re-ran on_create on an existing root: {:?} vs {:?}",
-        when(&third),
+        boot_when() == when(&first),
+        "setup re-ran on_create for an unedited recipe"
+    );
+
+    let stderr = setup_with(&format!("# a comment\n{source}"));
+    assert!(!stderr.contains(rebuilt), "a comment rebuilt:\n{stderr}");
+    assert!(
+        boot_when() == when(&first),
+        "setup re-ran on_create after a comment-only edit"
+    );
+
+    let stderr =
+        setup_with(&source.replace("mkdir -p /opt/baked", "mkdir -p /opt/baked /opt/baked2"));
+    assert!(
+        stderr.contains(rebuilt),
+        "a changed on_create went unreported:\n{stderr}"
+    );
+    let rebuilt_when = boot_when();
+    assert!(
+        rebuilt_when.is_some() && rebuilt_when != when(&first),
+        "a changed recipe did not rerun on_create: {rebuilt_when:?} vs {:?}",
         when(&first)
     );
 
@@ -1326,7 +1340,7 @@ fn run_boot_suite() {
     assert!(!flaky_files.join("setup-finished").exists());
     std::fs::write(
         &flaky,
-        "hooks:\n  on_create:\n    - test ! -e /leftover\n    - echo cleaned > /baked\nworkload:\n  entrypoint: /bin/cat\n  args: [/baked]\n",
+        "hooks:\n  on_create:\n    - test ! -e /leftover\n    - echo cleaned > /baked\nworkload:\n  run: exec /bin/cat /baked\n",
     )
     .unwrap();
     assert_eq!(
@@ -1446,11 +1460,7 @@ fn run_boot_suite() {
     // (A child that dies *before* owning the box replays its logs and exit
     // code - boot/lock failure, which no recipe can arrange.)
     let oneshot = s.get_work_dir().join("oneshot.yaml");
-    std::fs::write(
-        &oneshot,
-        "workload:\n  entrypoint: /bin/sh\n  args: [-c, 'echo ONESHOT_RAN; exit 7']\n",
-    )
-    .unwrap();
+    std::fs::write(&oneshot, "workload:\n  run: 'echo ONESHOT_RAN; exit 7'\n").unwrap();
     let oneshot_box = s.create_project_dir("oneshot");
     s.run_terra_command(&[
         oneshot.to_str().unwrap(),
@@ -1512,7 +1522,7 @@ fn run_boot_suite() {
     std::fs::write(
         &daemon_recipe,
         "daemons:\n  - echo DAEMON_STARTED\n  - \"echo CRASH; exit 3\"\n\
-         workload:\n  entrypoint: /bin/sh\n  args: [-c, 'sleep 4; echo WORKLOAD_DONE']\n",
+         workload:\n  run: 'sleep 4; echo WORKLOAD_DONE'\n",
     )
     .unwrap();
     let daemon_project = s.create_project_dir("daemon");
@@ -1536,7 +1546,7 @@ fn run_boot_suite() {
     );
 
     let status_recipe = s.get_work_dir().join("exit-status.yaml");
-    std::fs::write(&status_recipe, "workload:\n  entrypoint: /bin/true\n").unwrap();
+    std::fs::write(&status_recipe, "workload:\n  run: kill -TERM $$\n").unwrap();
     let status_project = s.create_project_dir("exit-status");
     let status_dir = status_project.to_str().unwrap();
     s.run_terra_command(&[
@@ -1545,23 +1555,11 @@ fn run_boot_suite() {
         "--project",
         status_dir,
     ]);
-    let boot_with = |cmd: &str| {
-        s.run_terra_status(&[
-            "exit-status",
-            "--foreground",
-            "--project",
-            status_dir,
-            "--",
-            "sh",
-            "-c",
-            cmd,
-        ])
-        .1
-    };
     // A signal death is `128 + signal`, the way a shell spells it - and the way
     // `terra exec` already reports one, so a box and a command agree.
     assert_eq!(
-        boot_with("kill -TERM $$"),
+        s.run_terra_status(&["exit-status", "--foreground", "--project", status_dir])
+            .1,
         128 + 15,
         "a signalled workload was not reported as 128 + signal"
     );
@@ -1768,7 +1766,7 @@ fn foreground_process_owns_the_vm_and_releases_its_lock_on_death() {
     let recipe = suite.get_work_dir().join("server.yaml");
     std::fs::write(
         &recipe,
-        "workload:\n  entrypoint: /bin/sh\n  args: [-c, 'echo FOREGROUND_READY; sleep 300']\n",
+        "workload:\n  run: 'echo FOREGROUND_READY; sleep 300'\n",
     )
     .unwrap();
     let (_, setup_code) = suite.run_terra_status(&[
@@ -1847,7 +1845,7 @@ fn attached_console_streams_hooks_before_workload_and_exit() {
     let recipe = suite.get_work_dir().join("hooks.yaml");
     std::fs::write(
         &recipe,
-        "hw: {cpus: 2, mem_mib: 512}\nhooks:\n  on_start:\n    - printf 'HOOK_START\\n'; sleep 2; printf 'HOOK_STDERR\\n' >&2\n  pre_stop:\n    - printf 'HOOK_STOP\\n'; printf 'STOP_STDERR\\n' >&2; exit 9\nworkload:\n  entrypoint: /bin/sh\n  args: [-c, \"printf 'WORKLOAD_READY\\n'; exit 7\"]\n",
+        "hw: {cpus: 2, mem_mib: 512}\nhooks:\n  on_start:\n    - printf 'HOOK_START\\n'; sleep 2; printf 'HOOK_STDERR\\n' >&2\n  pre_stop:\n    - printf 'HOOK_STOP\\n'; printf 'STOP_STDERR\\n' >&2; exit 9\nworkload:\n  run: \"printf 'WORKLOAD_READY\\n'; exit 7\"\n",
     )
     .unwrap();
     let (_, setup_code) = suite.run_terra_status(&[
@@ -1961,7 +1959,7 @@ fn capacity_machine_vcpus_and_storage_devices() {
     std::fs::write(
         &recipe,
         format!(
-            "hw: {{cpus: {cpus}, mem_mib: 512}}\nvolumes:\n{volumes}\nmounts:\n{mounts}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      test \"$(nproc)\" = {cpus}\n      test \"$(cat /sys/devices/system/cpu/online)\" = 0-{last_cpu}\n      grep -Eq '0x0*5' /sys/bus/virtio/devices/*/device\n      for target in {targets}; do\n        (\n          i=0\n          while test \"$i\" -lt 16; do\n            value=\"$target:$i\"\n            printf '%s' \"$value\" > \"$target/roundtrip\"\n            test \"$(cat \"$target/roundtrip\")\" = \"$value\"\n            i=$((i + 1))\n          done\n        ) &\n      done\n      wait\n      for index in $(seq 0 {last_mount}); do test \"$(cat /mount-$index/host-seed)\" = host-$index; done\n      echo CAPACITY_OK\n"
+            "hw: {{cpus: {cpus}, mem_mib: 512}}\nvolumes:\n{volumes}\nmounts:\n{mounts}\nworkload:\n  run: |\n      set -e\n      test \"$(nproc)\" = {cpus}\n      test \"$(cat /sys/devices/system/cpu/online)\" = 0-{last_cpu}\n      grep -Eq '0x0*5' /sys/bus/virtio/devices/*/device\n      for target in {targets}; do\n        (\n          i=0\n          while test \"$i\" -lt 16; do\n            value=\"$target:$i\"\n            printf '%s' \"$value\" > \"$target/roundtrip\"\n            test \"$(cat \"$target/roundtrip\")\" = \"$value\"\n            i=$((i + 1))\n          done\n        ) &\n      done\n      wait\n      for index in $(seq 0 {last_mount}); do test \"$(cat /mount-$index/host-seed)\" = host-$index; done\n      echo CAPACITY_OK\n"
         ),
     )
     .unwrap();
@@ -1992,7 +1990,7 @@ fn capacity_32_volumes_reaches_vdah() {
     std::fs::write(
         &recipe,
         format!(
-            "hw: {{cpus: 2, mem_mib: 512}}\nvolumes:\n{volumes}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      test -b /dev/vdah\n      for index in $(seq 0 31); do\n        value=volume-$index\n        printf '%s' \"$value\" > \"/volume-$index/roundtrip\"\n        test \"$(cat \"/volume-$index/roundtrip\")\" = \"$value\"\n      done\n      echo VOLUME_CAPACITY_OK\n"
+            "hw: {{cpus: 2, mem_mib: 512}}\nvolumes:\n{volumes}\nworkload:\n  run: |\n      set -e\n      test -b /dev/vdah\n      for index in $(seq 0 31); do\n        value=volume-$index\n        printf '%s' \"$value\" > \"/volume-$index/roundtrip\"\n        test \"$(cat \"/volume-$index/roundtrip\")\" = \"$value\"\n      done\n      echo VOLUME_CAPACITY_OK\n"
         ),
     )
     .unwrap();
@@ -2001,9 +1999,11 @@ fn capacity_32_volumes_reaches_vdah() {
     assert!(output.contains("VOLUME_CAPACITY_OK"), "{output}");
 }
 
+/// A changed `rootfs_mib` rebuilds the root at the new size, and the kept
+/// volume grows in place; both filesystems span their devices, also on restart.
 #[test]
 #[ignore = "boots a VM several times and requires a native hypervisor"]
-fn root_and_volume_filesystems_span_their_devices_after_growth_and_restart() {
+fn root_rebuilt_and_volume_grown_filesystems_span_their_devices_after_restart() {
     const MIB: u64 = 1024 * 1024;
     let suite = Suite::new();
     let recipe = suite.get_work_dir().join("grow.yaml");
@@ -2011,7 +2011,7 @@ fn root_and_volume_filesystems_span_their_devices_after_growth_and_restart() {
         std::fs::write(
             &recipe,
             format!(
-                "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: {rootfs_mib}}}\nvolumes:\n  - name: data\n    guest: /data\n    size_mib: {volume_mib}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      for target in / /data; do\n        device=$(awk -v t=$target '$2==t {{print $1}}' /proc/mounts | tail -n 1)\n        sectors=$(cat /sys/class/block/${{device##*/}}/size)\n        echo \"SPAN $target $((sectors * 512)) $(stat -f -c '%S %b' $target)\"\n      done\n"
+                "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: {rootfs_mib}}}\nvolumes:\n  - name: data\n    guest: /data\n    size_mib: {volume_mib}\nworkload:\n  run: |\n      set -e\n      for target in / /data; do\n        device=$(awk -v t=$target '$2==t {{print $1}}' /proc/mounts | tail -n 1)\n        sectors=$(cat /sys/class/block/${{device##*/}}/size)\n        echo \"SPAN $target $((sectors * 512)) $(stat -f -c '%S %b' $target)\"\n      done\n"
             ),
         )
         .unwrap();
@@ -2086,10 +2086,8 @@ fn local_apic_timers_work_without_a_legacy_clockevent() {
             format!(
                 r#"hw: {{cpus: {cpus}, mem_mib: 512}}
 workload:
-  entrypoint: /bin/sh
-  args:
-    - -ec
-    - |
+  run: |
+      set -e
       ! grep -Eq '^[[:space:]]*0:' /proc/interrupts
       for timer in /sys/devices/system/clockevents/clockevent[0-9]*/current_device; do
         grep -Eq '^lapic(-deadline)?$' "$timer"
@@ -2119,7 +2117,7 @@ fn agent_readiness_precedes_long_bake_and_start_hooks() {
     std::fs::create_dir(&share).unwrap();
     let recipe = suite.get_work_dir().join("server.yaml");
     std::fs::write(&recipe, format!(
-        "hw: {{cpus: 2, mem_mib: 512}}\nhooks:\n  on_create:\n    - sleep 65; touch /baked\n  on_start:\n    - while [ ! -e /work/release ]; do sleep 1; done; touch /work/finished\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\nmounts:\n  - host: {}\n    guest: /work\n",
+        "hw: {{cpus: 2, mem_mib: 512}}\nhooks:\n  on_create:\n    - sleep 65; touch /baked\n  on_start:\n    - while [ ! -e /work/release ]; do sleep 1; done; touch /work/finished\nworkload:\n  run: exec /bin/sleep infinity\nmounts:\n  - host: {}\n    guest: /work\n",
         share.display(),
     )).unwrap();
     let project = project.to_str().unwrap();
@@ -2215,7 +2213,7 @@ fn broker_loss_preserves_agent_and_supervisor_loss_stops_the_box() {
     let recipe = suite.get_work_dir().join("server.yaml");
     std::fs::write(
         &recipe,
-        format!("network:\n  ports: ['{port}:8080']\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n"),
+        format!("network:\n  ports: ['{port}:8080']\nworkload:\n  run: exec /bin/sleep infinity\n"),
     )
     .unwrap();
     let project = project.to_str().unwrap();
@@ -2337,7 +2335,7 @@ fn bwrap_enforces_vm_and_vcpu_threads() {
     let recipe = suite.get_work_dir().join("server.yaml");
     std::fs::write(
         &recipe,
-        "hw: {cpus: 2, mem_mib: 512}\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
+        "hw: {cpus: 2, mem_mib: 512}\nworkload:\n  run: exec /bin/sleep infinity\n",
     )
     .unwrap();
     let project = project.to_str().unwrap();
@@ -2520,7 +2518,7 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
             std::fs::write(
                 &recipe,
                 format!(
-                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n{volumes}mounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -c\n    - |\n      {script}\n",
+                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n{volumes}mounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  run: |\n      {script}\n",
                     project.display()
                 ),
             )
@@ -2857,7 +2855,7 @@ mod containers {
             let path = suite.get_work_dir().join(format!("{name}.yaml"));
             std::fs::write(
                 &path,
-                format!("{recipe}workload: {{entrypoint: /bin/sleep, args: [infinity]}}\n"),
+                format!("{recipe}workload: {{run: exec /bin/sleep infinity}}\n"),
             )
             .unwrap();
             for args in [
@@ -2899,7 +2897,7 @@ fn the_image_ships_the_identity_and_regenerates_per_boot_files() {
     let recipe = suite.get_work_dir().join("identity.yaml");
     std::fs::write(
         &recipe,
-        "hooks:\n  on_create:\n    - echo \"CREATE_TERRI=$(id -u terri)\"\n    - sed -i 's/^#.*/permit nopass terri/' /etc/doas.conf\n    - rm /etc/doas.d && mkdir /etc/doas.d && echo 'permit nopass terri' > /etc/doas.d/x.conf\nsudo: [id]\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
+        "hooks:\n  on_create:\n    - echo \"CREATE_TERRI=$(id -u terri)\"\n    - sed -i 's/^#.*/permit nopass terri/' /etc/doas.conf\n    - rm /etc/doas.d && mkdir /etc/doas.d && echo 'permit nopass terri' > /etc/doas.d/x.conf\nsudo: [id]\nworkload:\n  run: exec /bin/sleep infinity\n",
     )
     .unwrap();
     let (setup, code) =

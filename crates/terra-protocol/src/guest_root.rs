@@ -37,6 +37,10 @@ pub fn link_per_boot_files(root: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runs every recipe shell line (hooks, daemons, the workload's `run`) and is
+/// the interactive workload when `run` is unset.
+pub const RECIPE_SHELL: &str = "/bin/sh";
+
 /// Workload user name (cosmetic, for shell prompts).
 pub const WORKLOAD_USER_NAME: &str = "terri";
 

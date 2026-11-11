@@ -380,11 +380,7 @@ def recipe(cpus: int, mem_mib: int, mount: Path) -> str:
   cpus: {cpus}
   mem_mib: {mem_mib}
 workload:
-  entrypoint: /bin/sh
-  args:
-    - -ec
-    - |
-      while :; do sleep 60; done
+  run: 'while :; do sleep 60; done'
 mounts:
   - host: {mount}
     guest: /bench

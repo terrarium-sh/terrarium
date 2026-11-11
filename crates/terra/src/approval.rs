@@ -1,4 +1,4 @@
-//! Approve a recipe before it is pinned, and write the pin it becomes.
+//! Approve a recipe before it is applied, and write the applied recipe it becomes.
 //! Approval prevents a guest-written recipe in a writable share from granting new host access.
 
 use crate::policy::mount;
@@ -20,60 +20,102 @@ pub(crate) enum Approval {
 pub(crate) struct ApprovedRecipe {
     pub(crate) bx: BoxRef,
     pub(crate) recipe: Recipe,
-    pub(crate) new_pin: Option<resolve::RecipeFile>,
+    pub(crate) changed_recipe: Option<resolve::RecipeFile>,
     pub(crate) pinned_paths: Option<state::PinnedPaths>,
 }
 
 impl ApprovedRecipe {
-    /// Write the pin files this approval changes into `dir`, and name them.
-    pub(crate) fn write_pin(&self, dir: &Path) -> Result<Vec<&'static str>> {
-        state::write_pin(
+    /// Write the applied recipe files this approval changes into `dir`, and name them.
+    pub(crate) fn write_applied_recipe(&self, dir: &Path) -> Result<Vec<&'static str>> {
+        state::write_applied_recipe(
             dir,
-            self.new_pin.as_ref().map(|file| file.text.as_str()),
+            self.changed_recipe.as_ref().map(|file| file.text.as_str()),
             self.pinned_paths.as_ref(),
         )
     }
 }
 
-pub(crate) fn request_recipe_approval(
-    target: ResolvedRecipe,
-    approval: &Approval,
-    is_at_a_terminal: bool,
-) -> Result<ApprovedRecipe> {
-    let (mut recipe, paths) = target.load_recipe()?;
+/// A loaded recipe and how it differs from what the box has applied, before
+/// anyone is asked about it.
+pub(crate) struct RecipeReview {
+    bx: BoxRef,
+    recipe: Recipe,
+    paths: state::PinnedPaths,
+    previous_paths: Option<state::PinnedPaths>,
+    changed_recipe: Option<ChangedRecipe>,
+}
+
+pub(crate) fn review_recipe(target: ResolvedRecipe) -> Result<RecipeReview> {
+    let (recipe, paths) = target.load_recipe()?;
     let ResolvedRecipe {
         bx,
         source,
         manifest: _,
     } = target;
     let previous_paths = bx.load_pinned_paths()?;
-    let has_changed_targets = previous_paths
-        .as_ref()
-        .is_some_and(|pinned| pinned != &paths);
-    let new_pin = find_new_pin(&bx, source);
-    if new_pin.is_some() || has_changed_targets {
-        ask_about_pinning(
-            &bx,
-            new_pin.as_ref(),
-            &recipe,
-            has_changed_targets,
-            approval,
-            is_at_a_terminal,
-        )?;
-    }
-    let pinned_paths = (previous_paths.as_ref() != Some(&paths)).then_some(paths);
-    merge_env_file(&mut recipe)?;
-    ensure_boot_plan_fits(&bx, &recipe)?;
-    Ok(ApprovedRecipe {
+    let changed_recipe = find_changed_recipe(&bx, source);
+    Ok(RecipeReview {
         bx,
         recipe,
-        new_pin: new_pin.map(|pin| pin.file),
-        pinned_paths,
+        paths,
+        previous_paths,
+        changed_recipe,
     })
 }
 
-/// A recipe that differs from the pin, and what brought it to setup.
-struct NewPin {
+impl RecipeReview {
+    pub(crate) fn get_box(&self) -> &BoxRef {
+        &self.bx
+    }
+
+    pub(crate) fn get_changed_text(&self) -> Option<&str> {
+        self.changed_recipe
+            .as_ref()
+            .map(|changed| changed.file.text.as_str())
+    }
+
+    /// Ask about the changes, when they need asking, naming `effect` as what a yes does.
+    pub(crate) fn approve(
+        self,
+        approval: &Approval,
+        effect: ApplyEffect,
+        is_at_a_terminal: bool,
+    ) -> Result<ApprovedRecipe> {
+        let RecipeReview {
+            bx,
+            mut recipe,
+            paths,
+            previous_paths,
+            changed_recipe,
+        } = self;
+        let has_changed_targets = previous_paths
+            .as_ref()
+            .is_some_and(|applied| applied != &paths);
+        if changed_recipe.is_some() || has_changed_targets {
+            ask_to_apply_recipe(
+                &bx,
+                changed_recipe.as_ref(),
+                &recipe,
+                has_changed_targets,
+                effect,
+                approval,
+                is_at_a_terminal,
+            )?;
+        }
+        let pinned_paths = (previous_paths.as_ref() != Some(&paths)).then_some(paths);
+        merge_env_file(&mut recipe)?;
+        ensure_boot_plan_fits(&bx, &recipe)?;
+        Ok(ApprovedRecipe {
+            bx,
+            recipe,
+            changed_recipe: changed_recipe.map(|changed| changed.file),
+            pinned_paths,
+        })
+    }
+}
+
+/// A recipe that differs from the applied recipe, and what brought it to setup.
+struct ChangedRecipe {
     file: resolve::RecipeFile,
     carrier: RecipeCarrier,
 }
@@ -86,36 +128,38 @@ enum RecipeCarrier {
     StorageArtifact,
 }
 
-fn find_new_pin(bx: &BoxRef, source: resolve::Source) -> Option<NewPin> {
+fn find_changed_recipe(bx: &BoxRef, source: resolve::Source) -> Option<ChangedRecipe> {
     let (file, carrier) = match source {
-        resolve::Source::Pinned => return None,
+        resolve::Source::Applied => return None,
         resolve::Source::File(file) => (file, RecipeCarrier::File),
         resolve::Source::Manifest(file) => (file, RecipeCarrier::Manifest),
         resolve::Source::Artifact(file) => (file, RecipeCarrier::StorageArtifact),
     };
-    let pinned_text =
-        std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap_or_default();
     // An import always asks, so running it without --trust-recipe always shows the recipe.
-    let is_new = matches!(carrier, RecipeCarrier::StorageArtifact) || file.text != pinned_text;
-    is_new.then_some(NewPin { file, carrier })
+    let is_changed =
+        matches!(carrier, RecipeCarrier::StorageArtifact) || !bx.is_recipe_applied(&file.text);
+    is_changed.then_some(ChangedRecipe { file, carrier })
 }
 
-fn ask_about_pinning(
+fn ask_to_apply_recipe(
     bx: &BoxRef,
-    new_pin: Option<&NewPin>,
+    changed_recipe: Option<&ChangedRecipe>,
     recipe: &Recipe,
     has_changed_targets: bool,
+    effect: ApplyEffect,
     approval: &Approval,
     is_at_a_terminal: bool,
 ) -> Result<()> {
-    let authorship = new_pin.and_then(|pin| find_recipe_authorship(bx, pin));
+    let authorship = changed_recipe.and_then(|recipe| find_recipe_authorship(bx, recipe));
     let sensitive_mounts = mount::find_sensitive_mounts(&recipe.mounts);
     let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.mount.readonly);
     let is_suspect = has_changed_targets || authorship.is_some() || has_readwrite_sensitive;
-    let new_file = new_pin.map(|pin| &pin.file);
+    let new_file = changed_recipe.map(|changed| &changed.file);
     let page = ApprovalPage {
-        lead: build_pinning_lead(bx, new_file, recipe)?,
-        warnings: build_pinning_warnings(
+        bx,
+        effect,
+        lead: build_apply_lead(bx, new_file, recipe, effect)?,
+        warnings: build_apply_warnings(
             new_file,
             authorship.as_ref(),
             &sensitive_mounts,
@@ -124,7 +168,7 @@ fn ask_about_pinning(
         recipe,
     };
     put_the_question(
-        decide_pinning(approval, is_suspect, is_at_a_terminal),
+        decide_applying(approval, is_suspect, is_at_a_terminal),
         &page,
     )
 }
@@ -135,19 +179,19 @@ enum RecipeAuthorship {
         recipe_or_manifest: PathBuf,
         share: PathBuf,
     },
-    UnreadablePinnedRecipe,
+    UnreadableAppliedRecipe,
     StorageArtifact,
 }
 
-fn find_recipe_authorship(bx: &BoxRef, pin: &NewPin) -> Option<RecipeAuthorship> {
+fn find_recipe_authorship(bx: &BoxRef, changed: &ChangedRecipe) -> Option<RecipeAuthorship> {
     let manifest = bx.get_project_dir().join(MANIFEST_FILE);
-    let carriers: &[&Path] = match pin.carrier {
-        RecipeCarrier::File => &[&pin.file.from],
-        RecipeCarrier::Manifest => &[&pin.file.from, &manifest],
+    let carriers: &[&Path] = match changed.carrier {
+        RecipeCarrier::File => &[&changed.file.from],
+        RecipeCarrier::Manifest => &[&changed.file.from, &manifest],
         RecipeCarrier::StorageArtifact => return Some(RecipeAuthorship::StorageArtifact),
     };
-    let Ok(previous) = state::list_pinned_recipes_across_boxes(bx.get_project_dir()) else {
-        return Some(RecipeAuthorship::UnreadablePinnedRecipe);
+    let Ok(previous) = state::list_applied_recipes_across_boxes(bx.get_project_dir()) else {
+        return Some(RecipeAuthorship::UnreadableAppliedRecipe);
     };
     for file in carriers {
         for (origin, recipe) in &previous {
@@ -159,7 +203,7 @@ fn find_recipe_authorship(bx: &BoxRef, pin: &NewPin) -> Option<RecipeAuthorship>
                     });
                 }
                 Ok(None) => {}
-                Err(_) => return Some(RecipeAuthorship::UnreadablePinnedRecipe),
+                Err(_) => return Some(RecipeAuthorship::UnreadableAppliedRecipe),
             }
         }
     }
@@ -182,22 +226,30 @@ fn find_writable_mount_containing(
         }))
 }
 
-fn build_pinning_lead(
+fn build_apply_lead(
     bx: &BoxRef,
     file: Option<&resolve::RecipeFile>,
     recipe: &Recipe,
+    effect: ApplyEffect,
 ) -> Result<String> {
-    Ok(match file {
-        Some(file) => format!(
-            "pinning {} to {bx}:\n{}",
+    let review = || render_recipe_for_review(recipe).context("rendering the recipe for review");
+    Ok(match (file, effect) {
+        (Some(file), _) => format!(
+            "applying {} to {bx}:\n{}",
             escape_printable_path(&file.from),
-            render_recipe_for_review(recipe).context("rendering the recipe for review")?
+            review()?
         ),
-        None => format!("updating pinned paths for {bx}"),
+        (None, ApplyEffect::PinPaths) => format!("updating {bx}'s share and env_file paths"),
+        (
+            None,
+            ApplyEffect::Create | ApplyEffect::Rebuild | ApplyEffect::Update | ApplyEffect::Import,
+        ) => {
+            format!("applying {bx}'s recipe again:\n{}", review()?)
+        }
     })
 }
 
-fn build_pinning_warnings(
+fn build_apply_warnings(
     file: Option<&resolve::RecipeFile>,
     authorship: Option<&RecipeAuthorship>,
     sensitive_mounts: &[mount::SensitiveMount<'_>],
@@ -206,7 +258,7 @@ fn build_pinning_warnings(
     let mut warnings = Vec::new();
     if has_changed_targets {
         warnings.push(
-            "WARNING: a share or env_file target changed since it was pinned; review the new host paths before approving.".to_string(),
+            "WARNING: a share or env_file target changed since the last setup; review the new host paths before approving.".to_string(),
         );
     }
     if let (Some(file), Some(authorship)) = (file, authorship) {
@@ -237,9 +289,9 @@ fn build_adoption_reason(from: &Path, authorship: &RecipeAuthorship) -> String {
             recipe_or_manifest,
             share,
         } => (recipe_or_manifest, share),
-        RecipeAuthorship::UnreadablePinnedRecipe => {
+        RecipeAuthorship::UnreadableAppliedRecipe => {
             return format!(
-                "a box's pinned recipe cannot be read to determine whether a guest could have written {}",
+                "a box's applied recipe cannot be read to determine whether a guest could have written {}",
                 escape_printable_path(from)
             );
         }
@@ -267,8 +319,20 @@ fn build_adoption_reason(from: &Path, authorship: &RecipeAuthorship) -> String {
     why
 }
 
-/// What a pinning puts to the person: what it pins, why to doubt it, what it grants.
+/// What a yes does to the box, which the question names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyEffect {
+    Create,
+    Rebuild,
+    Update,
+    PinPaths,
+    Import,
+}
+
+/// What applying puts to the person: what it applies, why to doubt it, what it grants.
 struct ApprovalPage<'a> {
+    bx: &'a BoxRef,
+    effect: ApplyEffect,
     lead: String,
     warnings: Vec<String>,
     recipe: &'a Recipe,
@@ -276,6 +340,8 @@ struct ApprovalPage<'a> {
 
 impl ApprovalPage<'_> {
     fn render(&self) -> String {
+        use std::fmt::Write as _;
+
         let mut page = format!("{}\n", self.lead);
         for warning in &self.warnings {
             page.push_str(warning);
@@ -283,44 +349,67 @@ impl ApprovalPage<'_> {
         }
         page.push_str("It would grant:\n");
         page.push_str(&render_policy_summary(self.recipe));
+        if self.effect == ApplyEffect::Rebuild {
+            let _ = writeln!(
+                page,
+                "Rebuilding replaces {}'s root filesystem and runs on_create again; \
+                 box volumes are kept.",
+                self.bx
+            );
+        }
         page
+    }
+
+    fn question(&self) -> String {
+        let bx = self.bx;
+        match self.effect {
+            ApplyEffect::Create => format!("terra: create {bx} with it? [y/N] "),
+            ApplyEffect::Rebuild => format!("terra: rebuild {bx} with it? [y/N] "),
+            ApplyEffect::Update => format!("terra: apply it to {bx}? [y/N] "),
+            ApplyEffect::PinPaths => "terra: use the new paths? [y/N] ".to_string(),
+            ApplyEffect::Import => format!("terra: import it into {bx}? [y/N] "),
+        }
     }
 }
 
-/// What one pinning does about the recipe it would pin
+/// What applying does about the recipe it would apply
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum PinAction {
+enum ApplyAction {
     WithoutAsking,
-    WarnAndPin,
+    WarnAndApply,
     Ask,
     ReportOnly,
     RefuseUnasked,
 }
 
-/// The one table a pinning's fate is read from: who vouches, whether a guest
+/// The one table applying's fate is read from: who vouches, whether a guest
 /// could have written it, and whether there is anyone to ask.
-fn decide_pinning(approval: &Approval, is_suspect: bool, is_at_a_terminal: bool) -> PinAction {
+fn decide_applying(approval: &Approval, is_suspect: bool, is_at_a_terminal: bool) -> ApplyAction {
     match (approval, is_suspect, is_at_a_terminal) {
-        (Approval::ChosenByHand { .. }, false, _) => PinAction::WithoutAsking,
-        (Approval::ChosenByHand { trust_recipe: true }, true, _) => PinAction::WarnAndPin,
-        (Approval::Reported, false, _) | (Approval::Reported, true, true) => PinAction::ReportOnly,
-        (Approval::ChosenByHand { .. } | Approval::Reported, _, false) => PinAction::RefuseUnasked,
-        (Approval::ChosenByHand { .. }, _, true) => PinAction::Ask,
+        (Approval::ChosenByHand { .. }, false, _) => ApplyAction::WithoutAsking,
+        (Approval::ChosenByHand { trust_recipe: true }, true, _) => ApplyAction::WarnAndApply,
+        (Approval::Reported, false, _) | (Approval::Reported, true, true) => {
+            ApplyAction::ReportOnly
+        }
+        (Approval::ChosenByHand { .. } | Approval::Reported, _, false) => {
+            ApplyAction::RefuseUnasked
+        }
+        (Approval::ChosenByHand { .. }, _, true) => ApplyAction::Ask,
     }
 }
 
-/// Carry out the settled [`PinAction`]: `Ok(())` means pin it.
-fn put_the_question(action: PinAction, page: &ApprovalPage<'_>) -> Result<()> {
+/// Carry out the settled [`ApplyAction`]: `Ok(())` means apply it.
+fn put_the_question(action: ApplyAction, page: &ApprovalPage<'_>) -> Result<()> {
     let warning = page.warnings.join("\n");
     match action {
-        PinAction::WithoutAsking => Ok(()),
-        PinAction::WarnAndPin => {
+        ApplyAction::WithoutAsking => Ok(()),
+        ApplyAction::WarnAndApply => {
             if !warning.is_empty() {
-                eprintln!("terra: {warning} Pinning it anyway (--trust-recipe).");
+                eprintln!("terra: {warning} Applying it anyway (--trust-recipe).");
             }
             Ok(())
         }
-        PinAction::ReportOnly => {
+        ApplyAction::ReportOnly => {
             if !warning.is_empty() {
                 eprintln!(
                     "terra: {warning} A real setup would put it to you, and needs \
@@ -329,19 +418,19 @@ fn put_the_question(action: PinAction, page: &ApprovalPage<'_>) -> Result<()> {
             }
             Ok(())
         }
-        PinAction::RefuseUnasked => anyhow::bail!(
+        ApplyAction::RefuseUnasked => anyhow::bail!(
             "{}\n\
              There is no terminal to ask on. Review the recipe, then run this \
-             again with --trust-recipe to pin it.",
+             again with --trust-recipe to apply it.",
             page.render()
         ),
-        PinAction::Ask => {
+        ApplyAction::Ask => {
             // stderr: a question on stdout would vanish into `terra setup >
             // log` and read as a hang.
             eprintln!("terra: {}", page.render());
             anyhow::ensure!(
-                confirm("terra: pin it? [y/N] ")?,
-                "not pinned - the box is unchanged"
+                confirm(&page.question())?,
+                "not applied - the box is unchanged"
             );
             Ok(())
         }
@@ -379,16 +468,16 @@ fn ensure_boot_plan_fits(bx: &BoxRef, recipe: &Recipe) -> Result<()> {
     Ok(())
 }
 
-/// [`request_recipe_approval`] for a recipe a person named, as tests drive it.
+/// Review and approve a recipe a person named, as tests drive it.
 #[cfg(test)]
 pub(crate) fn approve_by_hand(
     target: ResolvedRecipe,
     trust_recipe: bool,
     is_at_a_terminal: bool,
 ) -> Result<ApprovedRecipe> {
-    request_recipe_approval(
-        target,
+    review_recipe(target)?.approve(
         &Approval::ChosenByHand { trust_recipe },
+        ApplyEffect::Rebuild,
         is_at_a_terminal,
     )
 }
@@ -397,6 +486,36 @@ pub(crate) fn approve_by_hand(
 mod tests {
     use super::*;
     use crate::recipe::{MAX_RECIPE_BYTES, parse_recipe};
+
+    /// Only a rebuild warns that the root filesystem goes, and the question
+    /// names what a yes does.
+    #[test]
+    fn only_a_rebuild_page_says_the_root_is_replaced() {
+        let _home = crate::sys::TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let recipe = Recipe::default();
+        let page = |effect| ApprovalPage {
+            bx: &bx,
+            effect,
+            lead: String::new(),
+            warnings: Vec::new(),
+            recipe: &recipe,
+        };
+        let rebuild = page(ApplyEffect::Rebuild);
+        assert!(rebuild.render().contains("Rebuilding replaces"));
+        assert!(rebuild.question().contains("rebuild"));
+        for effect in [
+            ApplyEffect::Create,
+            ApplyEffect::Update,
+            ApplyEffect::PinPaths,
+            ApplyEffect::Import,
+        ] {
+            let page = page(effect);
+            assert!(!page.render().contains("Rebuilding"), "{effect:?}");
+            assert!(!page.question().contains("rebuild"), "{effect:?}");
+        }
+    }
 
     #[test]
     fn oversized_boot_plans_are_refused_after_dotenv_merge_before_preparation() {
@@ -449,7 +568,7 @@ mod tests {
         let authorship = |from: PathBuf, carrier| {
             find_recipe_authorship(
                 &bx,
-                &NewPin {
+                &ChangedRecipe {
                     file: resolve::RecipeFile {
                         from,
                         text: String::new(),
@@ -470,18 +589,18 @@ mod tests {
         std::fs::write(writer.get_dir().join(state::RECIPE_FILE), [0xff]).unwrap();
         assert!(matches!(
             authorship(target.join("evil.yaml"), RecipeCarrier::File),
-            Some(RecipeAuthorship::UnreadablePinnedRecipe)
+            Some(RecipeAuthorship::UnreadableAppliedRecipe)
         ));
     }
 
-    /// Re-pinning an *already pinned* box still consults every sibling's
+    /// Re-applying an *already applied* box still consults every sibling's
     /// shares: a guest in box `b`, which shares the project read-write, can
-    /// write a new recipe file for box `a` - so pinning it must be treated as
+    /// write a new recipe file for box `a` - so applying it must be treated as
     /// suspect. Off a terminal that refuses, naming `--trust-recipe`; the flag
-    /// pins it with a warning. (The gap this pins: `a`'s own pin has no
+    /// applies it with a warning. (The gap this pins: `a`'s own applied recipe has no
     /// mounts, so checking only it answered "nobody could have written this".)
     #[test]
-    fn a_sibling_share_makes_a_repin_suspect_too() {
+    fn a_sibling_share_makes_a_reapply_suspect_too() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -518,22 +637,25 @@ mod tests {
             recipe.text.push_str("env_file: unreadable.env\n");
         }
         let err = approve_by_hand(refused, false, false)
-            .expect_err("a sibling's writable share should have made this pin suspect")
+            .expect_err("a sibling's writable share should have made this apply suspect")
             .to_string();
         assert!(err.contains("may be the author"), "{err}");
         assert!(err.contains("--trust-recipe"), "{err}");
 
-        // The flag pins it anyway - with the warning, but without a question,
+        // The flag applies it anyway - with the warning, but without a question,
         // so it never reaches the prompt whether there is a terminal or not.
         for is_at_a_terminal in [false, true] {
             let approved = approve_by_hand(target(), true, is_at_a_terminal)
-                .expect("--trust-recipe should pin without asking");
-            assert!(approved.new_pin.is_some(), "the recipe should be adopted");
+                .expect("--trust-recipe should apply without asking");
+            assert!(
+                approved.changed_recipe.is_some(),
+                "the recipe should be adopted"
+            );
         }
     }
 
     #[test]
-    fn readwrite_sensitive_mounts_are_suspect_and_warn_on_pinning() {
+    fn readwrite_sensitive_mounts_are_suspect_and_warn_on_applying() {
         let home = crate::sys::TestHome::new();
         let ssh_dir = home.get_path().join(".ssh");
         std::fs::create_dir_all(&ssh_dir).unwrap();
@@ -570,26 +692,26 @@ mod tests {
         assert!(err.contains("--trust-recipe"), "{err}");
 
         let approved = approve_by_hand(target(), true, false)
-            .expect("--trust-recipe should pin with sensitive mount");
-        assert!(approved.new_pin.is_some());
+            .expect("--trust-recipe should apply with sensitive mount");
+        assert!(approved.changed_recipe.is_some());
     }
 
-    /// The whole of what a pinning does about the person, off the three things
+    /// The whole of what applying does about the person, off the three things
     /// that decide it. One row differs from its neighbours by nothing a call
-    /// site could see - `--trust-recipe` on a recipe nobody suspects pins in
+    /// site could see - `--trust-recipe` on a recipe nobody suspects applies in
     /// silence rather than warning - so the table is pinned here rather than
     /// reconstructed from the routes that reach it.
     #[test]
-    fn what_a_pinning_asks_is_decided_by_who_vouches_for_it() {
+    fn what_applying_asks_is_decided_by_who_vouches_for_it() {
         let by_hand = |trust_recipe| Approval::ChosenByHand { trust_recipe };
 
-        // A person named the recipe and nothing suspects it: pinned in silence,
+        // A person named the recipe and nothing suspects it: applied in silence,
         // terminal or not, `--trust-recipe` or not.
         for trust_recipe in [false, true] {
             for is_at_a_terminal in [false, true] {
                 assert_eq!(
-                    decide_pinning(&by_hand(trust_recipe), false, is_at_a_terminal),
-                    PinAction::WithoutAsking,
+                    decide_applying(&by_hand(trust_recipe), false, is_at_a_terminal),
+                    ApplyAction::WithoutAsking,
                     "trust_recipe={trust_recipe} is_at_a_terminal={is_at_a_terminal}"
                 );
             }
@@ -597,51 +719,54 @@ mod tests {
 
         // A suspect one is put to them, and refused where
         // there is nobody to ask - `--trust-recipe` answers it either way.
-        assert_eq!(decide_pinning(&by_hand(false), true, true), PinAction::Ask);
         assert_eq!(
-            decide_pinning(&by_hand(false), true, false),
-            PinAction::RefuseUnasked
+            decide_applying(&by_hand(false), true, true),
+            ApplyAction::Ask
+        );
+        assert_eq!(
+            decide_applying(&by_hand(false), true, false),
+            ApplyAction::RefuseUnasked
         );
         for is_at_a_terminal in [false, true] {
             assert_eq!(
-                decide_pinning(&by_hand(true), true, is_at_a_terminal),
-                PinAction::WarnAndPin,
+                decide_applying(&by_hand(true), true, is_at_a_terminal),
+                ApplyAction::WarnAndApply,
                 "is_at_a_terminal={is_at_a_terminal}"
             );
         }
 
-        // A dry run pins nothing, so it never asks - but it refuses exactly
+        // A dry run applies nothing, so it never asks - but it refuses exactly
         // where the setup it stands for would, which is the whole of its
         // promise: a suspect recipe with nobody to ask is a `terra setup` that
         // fails, and a dry run reporting that one clean would be a lie.
         for is_at_a_terminal in [false, true] {
             assert_eq!(
-                decide_pinning(&Approval::Reported, false, is_at_a_terminal),
-                PinAction::ReportOnly,
+                decide_applying(&Approval::Reported, false, is_at_a_terminal),
+                ApplyAction::ReportOnly,
                 "is_at_a_terminal={is_at_a_terminal}"
             );
         }
         assert_eq!(
-            decide_pinning(&Approval::Reported, true, true),
-            PinAction::ReportOnly
+            decide_applying(&Approval::Reported, true, true),
+            ApplyAction::ReportOnly
         );
         assert_eq!(
-            decide_pinning(&Approval::Reported, true, false),
-            PinAction::RefuseUnasked
+            decide_applying(&Approval::Reported, true, false),
+            ApplyAction::RefuseUnasked
         );
     }
 
     /// What a typed answer means, on the one question that decides whether
-    /// bytes a sandbox may have written become the box's pinned recipe.
+    /// bytes a sandbox may have written become the box's applied recipe.
     ///
     /// Anything that is not a yes is a no - an answer this cannot read must
-    /// never be the one that pins.
+    /// never be the one that applies.
     #[test]
-    fn only_a_yes_pins_and_a_bare_enter_refuses() {
+    fn only_a_yes_applies_and_a_bare_enter_refuses() {
         for yes in ["y", "Y", "yes", "Yes", "YES", " y \n", "yes\r\n"] {
             assert!(answer_is_yes(yes), "{yes:?} is a yes");
         }
-        // `yep` and `ok` included, because a recipe is pinned on a yes, not on
+        // `yep` and `ok` included, because a recipe is applied on a yes, not on
         // a not-quite-no.
         for no in [
             "", "\n", "  \n", "\r\n", "n", "N", "no", "No", "yep", "ok", "sure", "y es", "1",
@@ -695,7 +820,7 @@ mod tests {
     }
 
     /// The guest can delete a sibling's mount host through a writable share;
-    /// that used to stop the pinned recipe parsing and answered "no share
+    /// that used to stop the applied recipe parsing and answered "no share
     /// could have authored this", flipping the prompt's default to yes.
     /// Whether a host path exists is a boot's question, not this one's.
     #[test]
@@ -728,9 +853,9 @@ mod tests {
     /// The same hole as
     /// [`a_share_that_was_deleted_does_not_silence_the_authorship_check`],
     /// reached through `env_file:` instead of a mount: the guest deletes the
-    /// dotenv a *sibling*'s pinned recipe names, that recipe stops parsing,
+    /// dotenv a *sibling*'s applied recipe names, that recipe stops parsing,
     /// and the sibling's writable share stops counting - so a recipe the
-    /// guest smuggled in pins with no warning. [`parse_recipe`] never
+    /// guest smuggled in applied recipes with no warning. [`parse_recipe`] never
     /// reads env files, which is what keeps this parse working.
     #[test]
     fn a_deleted_env_file_does_not_silence_the_authorship_check() {
@@ -758,67 +883,67 @@ mod tests {
         );
     }
 
-    /// The gate reads pins written by every terra that came before, and
+    /// The gate reads applied recipes written by every terra that came before, and
     /// `validate` tightens between releases: `hw.mem_mib`'s floor and
     /// the "opens nothing" allow rule each refuse recipes that were once
-    /// pinnable. Running a pin through the full validation answered "no share
-    /// could have authored this" for every one of them, which flips the pinning
+    /// accepted. Running an applied recipe through the full validation answered "no share
+    /// could have authored this" for every one of them, which flips the apply
     /// prompt's default to yes on a recipe a guest may have written.
     #[test]
-    fn a_pin_this_terra_would_now_refuse_still_answers_the_gate() {
+    fn an_applied_recipe_this_terra_would_now_refuse_still_answers_the_gate() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let smuggled = project.join("evil.yaml");
         std::fs::write(&smuggled, "hw:\n  cpus: 2\n").unwrap();
 
-        // What an older terra pinned: the project shared read-write, plus
+        // What an older terra applied: the project shared read-write, plus
         // hardware this one refuses.
         let ran = format!(
             "hw:\n  mem_mib: 64\nmounts:\n  - host: {}\n    guest: /work\n",
             project.display()
         );
         assert!(
-            parse_recipe(&ran, dir.path(), Path::new("a pinned recipe")).is_err(),
+            parse_recipe(&ran, dir.path(), Path::new("an applied recipe")).is_err(),
             "this recipe has to be one today's validation refuses, or it proves nothing"
         );
         assert_eq!(
             find_writable_mount_containing(&smuggled, &ran, dir.path()).unwrap(),
             Some(std::fs::canonicalize(&project).unwrap()),
-            "a pin this terra would refuse took its shares out of the gate"
+            "an applied recipe this terra would refuse took its shares out of the gate"
         );
     }
 
-    /// The gate also reads pins a *newer* terra wrote: a recipe field this
+    /// The gate also reads applied recipes a *newer* terra wrote: a recipe field this
     /// binary does not know fails `Recipe`'s `deny_unknown_fields` parse
     /// outright, which used to answer "no share could have authored this" -
-    /// the same silent yes as a refused pin. The mounts are read through a
+    /// the same silent yes as a refused applied recipe. The mounts are read through a
     /// lenient mirror instead, so only the fields the gate needs decide.
     #[test]
-    fn a_pin_with_fields_this_terra_does_not_know_still_answers_the_gate() {
+    fn an_applied_recipe_with_fields_this_terra_does_not_know_still_answers_the_gate() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let smuggled = project.join("evil.yaml");
         std::fs::write(&smuggled, "hw:\n  cpus: 2\n").unwrap();
 
-        // What a newer terra pinned: an unknown top-level section, and an
+        // What a newer terra applied: an unknown top-level section, and an
         // unknown per-mount field.
         let ran = format!(
             "quotas:\n  io_mib: 64\nmounts:\n  - host: {}\n    guest: /work\n    idmap: false\n",
             project.display()
         );
         assert!(
-            parse_recipe(&ran, dir.path(), Path::new("a pinned recipe")).is_err(),
+            parse_recipe(&ran, dir.path(), Path::new("an applied recipe")).is_err(),
             "this recipe has to be one today's Recipe cannot parse, or it proves nothing"
         );
         assert_eq!(
             find_writable_mount_containing(&smuggled, &ran, dir.path()).unwrap(),
             Some(std::fs::canonicalize(&project).unwrap()),
-            "a pin with unknown fields took its shares out of the gate"
+            "an applied recipe with unknown fields took its shares out of the gate"
         );
 
-        // …and a host this terra refuses to expand (`~alice`, pinned before
+        // …and a host this terra refuses to expand (`~alice`, applied before
         // the refusal existed) counts as the boot that ran it placed it -
         // joined onto the project - rather than silently not counting.
         let inside_old = project.join("~alice/data");
@@ -857,7 +982,7 @@ mod tests {
                 project.display()
             );
             assert!(
-                parse_recipe(&ran, dir.path(), Path::new("a pinned recipe")).is_err(),
+                parse_recipe(&ran, dir.path(), Path::new("an applied recipe")).is_err(),
                 "{odd} has to be an entry today's Recipe cannot read, or it proves nothing"
             );
             assert_eq!(

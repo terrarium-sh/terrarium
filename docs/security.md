@@ -43,7 +43,7 @@ mount of the same file does not help if a writable share also reaches it.
 If your workflow needs recipes in a writable share, Terra allows it but warns.
 `--trust-recipe` means you reviewed both files.
 
-The warning only checks shares that are pinned now. Removing a share does not
+The warning only checks the shares in the box's current recipe. Removing a share does not
 make the files the guest left there safe, and Terra will no longer warn about
 them. Treat files from a former share as untrusted.
 

@@ -97,7 +97,9 @@ pub struct Plan {
     pub pre_stop: Vec<String>,
     /// Background shell lines, restarted on failure until the box stops.
     pub daemons: Vec<String>,
-    pub workload: Vec<String>,
+    /// The recipe's `run` shell line; `None` runs an interactive
+    /// [`RECIPE_SHELL`](crate::guest_root::RECIPE_SHELL).
+    pub workload: Option<String>,
     pub sandbox_info: String,
     /// Wait for the foreground host session before starting the workload.
     pub await_initial_session: bool,
@@ -112,7 +114,7 @@ impl crate::Message for Plan {
 impl Plan {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn bare_run(workload: Vec<String>) -> Self {
+    pub fn bare_run(workload: Option<String>) -> Self {
         Self {
             mode: PlanMode::Run,
             hostname: "terrarium".to_owned(),
@@ -204,7 +206,7 @@ mod tests {
                 on_start: vec!["date".into()],
                 pre_stop: vec!["sync".into()],
                 daemons: vec!["while true; do sleep 60; done".into()],
-                workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
+                workload: Some("make".into()),
                 sandbox_info: "# Terrarium sandbox".into(),
                 await_initial_session: true,
                 host_tz,

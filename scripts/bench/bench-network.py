@@ -499,7 +499,7 @@ def measure_box(binary, probe, run, args, fixtures):
         shutil.copy2(probe, mount / "probe")
         recipe = {
             "hw": {"cpus": 2, "mem_mib": 512},
-            "workload": {"entrypoint": "/bin/sh", "args": ["-ec", "while :; do sleep 60; done"]},
+            "workload": {"run": "while :; do sleep 60; done"},
             "mounts": [{"host": str(mount), "guest": "/bench", "readonly": True}],
             "network": {
                 "allow": [f"benchmark.test:{fixtures.tcp_port}", f"benchmark.test:{fixtures.udp_port}"],

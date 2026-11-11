@@ -6,8 +6,7 @@ name before the verb: `terra [BOX] [VERB]`. With one box, the name is optional.
 ```sh
 terra dev setup
 terra dev
-terra dev -- npm test
-terra dev exec -- sh
+terra dev exec -- npm test
 terra dev stop
 ```
 
@@ -30,6 +29,10 @@ volumes survive restarts, so its tools and state stay put.
 2. Share only the directories it should touch, or none, and hand files over
    with `terra <box> sync`.
 3. [Allow](recipe.md#network) only the destinations it needs.
+4. Point the agent at `/terra/README.md`. Every boot rewrites it with what
+   the agent may do there: its user, whether the root filesystem keeps
+   writes, the shared directories, the workload, the box's recipe with
+   environment values hidden, and the egress policy.
 
 `terra <box> logs` shows network denials as `egress: blocked` lines. To keep
 the agent running across host restarts, use the
@@ -108,15 +111,19 @@ powershell -ExecutionPolicy Bypass -File terra\install.ps1
 
 ## Set up and start
 
-`terra <box> setup` reads the recipe, asks for approval when needed, pins it,
+`terra <box> setup` reads the recipe, asks for approval when needed, applies it,
 creates storage, prepares the root image in an isolated VM with the box's
-volumes but no shares, and runs `on_create`. Run it again after changing the recipe.
+volumes but no shares, and runs `on_create`. Run it again after changing the
+recipe: a changed recipe rebuilds the root filesystem and reruns `on_create`,
+keeping volumes. A change only to run-time fields, such as `workload.run` or
+`daemons`, applies without a rebuild; see
+[applying changes](recipe.md#applying-changes).
 `--dry-run` checks the recipe without changing anything. Without a terminal, a
 recipe a guest might have written needs `--trust-recipe` after you review it.
 
 `terra <box>` starts a box that `setup` finished, or attaches if it is already
-running. It never builds or re-pins: after editing a recipe, run `setup` again.
-It runs the recipe's workload, or the command after `--` for that boot only.
+running. It never builds or re-applies: after editing a recipe, run `setup` again.
+It runs the recipe's workload; `terra <box> exec -- CMD` runs anything else.
 
 - `--root` runs that boot's workload and daemons as guest root.
 - `-d` starts the box in the background.
@@ -147,7 +154,7 @@ terra dev logs -f
   only.
 - `logs` shows Terra's host diagnostics, and `--diagnostics` the guest's. Both
   are replayed after a failed boot. Workload output goes to the session.
-- `show` prints the pinned recipe. Environment values stay hidden unless you
+- `show` prints the applied recipe. Environment values stay hidden unless you
   pass `--with-env-values`.
 
 ### Sync files
@@ -205,8 +212,9 @@ terra ls --all --state running --json
 ```
 
 - States are `running`, `setting_up`, `stopped`, `needs_setup`, `not_created`
-  and `gone`. `needs_setup` means the last setup did not finish, or the pinned
-  recipe changed since it did: `terra <box> setup` makes it bootable.
+  and `gone`. `needs_setup` means the last setup did not finish, or the root
+  image was not baked for the applied recipe's setup inputs: `terra <box> setup`
+  makes it bootable.
   Repeat `--state` or join states with commas to match any of them.
 - Filters work with every format, including `--json` and `--tsv`. No match
   prints nothing, or `[]` for JSON.
@@ -226,15 +234,15 @@ Guest package updates never change the kernel.
 
 - `terra <box> stop` shuts the box down in order, running `pre_stop`.
 - `terra <box> rm` removes the box's storage, logs and sockets but keeps its
-  pinned recipe; `--purge` removes that too. `--force` removes a running box
+  applied recipe; `--purge` removes that too. `--force` removes a running box
   after trying a graceful stop.
 - `terra <box> storage show` lists the root filesystem and volumes. `export`
-  writes a set-up box to a file: its pinned recipe, including inline `env:`
+  writes a set-up box to a file: its applied recipe, including inline `env:`
   values, and its images (a `lifetime: boot` volume is left out, since the next
   boot replaces it). `import` loads one into a stopped or new box, on this or
-  another machine. It asks before pinning the carried recipe, as setup does;
+  another machine. It asks before applying the carried recipe, as setup does;
   without a terminal it prints the recipe and refuses, and `--trust-recipe`
-  pins it without asking. Its mounts and `env_file` resolve against the
+  applies it without asking. Its mounts and `env_file` resolve against the
   importing project, so a file the recipe names must exist there first. The box
   boots straight after an import.
   `prune` deletes images the recipe no longer names.

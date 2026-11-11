@@ -368,7 +368,7 @@ mod tests {
         assert!(err.contains("no box 'dve'"), "{err}");
         assert!(err.contains("terra ls"), "the way to look: {err}");
 
-        // A box with state - even one whose setup died before pinning a recipe,
+        // A box with state - even one whose setup died before applying a recipe,
         // which is what lenient resolution is for - is still removed.
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
