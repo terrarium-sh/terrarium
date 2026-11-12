@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "podman", "readonly", "overlay", "bad-bake"
+$boxes = "probe", "isolated", "offline", "podman", "readonly", "overlay", "bad-bake", "rebuild"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -368,26 +368,27 @@ try {
     Invoke-Terra @("probe", "storage", "export", $exported)
     if ((Get-Item -LiteralPath $exported).Length -eq 0) { throw "empty storage export" }
     Invoke-Terra @("probe", "storage", "prune")
-    $restarted = Get-TerraOutput @("probe", "--foreground", "--root", "--", "sh", "-e", "/suite/guest/storage-restart.sh")
-    Assert-Contains $restarted "RESTART_OK"
-    Assert-Contains $restarted "STOP_OK"
+    Invoke-Terra @("probe", "-d")
+    Assert-Contains (Get-TerraOutput @("probe", "exec", "--no-tty", "--root", "--", "sh", "-e", "/suite/guest/storage-restart.sh")) "RESTART_OK"
+    Invoke-Terra @("probe", "stop")
+    Assert-Equal ((Read-Text "work/hooks") -replace "`r", "" -replace "`n", " ") "start stop start stop"
     $refused = Get-TerraOutput @("probe", "storage", "import", $exported) -Fails
     Assert-Contains $refused "gate.test"
     Assert-Contains $refused "--trust-recipe"
     Invoke-Terra @("probe", "storage", "import", "--trust-recipe", $exported)
-    Assert-Contains (Get-TerraOutput @("probe", "--foreground", "--",
+    Invoke-Terra @("probe", "-d")
+    Assert-Contains (Get-TerraOutput @("probe", "exec", "--no-tty", "--",
         "sh", "-ec", 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')) "RESTORED_OK"
+    Invoke-Terra @("probe", "stop")
     $imported = Join-Path $work "imported"
     New-Item -ItemType Directory -Path $imported, (Join-Path $imported "work"), (Join-Path $imported "readonly") | Out-Null
     Copy-Item -Recurse -LiteralPath (Join-Path $project "suite") -Destination (Join-Path $imported "suite")
     Invoke-Terra @("--project", $imported, "probe", "storage", "import", "--trust-recipe", $exported)
     Assert-Contains (Get-TerraOutput @("--project", $imported, "ls", "--state", "stopped", "--quiet")) "probe"
-    Assert-Contains (Get-TerraOutput @("--project", $imported, "probe", "--foreground", "--",
+    Invoke-Terra @("--project", $imported, "probe", "-d")
+    Assert-Contains (Get-TerraOutput @("--project", $imported, "probe", "exec", "--no-tty", "--",
         "sh", "-ec", 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')) "RESTORED_OK"
-    Complete-Step
-
-    Start-Step "a foreground command's exit status is terra's"
-    Invoke-Terra @("probe", "--foreground", "--", "sh", "-c", "exit 7") -ExitCode 7
+    Invoke-Terra @("--project", $imported, "probe", "stop")
     Complete-Step
 
     Start-Step "logs show host and guest diagnostics"
@@ -399,6 +400,29 @@ try {
     Assert-Contains (Get-TerraOutput @("./bad-bake.yaml", "setup") -Fails) "FAILED_BAKE"
     Assert-Contains (Get-TerraOutput @("bad-bake", "logs", "--diagnostics")) "init failed"
     Assert-Listed "bad-bake" "needs_setup"
+    Complete-Step
+
+    Start-Step "setup rebuilds from scratch only when the recipe says something new"
+    function Assert-Untouched($Text) {
+        if ($Text.Contains("from scratch") -or $Text.Contains("BAKED_")) {
+            Write-Note "an unchanged recipe was rebuilt"
+            throw "unexpected output"
+        }
+    }
+    Assert-Contains (Get-TerraOutput @("./rebuild.yaml", "setup")) "BAKED_ONE"
+    Assert-Untouched (Get-TerraOutput @("./rebuild.yaml", "setup"))
+    Write-Text "rebuild.yaml" ("# only a comment`n" + (Read-Text "rebuild.yaml"))
+    Assert-Untouched (Get-TerraOutput @("./rebuild.yaml", "setup"))
+    Write-Text "rebuild.yaml" ((Read-Text "rebuild.yaml") -replace "BAKED_ONE", "BAKED_TWO")
+    $changed = Get-TerraOutput @("./rebuild.yaml", "setup")
+    Assert-Contains $changed "from scratch: the recipe changed"
+    Assert-Contains $changed "BAKED_TWO"
+    Complete-Step
+
+    Start-Step "a new run keeps the root, and a foreground workload's exit status is terra's"
+    Write-Text "rebuild.yaml" ((Read-Text "rebuild.yaml") + "workload: {run: exit 7}`n")
+    Assert-Contains (Get-TerraOutput @("./rebuild.yaml", "setup")) "keeps its root"
+    Invoke-Terra @("rebuild", "--foreground") -ExitCode 7
     Complete-Step
 
     Start-Step "rm discards the box, --purge forgets it"

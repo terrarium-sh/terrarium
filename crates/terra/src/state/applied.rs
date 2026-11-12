@@ -1,4 +1,4 @@
-//! A box's pin: the recipe it was set up from, and the host paths that recipe was approved for.
+//! A box's applied recipe: the recipe it was set up from, and the host paths that recipe was approved for.
 
 use super::{
     BoxRef, ORIGIN_FILE, get_box_home_path, get_project_state_dir, list_boxes_in, read_origin,
@@ -48,15 +48,15 @@ impl BoxRef {
     pub(crate) fn verify_pinned_paths(&self, current: &PinnedPaths) -> Result<()> {
         anyhow::ensure!(
             self.load_pinned_paths()?.as_ref() == Some(current),
-            "a share or env_file moved since it was pinned - run `terra {} setup` again",
+            "a share or env_file moved since the last setup - run `terra {} setup` again",
             self.get_name()
         );
         Ok(())
     }
 }
 
-/// Write the pin files that change into `dir`, and name them.
-pub(crate) fn write_pin(
+/// Write the applied recipe files that change into `dir`, and name them.
+pub(crate) fn write_applied_recipe(
     dir: &Path,
     recipe: Option<&str>,
     pinned_paths: Option<&PinnedPaths>,
@@ -80,8 +80,8 @@ pub(crate) fn write_pin(
     Ok(written)
 }
 
-/// ponytail: only current pins count; tracking past writable shares requires a persistent share history.
-pub(crate) fn list_pinned_recipes_across_boxes(
+/// ponytail: only current applied recipes count; tracking past writable shares requires a persistent share history.
+pub(crate) fn list_applied_recipes_across_boxes(
     project_dir: &Path,
 ) -> Result<Vec<(PathBuf, String)>> {
     let current_state = get_project_state_dir(project_dir)?;
@@ -120,12 +120,12 @@ mod tests {
     /// Every box of the directory answers, not just the one being set up - a
     /// sibling's writable share could have authored a new box's recipe.
     #[test]
-    fn list_pinned_recipes_across_boxes_in_the_directory() {
+    fn list_applied_recipes_across_boxes_in_the_directory() {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
         assert_eq!(
-            list_pinned_recipes_across_boxes(project).unwrap(),
+            list_applied_recipes_across_boxes(project).unwrap(),
             Vec::<(PathBuf, String)>::new()
         );
 
@@ -134,10 +134,10 @@ mod tests {
             std::fs::create_dir_all(b.get_dir()).unwrap();
             std::fs::write(b.get_dir().join(crate::state::RECIPE_FILE), text).unwrap();
         }
-        // A box directory without a pinned recipe (never set up) is skipped.
+        // A box directory without an applied recipe (never set up) is skipped.
         std::fs::create_dir_all(BoxRef::resolve(project, "c").unwrap().get_dir()).unwrap();
 
-        let recipes = list_pinned_recipes_across_boxes(project).unwrap();
+        let recipes = list_applied_recipes_across_boxes(project).unwrap();
         assert_eq!(recipes.len(), 2, "{recipes:?}");
         assert!(recipes.iter().any(|(_, recipe)| recipe.contains("cpus: 1")));
         assert!(recipes.iter().any(|(_, recipe)| recipe.contains("cpus: 2")));

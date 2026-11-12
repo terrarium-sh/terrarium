@@ -1,9 +1,8 @@
-//! `terra setup`: pin an approved recipe, then prepare the guest filesystem.
+//! `terra setup`: apply an approved recipe, then prepare the guest filesystem.
 
-use crate::approval::{Approval, ApprovedRecipe, request_recipe_approval};
+use crate::approval::{ApplyEffect, Approval, ApprovedRecipe, review_recipe};
 use crate::recipe::resolve;
-use crate::recipe::{Recipe, VolumeLifetime, load_path};
-use crate::render::escape_printable_path;
+use crate::recipe::{Recipe, VolumeLifetime};
 use crate::state::{BoxRef, BoxSetupState};
 use crate::vm::boot;
 use crate::{cli, state};
@@ -12,7 +11,7 @@ use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 
-/// `terra [BOX] setup` - pin a recipe, build the filesystem, run `on_create`.
+/// `terra [BOX] setup` - apply a recipe, build the filesystem, run `on_create`.
 pub async fn run(
     args: &cli::SetupArgs,
     name: Option<&str>,
@@ -20,8 +19,16 @@ pub async fn run(
     cwd: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve_recipe(name, project_dir, resolve::Purpose::Pin { cwd })?;
+    let target = resolve::resolve_recipe(name, project_dir, resolve::Purpose::Apply { cwd })?;
     let held = target.bx.lock_if_present()?;
+    let rebuild = if args.rebuild {
+        Rebuild::Yes
+    } else {
+        Rebuild::No
+    };
+    let review = review_recipe(target)?;
+    let plan = plan_root(review.get_box(), rebuild, review.get_changed_text())?;
+    let effect = plan.get_effect(review.get_changed_text().is_some());
     let approval = if args.dry_run {
         Approval::Reported
     } else {
@@ -29,29 +36,19 @@ pub async fn run(
             trust_recipe: args.trust_recipe,
         }
     };
-    let approved = request_recipe_approval(target, &approval, is_at_a_terminal)?;
+    let approved = review.approve(&approval, effect, is_at_a_terminal)?;
     if args.dry_run {
         // The refusals have run; the rest is the disk work a dry run exists
         // not to do.
         eprintln!(
-            "terra: --dry-run: {} - `terra setup` would take this recipe, \
-             and nothing was pinned or built",
-            approved.bx
+            "terra: --dry-run: {}; nothing was changed",
+            describe_dry_run(&approved, plan)
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let rebuild = if args.rebuild {
-        Rebuild::Yes
-    } else {
-        Rebuild::No
-    };
-    let PreparedBox { lock, root } = prepare_box(&approved, rebuild, held)?;
-    let ApprovedRecipe { bx, mut recipe, .. } = approved;
-    if !bx.is_set_up() {
-        match root {
-            RootPlan::Bake => {}
-            RootPlan::Keep => recipe.hooks.on_create.clear(),
-        }
+    let PreparedBox { lock, plan } = prepare_box(&approved, plan, rebuild, held)?;
+    let ApprovedRecipe { bx, recipe, .. } = approved;
+    if plan != RootPlan::Keep {
         boot::run_setup_vm(&recipe, &bx, &lock).await?;
     }
     eprintln!("terra: {bx} is ready - `terra {}` boots it", bx.get_name());
@@ -64,65 +61,162 @@ enum Rebuild {
     No,
 }
 
-/// What setup does with a box's root image.
+/// What setup does to the box's root image. The root always matches what the
+/// applied recipe gave the setup boot that baked it, so changing that rebuilds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootPlan {
-    /// Lay down a new root and bake `on_create` into it.
-    Bake,
-    /// Keep the baked root, and the result of the `on_create` it ran.
     Keep,
+    Create,
+    Rebuild(RebuildReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildReason {
+    RecipeChanged,
+    /// The applied recipe is unchanged, but its root was baked for other setup inputs, as by an older terra.
+    NotBakedForAppliedRecipe,
+    Unfinished,
+    Asked,
+}
+
+impl RootPlan {
+    fn get_effect(self, has_changed_recipe: bool) -> ApplyEffect {
+        match self {
+            RootPlan::Keep if has_changed_recipe => ApplyEffect::Update,
+            RootPlan::Keep => ApplyEffect::PinPaths,
+            RootPlan::Create => ApplyEffect::Create,
+            RootPlan::Rebuild(_) => ApplyEffect::Rebuild,
+        }
+    }
+}
+
+impl RebuildReason {
+    fn describe(self) -> &'static str {
+        match self {
+            RebuildReason::RecipeChanged => "the recipe changed",
+            RebuildReason::NotBakedForAppliedRecipe => {
+                "its root was not baked for the applied recipe"
+            }
+            RebuildReason::Unfinished => "its last setup did not finish",
+            RebuildReason::Asked => "asked for with --rebuild",
+        }
+    }
+}
+
+/// Plan for `changed_text`, the recipe about to be applied, or for the applied
+/// recipe when it is `None`.
+fn plan_root(bx: &BoxRef, rebuild: Rebuild, changed_text: Option<&str>) -> Result<RootPlan> {
+    let setup_state = bx.get_setup_state()?;
+    Ok(match (rebuild, setup_state) {
+        (Rebuild::Yes | Rebuild::No, BoxSetupState::Missing) => RootPlan::Create,
+        (Rebuild::Yes, BoxSetupState::Unbaked | BoxSetupState::Stale | BoxSetupState::SetUp) => {
+            RootPlan::Rebuild(RebuildReason::Asked)
+        }
+        (Rebuild::No, BoxSetupState::Unbaked) => RootPlan::Rebuild(RebuildReason::Unfinished),
+        (Rebuild::No, BoxSetupState::Stale | BoxSetupState::SetUp) => {
+            let (is_baked_for_it, reason) = match changed_text {
+                Some(text) => (bx.is_root_baked_for(text)?, RebuildReason::RecipeChanged),
+                None => (
+                    setup_state == BoxSetupState::SetUp,
+                    RebuildReason::NotBakedForAppliedRecipe,
+                ),
+            };
+            if is_baked_for_it {
+                RootPlan::Keep
+            } else {
+                RootPlan::Rebuild(reason)
+            }
+        }
+    })
+}
+
+fn describe_dry_run(approved: &ApprovedRecipe, plan: RootPlan) -> String {
+    let bx = &approved.bx;
+    match plan {
+        RootPlan::Keep if approved.changed_recipe.is_some() => {
+            let paths = if approved.pinned_paths.is_some() {
+                ", update its share and env_file paths,"
+            } else {
+                ""
+            };
+            format!("setup would apply the new recipe to {bx}{paths} and keep its root")
+        }
+        RootPlan::Keep if approved.pinned_paths.is_some() => {
+            format!("setup would update {bx}'s share and env_file paths")
+        }
+        RootPlan::Keep => format!("{bx} is already set up for this recipe"),
+        RootPlan::Create if approved.recipe.hooks.on_create.is_empty() => {
+            format!("setup would create {bx}")
+        }
+        RootPlan::Create => format!("setup would create {bx} and run on_create"),
+        RootPlan::Rebuild(reason) => {
+            format!(
+                "setup would rebuild {bx} from scratch: {}",
+                reason.describe()
+            )
+        }
+    }
 }
 
 struct PreparedBox {
     lock: File,
-    root: RootPlan,
+    plan: RootPlan,
 }
 
-/// Prepare the box under `held`, the lock taken before approval, or a new one
-/// for a box that had no state to lock then.
+/// Carry out the approved plan under `held`, the lock taken before approval, or
+/// a new one for a box that had no state to lock then.
 fn prepare_box(
     approved: &ApprovedRecipe,
+    approved_plan: RootPlan,
     rebuild: Rebuild,
     held: Option<File>,
 ) -> Result<PreparedBox> {
-    let ApprovedRecipe {
-        bx,
-        recipe,
-        new_pin,
-        ..
-    } = approved;
+    let ApprovedRecipe { bx, recipe, .. } = approved;
     let lock = match held {
         Some(lock) => lock,
         None => bx.lock_and_repair()?,
     };
+    let plan = replan_under_lock(approved, approved_plan, rebuild)?;
     bx.prepare_state_dir()?;
-    let root = plan_root(bx, rebuild)?;
-    match root {
-        RootPlan::Bake => discard_root(bx)?,
-        RootPlan::Keep => {
-            if let Some(new_file) = new_pin {
-                report_kept_root(bx, recipe, new_file);
-            }
+    match plan {
+        RootPlan::Keep if approved.changed_recipe.is_some() => {
+            eprintln!("terra: {bx} keeps its root: the change only affects its boots");
+        }
+        RootPlan::Keep => {}
+        RootPlan::Create => discard_root(bx)?,
+        RootPlan::Rebuild(reason) => {
+            eprintln!(
+                "terra: rebuilding {bx} from scratch: {} - on_create runs again; box volumes are kept",
+                reason.describe()
+            );
+            discard_root(bx)?;
         }
     }
-    approved.write_pin(bx.get_dir())?;
+    approved.write_applied_recipe(bx.get_dir())?;
     install_or_grow_images(bx, recipe, rebuild)?;
-    Ok(PreparedBox { lock, root })
+    Ok(PreparedBox { lock, plan })
 }
 
-fn plan_root(bx: &BoxRef, rebuild: Rebuild) -> Result<RootPlan> {
-    Ok(match (rebuild, bx.get_setup_state()?) {
-        (Rebuild::No, BoxSetupState::Stale | BoxSetupState::SetUp) => RootPlan::Keep,
-        (Rebuild::Yes | Rebuild::No, BoxSetupState::Missing) => RootPlan::Bake,
-        (Rebuild::Yes, BoxSetupState::Unbaked | BoxSetupState::Stale | BoxSetupState::SetUp) => {
-            eprintln!("terra: --rebuild: rebuilding {bx} from scratch");
-            RootPlan::Bake
-        }
-        (Rebuild::No, BoxSetupState::Unbaked) => {
-            eprintln!("terra: {bx}'s last setup did not finish on_create; creating it again");
-            RootPlan::Bake
-        }
-    })
+/// Plan again now that the box is locked: a box that had no state to lock
+/// while the question was open may have been set up since, and the plan
+/// approved for it must not discard that root unasked.
+fn replan_under_lock(
+    approved: &ApprovedRecipe,
+    approved_plan: RootPlan,
+    rebuild: Rebuild,
+) -> Result<RootPlan> {
+    let bx = &approved.bx;
+    let changed_text = approved
+        .changed_recipe
+        .as_ref()
+        .map(|file| file.text.as_str());
+    let plan = plan_root(bx, rebuild, changed_text)?;
+    anyhow::ensure!(
+        plan == RootPlan::Keep || plan == approved_plan,
+        "{bx} changed while setup was waiting for an answer - run `terra {} setup` again",
+        bx.get_name()
+    );
+    Ok(plan)
 }
 
 /// Remove the root image, stamp first: an old stamp beside a new root would
@@ -134,29 +228,6 @@ fn discard_root(bx: &BoxRef) -> Result<()> {
         std::fs::remove_file(&img).with_context(|| format!("removing {}", img.display()))?;
     }
     Ok(())
-}
-
-/// Say what a new pin leaves as it was on a kept root; reads the pin it replaces.
-fn report_kept_root(bx: &BoxRef, recipe: &Recipe, new_pin: &resolve::RecipeFile) {
-    let pinned = bx.get_dir().join(state::RECIPE_FILE);
-    if !pinned.exists() {
-        return;
-    }
-    eprintln!(
-        "terra: recipe updated from {} (the box keeps its filesystem; \
-         `terra {} setup --rebuild` rebuilds it)",
-        escape_printable_path(&new_pin.from),
-        bx.get_name()
-    );
-    if load_path(&pinned, bx.get_project_dir())
-        .is_ok_and(|pinned| pinned.hooks.on_create != recipe.hooks.on_create)
-    {
-        eprintln!(
-            "terra: on_create changed, but {bx} keeps the result of the old one \
-             (`terra {} setup --rebuild` runs the new one)",
-            bx.get_name()
-        );
-    }
 }
 
 fn install_or_grow_images(bx: &BoxRef, recipe: &Recipe, rebuild: Rebuild) -> Result<()> {
@@ -208,11 +279,20 @@ fn sweep_or_keep_unused_volumes(
 mod tests {
     use super::*;
     use crate::approval::approve_by_hand;
+
+    /// Plan and carry out a setup's disk work, as `run` does.
+    fn prepare(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<File> {
+        let changed_text = approved
+            .changed_recipe
+            .as_ref()
+            .map(|file| file.text.as_str());
+        let plan = plan_root(&approved.bx, rebuild, changed_text)?;
+        Ok(prepare_box(approved, plan, rebuild, None)?.lock)
+    }
     use crate::recipe::resolve::ResolvedRecipe;
-    use sha2::{Digest as _, Sha256};
 
     #[test]
-    fn a_changed_pinned_target_needs_explicit_trust_before_any_source_can_boot_it() {
+    fn a_changed_target_needs_explicit_trust_before_any_source_can_boot_it() {
         for changed_env_file in [false, true] {
             let _home = crate::sys::TestHome::new();
             let dir = tempfile::tempdir().unwrap();
@@ -240,7 +320,7 @@ mod tests {
             };
             let approved =
                 approve_by_hand(target(resolve::Source::File(recipe())), false, true).unwrap();
-            prepare_box(&approved, Rebuild::No, None).unwrap();
+            prepare(&approved, Rebuild::No).unwrap();
 
             let path = if changed_env_file { "env" } else { "share" };
             if changed_env_file {
@@ -259,16 +339,16 @@ mod tests {
                 crate::sys::symlink_dir(replacement, project.join(path)).unwrap();
             }
 
-            for source in [resolve::Source::Pinned, resolve::Source::File(recipe())] {
+            for source in [resolve::Source::Applied, resolve::Source::File(recipe())] {
                 let error = target(source)
-                    .load_pinned_recipe()
+                    .load_applied_recipe()
                     .expect_err("a changed target must not boot")
                     .to_string();
-                assert!(error.contains("moved since it was pinned"), "{error}");
+                assert!(error.contains("moved since the last setup"), "{error}");
             }
 
             for source in [
-                resolve::Source::Pinned,
+                resolve::Source::Applied,
                 resolve::Source::File(recipe()),
                 resolve::Source::Manifest(recipe()),
                 resolve::Source::File(resolve::RecipeFile {
@@ -280,23 +360,23 @@ mod tests {
                     .expect_err("changed targets require explicit trust")
                     .to_string();
                 assert!(
-                    error.contains("target changed since it was pinned"),
+                    error.contains("target changed since the last setup"),
                     "{error}"
                 );
                 assert!(error.contains("--trust-recipe"), "{error}");
             }
 
-            let refreshed = approve_by_hand(target(resolve::Source::Pinned), true, true)
-                .expect("explicit trust refreshes pinned targets");
-            prepare_box(&refreshed, Rebuild::No, None).unwrap();
-            target(resolve::Source::Pinned)
-                .load_pinned_recipe()
-                .expect("the refreshed pin boots");
+            let refreshed = approve_by_hand(target(resolve::Source::Applied), true, true)
+                .expect("explicit trust refreshes applied targets");
+            prepare(&refreshed, Rebuild::No).unwrap();
+            target(resolve::Source::Applied)
+                .load_applied_recipe()
+                .expect("the refreshed applied recipe boots");
         }
     }
 
     /// A volume the recipe dropped keeps its image: deleting data is never a
-    /// side effect of a pin or a boot - it used to be, loudly but with nobody
+    /// side effect of an applied recipe or a boot - it used to be, loudly but with nobody
     /// asked. `--rebuild` is the clean slate asked for by name, so only it
     /// sweeps, and a volume the recipe still names survives even that.
     #[test]
@@ -313,7 +393,7 @@ mod tests {
         sweep_or_keep_unused_volumes(&bx, &recipe_volumes, Rebuild::No).unwrap();
         assert!(
             bx.get_volume_image_path("old").exists(),
-            "a plain pin or boot deleted a volume's data"
+            "a plain apply or boot deleted a volume's data"
         );
         assert!(bx.get_volume_image_path("data").exists());
 
@@ -345,10 +425,10 @@ mod tests {
             let approved = ApprovedRecipe {
                 bx: bx.clone(),
                 recipe,
-                new_pin: None,
+                changed_recipe: None,
                 pinned_paths: None,
             };
-            drop(prepare_box(&approved, Rebuild::No, None).unwrap());
+            drop(prepare(&approved, Rebuild::No).unwrap());
         };
         let kept_mib = || {
             std::fs::metadata(bx.get_volume_image_path("kept"))
@@ -367,7 +447,7 @@ mod tests {
         recipe: &str,
         root_and_stamp: Option<(&[u8], Option<&[u8]>)>,
         rebuild: Rebuild,
-    ) -> (BoxRef, PreparedBox, tempfile::TempDir, crate::sys::TestHome) {
+    ) -> (BoxRef, tempfile::TempDir, crate::sys::TestHome) {
         let dir = tempfile::tempdir().unwrap();
         let home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
@@ -382,58 +462,55 @@ mod tests {
         let approved = ApprovedRecipe {
             bx: bx.clone(),
             recipe: yaml_serde::from_str::<crate::recipe::Recipe>(recipe).unwrap(),
-            new_pin: None,
+            changed_recipe: None,
             pinned_paths: None,
         };
-        let prepared = prepare_box(&approved, rebuild, None).unwrap();
-        (bx, prepared, dir, home)
+        drop(prepare(&approved, rebuild).unwrap());
+        (bx, dir, home)
     }
 
-    /// A root with no stamp, or an empty one, never finished a bake: setup
-    /// replaces it rather than reusing it. `--rebuild` replaces even a baked
-    /// root, and takes its stamp with it.
+    /// A root with no stamp, or an empty one, never finished a bake, and a
+    /// root stamped for another applied recipe was baked for another recipe: setup
+    /// replaces both rather than reusing them. `--rebuild` replaces even a
+    /// root baked for this applied recipe, and takes its stamp with it.
     #[test]
-    fn setup_replaces_a_root_that_never_finished_a_bake() {
-        let digest = [7u8; 32];
+    fn setup_replaces_a_root_not_baked_for_the_applied_recipe() {
+        let current_digest = state::digest_setup_boot_inputs("{}");
+        let other_digest = [7u8; 32];
         for (root_and_stamp, rebuild) in [
             (None, Rebuild::No),
             (Some((&b"old"[..], None)), Rebuild::No),
             (Some((&b"old"[..], Some(&b""[..]))), Rebuild::No),
-            (Some((&b"old"[..], Some(&digest[..]))), Rebuild::Yes),
+            (Some((&b"old"[..], Some(&other_digest[..]))), Rebuild::No),
+            (Some((&b"old"[..], Some(&current_digest[..]))), Rebuild::Yes),
         ] {
-            let (bx, prepared, _dir, _home) = prepare_with_root("{}", root_and_stamp, rebuild);
-            assert_eq!(prepared.root, RootPlan::Bake);
+            let (bx, _dir, _home) = prepare_with_root("{}", root_and_stamp, rebuild);
             let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
             assert!(!root.starts_with(b"old"), "the old root was reused");
             assert!(!bx.get_dir().join(state::SETUP_STAMP).exists());
         }
     }
 
-    /// A baked root is kept whatever pin its stamp names, and keeps its stamp
-    /// until the setup VM succeeds.
+    /// Setup on an unchanged applied recipe keeps the root baked for it, and its stamp.
     #[test]
-    fn setup_keeps_a_baked_root_and_its_stamp() {
-        let current_digest = Sha256::digest(b"{}");
-        for stamp in [&current_digest[..], &[9u8; 32][..]] {
-            let (bx, prepared, _dir, _home) =
-                prepare_with_root("{}", Some((b"baked", Some(stamp))), Rebuild::No);
-            assert_eq!(prepared.root, RootPlan::Keep);
-            let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
-            assert!(root.starts_with(b"baked"));
-            assert_eq!(
-                std::fs::read(bx.get_dir().join(state::SETUP_STAMP)).unwrap(),
-                stamp
-            );
-        }
+    fn setup_keeps_a_root_baked_for_the_applied_recipe() {
+        let stamp = state::digest_setup_boot_inputs("{}");
+        let (bx, _dir, _home) =
+            prepare_with_root("{}", Some((b"baked", Some(&stamp))), Rebuild::No);
+        let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
+        assert!(root.starts_with(b"baked"));
+        assert_eq!(
+            std::fs::read(bx.get_dir().join(state::SETUP_STAMP)).unwrap(),
+            stamp.as_slice()
+        );
     }
 
-    /// The stamp names the pin the root is set up for. Pinning a new recipe
-    /// keeps the old digest, which no longer matches, so a re-setup that fails
-    /// or dies before its VM finishes leaves the box unbootable rather than
-    /// booting the new recipe against a root prepared for the old one.
-    /// Re-pinning nothing keeps it set up.
+    /// Applying a new recipe rebuilds the root and drops its stamp, so a
+    /// re-setup that fails or dies before its VM finishes leaves the box
+    /// unbootable rather than booting the new recipe against a root baked for
+    /// the old one. Re-applying nothing keeps it set up.
     #[test]
-    fn a_new_pin_is_not_bootable_until_its_setup_vm_succeeds() {
+    fn a_changed_recipe_rebuilds_the_root_and_is_not_bootable_until_its_setup_vm_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
@@ -442,7 +519,7 @@ mod tests {
             .unwrap();
         std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "{}").unwrap();
         let stamp = bx.get_dir().join(state::SETUP_STAMP);
-        for (new_pin, is_set_up) in [
+        for (changed_recipe, is_set_up) in [
             (None, true),
             (
                 Some(resolve::RecipeFile {
@@ -456,20 +533,20 @@ mod tests {
             let approved = ApprovedRecipe {
                 bx: bx.clone(),
                 recipe: yaml_serde::from_str::<crate::recipe::Recipe>("{}").unwrap(),
-                new_pin,
+                changed_recipe,
                 pinned_paths: None,
             };
-            drop(prepare_box(&approved, Rebuild::No, None).unwrap());
-            assert!(stamp.exists());
+            drop(prepare(&approved, Rebuild::No).unwrap());
+            assert_eq!(stamp.exists(), is_set_up);
             assert_eq!(bx.is_set_up(), is_set_up);
         }
     }
 
-    /// In-place edits need setup even when no image is installed or grown.
-    /// Boot refuses the old stamp, and setup keeps the root and the stamp until
-    /// its VM succeeds.
+    /// An in-place edit of the applied recipe needs setup even when no image is
+    /// installed or grown: boot refuses the old stamp, and setup rebuilds the
+    /// root for the edited recipe.
     #[test]
-    fn an_in_place_recipe_edit_invalidates_setup_without_rebuilding() {
+    fn an_in_place_recipe_edit_invalidates_setup_and_rebuilds_the_root() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
@@ -481,7 +558,6 @@ mod tests {
             "mounts: [{host: ., guest: /new-share}]\n",
             "volumes: [{name: scratch, guest: /new-volume, size_mib: 8, lifetime: boot}]\n",
             "workload: {workdir: /new-work}\n",
-            "hw: {rootfs_readonly: true}\n",
         ] {
             std::fs::write(&recipe_path, "{}").unwrap();
             bx.write_setup_stamp().unwrap();
@@ -493,17 +569,162 @@ mod tests {
             let approved = ApprovedRecipe {
                 bx: bx.clone(),
                 recipe: yaml_serde::from_str::<crate::recipe::Recipe>(recipe).unwrap(),
-                new_pin: None,
+                changed_recipe: None,
                 pinned_paths: None,
             };
-            drop(prepare_box(&approved, Rebuild::No, None).unwrap());
-            assert!(bx.get_dir().join(state::SETUP_STAMP).exists(), "{recipe}");
+            drop(prepare(&approved, Rebuild::No).unwrap());
+            assert!(!bx.get_dir().join(state::SETUP_STAMP).exists(), "{recipe}");
             assert!(!bx.is_set_up(), "{recipe}");
             assert_eq!(std::fs::metadata(&rootfs).unwrap().len(), 512 << 20);
             bx.write_setup_stamp().unwrap();
             assert!(bx.is_set_up(), "{recipe}");
             drop(bx.lock_finished().unwrap());
         }
+    }
+
+    /// A setup that waited at its question for a box with no state does not
+    /// discard a root another setup finished meanwhile: the same recipe keeps
+    /// it, and a different one is refused rather than rebuilt unasked.
+    #[test]
+    fn a_setup_replans_under_the_lock_it_took_after_asking() {
+        for (other_recipe, keeps) in [("{}", true), ("hw: {cpus: 5}\n", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let _home = crate::sys::TestHome::new();
+            let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+            let approved = ApprovedRecipe {
+                bx: bx.clone(),
+                recipe: Recipe::default(),
+                changed_recipe: Some(resolve::RecipeFile {
+                    from: dir.path().join("dev.yaml"),
+                    text: "# mine\n{}\n".into(),
+                }),
+                pinned_paths: None,
+            };
+            let plan = plan_root(&bx, Rebuild::No, Some("# mine\n{}\n")).unwrap();
+            assert_eq!(plan, RootPlan::Create);
+
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"theirs").unwrap();
+            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), other_recipe).unwrap();
+            bx.write_setup_stamp().unwrap();
+
+            let prepared = prepare_box(&approved, plan, Rebuild::No, None);
+            let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
+            assert!(root.starts_with(b"theirs"), "{other_recipe}");
+            if keeps {
+                assert_eq!(prepared.unwrap().plan, RootPlan::Keep);
+            } else {
+                let error = prepared.err().expect("a different recipe rebuilt unasked");
+                assert!(error.to_string().contains("changed while setup"), "{error}");
+            }
+        }
+    }
+
+    /// Only what the setup boot sees decides a rebuild. A new `run`, daemon,
+    /// `on_start`/`pre_stop` hook, `sudo`, published port, component memory or
+    /// read-only flag is applied over the baked root, which stays bootable with
+    /// no setup VM; `workdir` is made on the root by the setup boot, and
+    /// `on_create` reads `hw.cpus`, so changing either rebuilds.
+    #[test]
+    fn only_what_the_setup_boot_sees_rebuilds_the_root() {
+        for (text, keeps) in [
+            (
+                "workload: {run: exec bash -l}\ndaemons: [sleep 9]\n\
+                 hooks: {on_start: [true], pre_stop: [true]}\n",
+                true,
+            ),
+            (
+                "hw: {rootfs_readonly: true}\ncomponents: {memory_mib: 96}\nsudo: [apk]\n\
+                 network: {ports: ['8080:80']}\n",
+                true,
+            ),
+            ("workload: {workdir: /srv}\n", false),
+            ("hw: {cpus: 3}\n", false),
+            ("hooks: {on_create: [true]}\n", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let _home = crate::sys::TestHome::new();
+            let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"baked").unwrap();
+            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "{}").unwrap();
+            bx.write_setup_stamp().unwrap();
+            let approved = ApprovedRecipe {
+                bx: bx.clone(),
+                recipe: yaml_serde::from_str(text).unwrap(),
+                changed_recipe: Some(resolve::RecipeFile {
+                    from: dir.path().join("dev.yaml"),
+                    text: text.into(),
+                }),
+                pinned_paths: None,
+            };
+            drop(prepare(&approved, Rebuild::No).unwrap());
+            let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
+            assert_eq!(root.starts_with(b"baked"), keeps, "{text}");
+            assert_eq!(bx.is_set_up(), keeps, "{text}");
+            assert_eq!(
+                std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap(),
+                text,
+                "the new recipe was not applied"
+            );
+        }
+    }
+
+    /// A dry run says what the real setup would do to the box, from the same
+    /// decision the real setup acts on.
+    #[test]
+    fn a_dry_run_says_what_setup_would_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let describe = |has_changed_recipe: bool| {
+            let approved = ApprovedRecipe {
+                bx: bx.clone(),
+                recipe: Recipe::default(),
+                changed_recipe: has_changed_recipe.then(|| resolve::RecipeFile {
+                    from: dir.path().join("dev.yaml"),
+                    text: "hw: {cpus: 1}\n".into(),
+                }),
+                pinned_paths: None,
+            };
+            let changed_text = approved
+                .changed_recipe
+                .as_ref()
+                .map(|file| file.text.as_str());
+            let plan = plan_root(&bx, Rebuild::No, changed_text).unwrap();
+            describe_dry_run(&approved, plan)
+        };
+
+        let created = describe(true);
+        assert!(
+            created.contains("would create") && !created.contains("on_create"),
+            "{created}"
+        );
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"root").unwrap();
+        std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "{}").unwrap();
+        bx.write_setup_stamp().unwrap();
+        assert!(
+            describe(false).contains("already set up"),
+            "{}",
+            describe(false)
+        );
+        assert!(
+            describe(true).contains("the recipe changed"),
+            "{}",
+            describe(true)
+        );
+        let with_on_create = ApprovedRecipe {
+            bx: bx.clone(),
+            recipe: yaml_serde::from_str("hooks: {on_create: [true]}\n").unwrap(),
+            changed_recipe: None,
+            pinned_paths: None,
+        };
+        let created_with_on_create = describe_dry_run(&with_on_create, RootPlan::Create);
+        assert!(
+            created_with_on_create.contains("and run on_create"),
+            "{created_with_on_create}"
+        );
     }
 
     /// A dry run answers about the setup it stands for and leaves no trace of
@@ -535,7 +756,7 @@ mod tests {
         );
         assert!(
             !bx.get_dir().join(state::RECIPE_FILE).exists(),
-            "a dry run pinned the recipe"
+            "a dry run applied the recipe"
         );
 
         // …and one it would refuse fails the dry run with the same complaint.
@@ -559,7 +780,7 @@ mod tests {
         assert!(err.contains("this box's own state"), "{err}");
         assert!(
             !bx.get_dir().join(state::RECIPE_FILE).exists(),
-            "a refused dry run pinned the recipe"
+            "a refused dry run applied the recipe"
         );
     }
 

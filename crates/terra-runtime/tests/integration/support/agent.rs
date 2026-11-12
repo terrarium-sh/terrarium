@@ -205,6 +205,5 @@ impl AgentGuest {
 }
 
 pub fn plan_frame() -> Vec<u8> {
-    terra_protocol::encode_frame(&terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]))
-        .expect("plan encodes")
+    terra_protocol::encode_frame(&terra_protocol::Plan::bare_run(None)).expect("plan encodes")
 }

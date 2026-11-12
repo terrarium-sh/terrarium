@@ -45,7 +45,7 @@ fn a_relative_mount_resolves_against_the_project_directory() {
 
 /// Reading a recipe must not depend on its shares being there: a guest with
 /// a writable share can delete a directory a *sibling* mount names, and the
-/// pinned recipe is what the adoption gate reads to decide whether a guest
+/// applied recipe is what the adoption gate reads to decide whether a guest
 /// could have authored the next one. Existence is a boot's question.
 #[test]
 fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
@@ -237,10 +237,10 @@ fn an_env_file_past_the_size_limit_is_refused() {
 }
 
 /// An `env_file:` that is not there must not stop the recipe *parsing*: a
-/// guest with a writable share can delete the dotenv a box's pinned recipe
-/// names, and the authorship gate re-parses every sibling's pin to find the
+/// guest with a writable share can delete the dotenv a box's applied recipe
+/// names, and the authorship gate re-parses every sibling's applied recipe to find the
 /// shares one of them could have written a new recipe through. A parse that
-/// failed here took those shares out of the question, and the pin went
+/// failed here took those shares out of the question, and the applied recipe went
 /// through unwarned. Reading the file is a later step for exactly this.
 #[test]
 fn a_deleted_env_file_does_not_stop_the_recipe_parsing() {
@@ -482,7 +482,7 @@ fn sudo_entries_are_normalized_to_bare_commands() {
 
 /// A `network:` section the gateway cannot be built from must fail the
 /// recipe too: the gateway is started in the background VM process, so a
-/// rule refused there is refused *after* `terra setup` pinned the recipe
+/// rule refused there is refused *after* `terra setup` applied the recipe
 /// and listed that very rule on the page the approving `y` was given to.
 #[test]
 fn a_network_section_the_gateway_is_refused_by_fails_the_recipe() {
@@ -612,26 +612,43 @@ fn recipes_and_manifests_have_a_bounded_read() {
     assert!(manifest.contains("larger than"), "{manifest}");
 }
 
+/// Every recipe shell line becomes a process argument, which cannot carry a
+/// NUL: setup refuses one and names where it is, rather than the boot failing
+/// to start the line.
+#[test]
+fn a_shell_line_with_a_nul_is_refused() {
+    let cwd = std::env::temp_dir();
+    for (recipe, field) in [
+        ("hooks:\n  on_create: [\"a\\0b\"]\n", "hooks.on_create[0]"),
+        ("hooks:\n  on_start: [ok, \"a\\0b\"]\n", "hooks.on_start[1]"),
+        ("hooks:\n  pre_stop: [\"a\\0b\"]\n", "hooks.pre_stop[0]"),
+        ("daemons: [\"a\\0b\"]\n", "daemons[0]"),
+        ("workload:\n  run: \"a\\0b\"\n", "workload.run"),
+    ] {
+        let err = format!(
+            "{:#}",
+            parse_recipe(recipe, &cwd, Path::new("t.yaml")).unwrap_err()
+        );
+        assert!(
+            err.contains(&format!("{field} cannot contain a NUL")),
+            "{err}"
+        );
+    }
+    let multi_line = "workload:\n  run: |\n    set -e\n    echo ok\n";
+    parse_recipe(multi_line, &cwd, Path::new("t.yaml")).expect("a multi-line run is a script");
+}
+
 /// A guest path: a relative one has no host cwd to mean and would silently
 /// land wherever the workload happened to start.
 #[test]
 fn a_relative_workdir_is_refused() {
     let cwd = std::env::temp_dir();
-    let err = parse_recipe(
-        "workload:\n  entrypoint: /bin/sh\n  workdir: work\n",
-        &cwd,
-        Path::new("t.yaml"),
-    )
-    .unwrap_err()
-    .to_string();
+    let err = parse_recipe("workload:\n  workdir: work\n", &cwd, Path::new("t.yaml"))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("workdir must be absolute"), "{err}");
 
-    let ok = parse_recipe(
-        "workload:\n  entrypoint: /bin/sh\n  workdir: /work\n",
-        &cwd,
-        Path::new("t.yaml"),
-    )
-    .unwrap();
+    let ok = parse_recipe("workload:\n  workdir: /work\n", &cwd, Path::new("t.yaml")).unwrap();
     assert_eq!(ok.workload.workdir.unwrap(), Path::new("/work"));
 }
 

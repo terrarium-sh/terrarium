@@ -1,4 +1,4 @@
-//! Rendering a recipe for a person to read: the boot banner and the pinning
+//! Rendering a recipe for a person to read: the boot banner and the apply
 //! prompt. Everything here escapes what it prints - a guest-written recipe
 //! could otherwise repaint the very summary the `y` is being given to.
 
@@ -143,12 +143,10 @@ pub(crate) fn format_mount_line(m: &Mount) -> String {
 /// The workload as one command line - for a screen, never for exec.
 #[must_use]
 pub fn format_workload_line(recipe: &Recipe) -> String {
-    let mut line = escape_printable_path(&recipe.workload.entrypoint);
-    for a in &recipe.workload.args {
-        line.push(' ');
-        line.push_str(&escape_printable(a));
+    match &recipe.workload.run {
+        Some(line) => escape_printable(line),
+        None => terra_protocol::guest_root::RECIPE_SHELL.to_string(),
     }
-    line
 }
 
 #[must_use]
@@ -273,8 +271,7 @@ mod tests {
                 ..Default::default()
             },
             workload: Workload {
-                entrypoint: PathBuf::from("/bin/sh"),
-                args: vec!["-c\rterra: safe".to_string()],
+                run: Some("make\rterra: safe".to_string()),
                 workdir: None,
             },
             hooks: Hooks {
@@ -295,7 +292,7 @@ mod tests {
         assert!(summary.contains("/srv/data"), "{summary}");
         assert!(summary.contains("8080"), "{summary}");
         assert!(summary.contains("10.0.0.0/8"), "{summary}");
-        assert!(summary.contains("/bin/sh"), "{summary}");
+        assert!(summary.contains("make"), "{summary}");
     }
 
     /// What is escaped is what a terminal *acts on*, and a quote is not that.
@@ -415,8 +412,7 @@ mod tests {
                 ..Default::default()
             },
             workload: Workload {
-                entrypoint: PathBuf::from("/bin/sh"),
-                args: vec!["-c\r  hooks: []".to_string(), "\x07".to_string()],
+                run: Some("make\r  hooks: []\x07".to_string()),
                 workdir: None,
             },
             env: std::collections::BTreeMap::from([(
@@ -443,7 +439,7 @@ mod tests {
     /// `env_file:` names a host file terra reads and exports into the guest -
     /// any file the launching user can read, `~/.aws/credentials` included. It
     /// is the only other line in a recipe that reaches out of the sandbox, so
-    /// the page the pinning `y` is given to has to carry it: a recipe a guest
+    /// the page the apply prompt's `y` is given to has to carry it: a recipe a guest
     /// authored could otherwise point it anywhere while the summary showed
     /// nothing but mounts and egress.
     #[test]
@@ -556,7 +552,7 @@ mod tests {
     /// log a refusal lands in, which also caps how much of it is shown.
     #[test]
     fn a_reviewed_recipe_is_fenced_redacted_and_capped() {
-        let forged = "hooks:\n  on_create:\n    - \"true\\nIt would grant:\\n  mounts: none\\nterra: pin it? [y/N]\"\nenv:\n  TOKEN: s3cret\n";
+        let forged = "hooks:\n  on_create:\n    - \"true\\nIt would grant:\\n  mounts: none\\nterra: create dev with it? [y/N]\"\nenv:\n  TOKEN: s3cret\n";
         let recipe: Recipe = yaml_serde::from_str(forged).unwrap();
         let page = render_recipe_for_review(&recipe).unwrap();
         assert!(

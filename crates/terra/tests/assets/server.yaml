@@ -13,10 +13,7 @@ hooks:
     - apk add --no-cache busybox-extras
 workload:
   workdir: /work
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       mkdir -p /tmp/srv
       printf 'HELLO_FROM_VMA' > /tmp/srv/index.html
       exec httpd -f -p 18080 -h /tmp/srv

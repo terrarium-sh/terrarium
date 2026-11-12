@@ -51,7 +51,7 @@ pub struct RecipeFile {
 /// Where the recipe a target resolves to comes from.
 #[derive(Debug)]
 pub enum Source {
-    Pinned,
+    Applied,
     File(RecipeFile),
     Manifest(RecipeFile),
     /// The recipe a storage artifact carries; `from` is the artifact.
@@ -75,7 +75,7 @@ pub fn resolve_box(arg: Option<&str>, project_dir: &Path, existence: Existence) 
     };
     let bx = BoxRef::resolve(project_dir, &name)?;
     match existence {
-        Existence::MustExist if !is_pinned(&bx) => Err(build_missing_box_error(
+        Existence::MustExist if !is_applied(&bx) => Err(build_missing_box_error(
             project_dir,
             Some(bx.get_name()),
             manifest.as_ref(),
@@ -87,14 +87,14 @@ pub fn resolve_box(arg: Option<&str>, project_dir: &Path, existence: Existence) 
 /// Where a verb takes a box's recipe from.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Purpose<'a> {
-    /// What a boot runs: the pin of a box that must exist, named by name.
+    /// What a boot runs: the applied recipe of a box that must exist, named by name.
     Boot,
-    /// What `show` reads: a typed path, else the pin, else the manifest's entry.
+    /// What `show` reads: a typed path, else the applied recipe, else the manifest's entry.
     Read { cwd: &'a Path },
-    /// What `setup` pins: a typed path, else the manifest's entry, else the pin.
-    /// `setup` is the one verb that re-reads the manifest over an existing pin,
-    /// so a pin never outlives a `terra.yaml` edit.
-    Pin { cwd: &'a Path },
+    /// What `setup` applies: a typed path, else the manifest's entry, else the applied recipe.
+    /// `setup` is the one verb that re-reads the manifest over an existing applied recipe,
+    /// so an applied recipe never outlives a `terra.yaml` edit.
+    Apply { cwd: &'a Path },
 }
 
 /// A box's recipe, and the box it is for.
@@ -106,15 +106,14 @@ pub struct ResolvedRecipe {
 }
 
 impl ResolvedRecipe {
-    /// Find the manifest recipe when its text differs from the pinned recipe.
+    /// Find the manifest recipe when it says something the applied recipe does not.
     pub(crate) fn find_manifest_divergence(&self) -> Option<PathBuf> {
-        if !matches!(self.source, Source::Pinned) {
+        if !matches!(self.source, Source::Applied) {
             return None;
         }
         let reference = self.manifest.as_ref()?.boxes.get(self.bx.get_name())?;
         let chosen = read_recipe(reference, self.bx.get_project_dir()).ok()??;
-        let pinned = read_recipe_text(&self.bx.get_dir().join(state::RECIPE_FILE)).ok()?;
-        (chosen.text != pinned).then_some(chosen.from)
+        (!self.bx.is_recipe_applied(&chosen.text)).then_some(chosen.from)
     }
 }
 
@@ -146,7 +145,7 @@ pub fn resolve_recipe(
 fn read_typed_recipe(path: &str, purpose: Purpose<'_>) -> Result<RecipeFile> {
     let cwd = match purpose {
         Purpose::Boot => return Err(refuse_recipe_path(path)),
-        Purpose::Read { cwd } | Purpose::Pin { cwd } => cwd,
+        Purpose::Read { cwd } | Purpose::Apply { cwd } => cwd,
     };
     read_recipe(path, cwd)?.ok_or_else(|| build_missing_recipe_error(path, path, cwd))
 }
@@ -156,20 +155,20 @@ fn choose_named_source(
     manifest: Option<&Manifest>,
     purpose: Purpose<'_>,
 ) -> Result<Source> {
-    let is_pinned = is_pinned(bx);
+    let is_applied = is_applied(bx);
     let project_dir = bx.get_project_dir();
     match purpose {
-        Purpose::Boot if !is_pinned => Err(build_missing_box_error(
+        Purpose::Boot if !is_applied => Err(build_missing_box_error(
             project_dir,
             Some(bx.get_name()),
             manifest,
         )),
-        Purpose::Boot => Ok(Source::Pinned),
-        Purpose::Read { .. } if is_pinned => Ok(Source::Pinned),
-        Purpose::Read { .. } | Purpose::Pin { .. } => {
+        Purpose::Boot => Ok(Source::Applied),
+        Purpose::Read { .. } if is_applied => Ok(Source::Applied),
+        Purpose::Read { .. } | Purpose::Apply { .. } => {
             let Some(reference) = manifest.and_then(|m| m.boxes.get(bx.get_name())) else {
-                return if is_pinned {
-                    Ok(Source::Pinned)
+                return if is_applied {
+                    Ok(Source::Applied)
                 } else {
                     Err(build_missing_recipe_error(
                         bx.get_name(),
@@ -182,7 +181,7 @@ fn choose_named_source(
                 return Ok(Source::Manifest(recipe));
             }
             let missing = build_missing_recipe_error(bx.get_name(), reference, project_dir);
-            if is_pinned {
+            if is_applied {
                 // The box is set up; only the manifest's reference is wrong, so the
                 // "never been set up" lead would lie.
                 Err(missing)
@@ -195,14 +194,14 @@ fn choose_named_source(
     }
 }
 
-fn is_pinned(bx: &BoxRef) -> bool {
+fn is_applied(bx: &BoxRef) -> bool {
     bx.get_dir().join(state::RECIPE_FILE).exists()
 }
 
 fn refuse_recipe_path(path: &str) -> anyhow::Error {
     anyhow!(
         "'{path}' is a recipe path - this command takes a box name \
-         (`terra {path} setup` is what reads and pins the file)"
+         (`terra {path} setup` is what reads and applies the file)"
     )
 }
 
@@ -320,7 +319,7 @@ pub(crate) fn build_missing_recipe_error(
     let reference = crate::render::escape_printable(reference);
     let arg = crate::render::escape_printable(arg);
     if reference == arg {
-        anyhow!("recipe not found: {tried} (terra {reference} setup reads and pins the file)")
+        anyhow!("recipe not found: {tried} (terra {reference} setup reads and applies the file)")
     } else {
         anyhow!(
             "recipe not found: {tried}\n\
@@ -439,7 +438,7 @@ mod tests {
         }
     }
 
-    /// A manifest entry wins over the pinned recipe for `terra setup`, so one
+    /// A manifest entry wins over the applied recipe for `terra setup`, so one
     /// name is one box in every clone of the project - and a name the manifest
     /// does not declare never reads a file at all.
     #[test]
@@ -510,7 +509,7 @@ mod tests {
     }
 
     /// Which resolutions read a recipe path typed on the command line, and
-    /// which refuse one. `setup` pins one and `show` prints one, so both read
+    /// which refuse one. `setup` applies one and `show` prints one, so both read
     /// the file. The verbs that operate on an existing box - a boot included -
     /// read no recipe at all, and for them the fix is spelled out rather than
     /// the path being quietly taken for a name.
@@ -530,7 +529,7 @@ mod tests {
         )
         .unwrap();
         let Source::File(r) = &t.source else {
-            panic!("a typed path is the recipe, whatever the box has pinned")
+            panic!("a typed path is the recipe, whatever the box has applied")
         };
         assert_eq!(r.from, dir.path().join("ci.yaml"));
         assert_eq!(t.bx.get_name(), "ci", "the box takes the file's stem");
@@ -595,13 +594,13 @@ mod tests {
         );
     }
 
-    /// A reading says when the manifest names a recipe other than the pin.
-    /// `terra show` answers about what a boot runs - the pin - while the very
-    /// next `terra setup` pins what the manifest names, so the review between
+    /// A reading says when the manifest names a recipe other than the applied recipe.
+    /// `terra show` answers about what a boot runs - the applied recipe - while the very
+    /// next `terra setup` applies what the manifest names, so the review between
     /// the two used to show neither the recipe that would win nor that there
     /// was a second one at all.
     #[test]
-    fn a_reading_says_when_the_manifest_would_pin_something_else() {
+    fn a_reading_says_when_the_manifest_would_apply_something_else() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
@@ -613,12 +612,12 @@ mod tests {
         )
         .unwrap();
 
-        // The same recipe by both routes is no divergence: a pin the manifest
+        // The same recipe by both routes is no divergence: an applied recipe the manifest
         // agrees with is what a settled project looks like.
         std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
         let agreed =
             resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
-        assert_matches!(agreed.source, Source::Pinned);
+        assert_matches!(agreed.source, Source::Applied);
         assert_eq!(agreed.find_manifest_divergence(), None);
 
         // …and an edited manifest is named, with the file that would win.
@@ -627,13 +626,13 @@ mod tests {
             resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
         assert_matches!(
             diverged.source,
-            Source::Pinned,
-            "the pin is still what a boot runs"
+            Source::Applied,
+            "the applied recipe is still what a boot runs"
         );
         assert_eq!(
             diverged.find_manifest_divergence(),
             Some(dir.path().join("dev.yaml")),
-            "the recipe `terra setup` would pin instead goes unreported"
+            "the recipe `terra setup` would apply instead goes unreported"
         );
 
         // A typed path is the recipe, so there is nothing for it to diverge from.
@@ -656,8 +655,8 @@ mod tests {
     /// stopped, removed and read.
     ///
     /// `setup` is the exception, and the reason the split is by verb: it is
-    /// what reads the manifest to decide which recipe to pin, and falling back
-    /// to the box's own older pin there would look like a recipe edit that took
+    /// what reads the manifest to decide which recipe to apply, and falling back
+    /// to the box's own older applied recipe there would look like a recipe edit that took
     /// effect.
     #[test]
     fn a_broken_manifest_does_not_take_the_box_away() {
@@ -676,22 +675,23 @@ mod tests {
 
         let started =
             resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
-        assert_matches!(started.source, Source::Pinned);
+        assert_matches!(started.source, Source::Applied);
 
-        // `setup` also tolerates a broken manifest when a pin exists: the
-        // lenient `load_manifest_or_warn` reads it as nothing, so the pin wins
-        // by default. A broken manifest with no pin still surfaces as
+        // `setup` also tolerates a broken manifest when an applied recipe exists: the
+        // lenient `load_manifest_or_warn` reads it as nothing, so the applied recipe wins
+        // by default. A broken manifest with no applied recipe still surfaces as
         // no recipe rather than `failed to parse`.
-        let t = resolve_recipe(Some("dev"), dir.path(), Purpose::Pin { cwd: dir.path() }).unwrap();
-        assert_matches!(t.source, Source::Pinned);
+        let t =
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Apply { cwd: dir.path() }).unwrap();
+        assert_matches!(t.source, Source::Applied);
     }
 
     /// A manifest reference pointing nowhere is the setup verb's to blame, not
-    /// the box's: `setup` re-reads the manifest over an existing pin, so a
+    /// the box's: `setup` re-reads the manifest over an existing applied recipe, so a
     /// dangling entry must fail it - naming `terra.yaml` - and the "never been
-    /// set up" lead, which a pinned box would make a lie, stays off.
+    /// set up" lead, which an applied box would make a lie, stays off.
     #[test]
-    fn setup_blames_the_manifest_for_a_dangling_reference_to_a_pinned_box() {
+    fn setup_blames_the_manifest_for_a_dangling_reference_to_an_applied_box() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
@@ -705,7 +705,7 @@ mod tests {
 
         let err = format!(
             "{:#}",
-            resolve_recipe(Some("dev"), dir.path(), Purpose::Pin { cwd: dir.path() })
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Apply { cwd: dir.path() })
                 .expect_err("a dangling manifest reference must fail setup")
         );
         assert!(err.contains(MANIFEST_FILE), "{err}");

@@ -7,8 +7,6 @@
 
 use std::process::{Command, Output};
 
-use sha2::{Digest as _, Sha256};
-
 /// Run terra from wherever the test process is, for cases that address a box by
 /// `--project` and never touch `~/.terra`.
 fn run_terra_command(args: &[&str]) -> Output {
@@ -39,17 +37,17 @@ fn setup_without_vm(dir: &std::path::Path, home: &std::path::Path, args: &[&str]
         stderr.contains(terra::SETUP_VM_STOPPED_BEFORE_CONSOLE),
         "setup failed other than by its VM not launching: {stderr}"
     );
-    // Only the box this setup prepared lacks the stamp for its pin that its VM writes on success;
+    // Only the box this setup prepared lacks the stamp for its applied recipe that its VM writes on success;
     // writing it lets later steps meet a set-up box.
     let unfinished: Vec<_> = find_boxes(home)
         .into_iter()
         .filter(|state| {
-            let Ok(recipe) = std::fs::read(state.join("recipe.yaml")) else {
+            let Ok(recipe) = std::fs::read_to_string(state.join("recipe.yaml")) else {
                 return false;
             };
             state.join("rootfs.img").exists()
-                && std::fs::read(state.join("setup-finished")).ok().as_deref()
-                    != Some(Sha256::digest(recipe).as_slice())
+                && std::fs::read(state.join("setup-finished")).ok()
+                    != Some(terra::digest_setup_boot_inputs(&recipe))
         })
         .collect();
     assert_eq!(
@@ -57,8 +55,12 @@ fn setup_without_vm(dir: &std::path::Path, home: &std::path::Path, args: &[&str]
         1,
         "expected one box whose setup VM did not run: {unfinished:?}\n{stderr}"
     );
-    let recipe = std::fs::read(unfinished[0].join("recipe.yaml")).unwrap();
-    std::fs::write(unfinished[0].join("setup-finished"), Sha256::digest(recipe)).unwrap();
+    let recipe = std::fs::read_to_string(unfinished[0].join("recipe.yaml")).unwrap();
+    std::fs::write(
+        unfinished[0].join("setup-finished"),
+        terra::digest_setup_boot_inputs(&recipe),
+    )
+    .unwrap();
     Output {
         status: successful_exit_status(),
         ..out
@@ -163,7 +165,7 @@ fn help_lists_the_lifecycle_verbs() {
 }
 
 #[test]
-fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
+fn setup_applies_a_recipe_and_the_box_then_answers_from_it() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 
@@ -186,7 +188,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     );
 
     // A box is self-contained: addressed by a name that resolves to no source,
-    // it re-checks against its own pinned recipe rather than erroring - so an
+    // it re-checks against its own applied recipe rather than erroring - so an
     // edit made to that copy is what answers.
     let marker = "env:\n  KEPT_BY_THE_BOX: \"1\"\n";
     std::fs::write(&recipe, marker).unwrap();
@@ -201,7 +203,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
 
 /// `terra start` boots the recipe the box was set up from; only `terra setup`
 /// reads a source at all. So editing a recipe file changes nothing until a setup
-/// names it again - at which point it says what it replaced.
+/// names it again - at which point it rebuilds the box for it, and says so.
 #[test]
 fn setup_adopts_recipe_edits_and_start_does_not() {
     let dir = tempfile::tempdir().unwrap();
@@ -219,25 +221,25 @@ fn setup_adopts_recipe_edits_and_start_does_not() {
     let state = find_only_box(home.path());
     assert_eq!(state.file_name().unwrap(), "other");
 
-    // The source changes; the pinned copy does not, and `show` (which answers
+    // The source changes; the applied copy does not, and `show` (which answers
     // for `start`) still sees the old value.
     std::fs::write(&other, "hw:\n  cpus: 5\n").unwrap();
     let shown = run_terra_in(dir.path(), home.path(), &["other", "show"]);
     assert!(
         String::from_utf8_lossy(&shown.stdout).contains("cpus: 3"),
-        "start/show should answer from the pinned copy"
+        "start/show should answer from the applied copy"
     );
 
     // `setup` is the adopt step, and says so.
     let adopted = setup_without_vm(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(adopted.status.success());
-    assert!(String::from_utf8_lossy(&adopted.stderr).contains("recipe updated"));
+    assert!(String::from_utf8_lossy(&adopted.stderr).contains("from scratch: the recipe changed"));
     let recipe = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
     assert!(recipe.contains("cpus: 5"));
 
     let again = setup_without_vm(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(again.status.success());
-    assert!(!String::from_utf8_lossy(&again.stderr).contains("recipe updated"));
+    assert!(!String::from_utf8_lossy(&again.stderr).contains("rebuilding"));
 }
 
 /// The point of keeping a box's files in `~/.terra/box`: a box may share the
@@ -245,7 +247,7 @@ fn setup_adopts_recipe_edits_and_start_does_not() {
 /// one there is - used to be refused outright.
 ///
 /// The counterpart: once such a box exists, its recipe file sits in a share its
-/// guest could write, so *pinning* an edit is a question rather than a default.
+/// guest could write, so *applying* an edit is a question rather than a default.
 /// `start` never reads it, so the guest still chooses nothing.
 #[test]
 fn a_box_can_share_the_directory_it_is_a_box_of() {
@@ -276,7 +278,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     // An "edit" lands in the file - exactly what a guest of this box could have
     // done through the share. There is no terminal in a test, so the question
     // that would be asked becomes a refusal, and it shows what it refused to
-    // pin: the name of a recipe file is exactly what nobody can judge it by.
+    // apply: the name of a recipe file is exactly what nobody can judge it by.
     std::fs::write(
         &recipe,
         "mounts:\n  - host: .\n    guest: /work\nhw:\n  cpus: 4\nnetwork:\n  mode: unrestricted-public\n",
@@ -298,9 +300,9 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
         "{stderr}"
     );
 
-    // `--rebuild` rebuilds the filesystem and says nothing about trust: it must
-    // NOT be a way past this. The two were one flag once, which meant accepting
-    // your own edit cost you the box - a price people learn to route around.
+    // `--rebuild` decides the clean slate and the volume sweep, and says nothing
+    // about trust: it must NOT be a way past this. `--trust-recipe` alone decides
+    // whether to ask.
     let forced = run_terra_in(
         dir.path(),
         home.path(),
@@ -312,7 +314,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
         "--rebuild must not double as --trust-recipe"
     );
 
-    // …and --trust-recipe pins it, out loud, without touching the filesystem.
+    // …and --trust-recipe applies it, out loud, without asking.
     let trusted = setup_without_vm(
         dir.path(),
         home.path(),
@@ -332,12 +334,12 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
 /// can write both `terra.yaml` and the recipe it points at, naming a box that
 /// does not exist yet. That box has no previous recipe of its own, so asking
 /// only about *its* history asked nothing at all - and the old `terra run <name>`
-/// pinned a guest-authored policy and booted it.
+/// applied a guest-authored policy and booted it.
 ///
 /// Now the sibling box that granted the share answers for it, and `start` cannot
-/// pin anything at all.
+/// apply anything at all.
 #[test]
-fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
+fn a_recipe_a_sibling_box_could_have_written_is_not_applied_silently() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 
@@ -372,7 +374,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
     )
     .unwrap();
 
-    // `terra test` must not pin it: only setup reads the manifest's recipe.
+    // `terra test` must not apply it: only setup reads the manifest's recipe.
     let started = run_terra_in(dir.path(), home.path(), &["test"]);
     assert_eq!(started.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&started.stderr);
@@ -392,7 +394,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
     assert!(stderr.contains("unrestricted"), "{stderr}");
     assert!(stderr.contains("--trust-recipe"), "{stderr}");
 
-    // Nothing was pinned: the box does not exist.
+    // Nothing was applied: the box does not exist.
     assert!(
         !home
             .path()
@@ -401,7 +403,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
             .unwrap()
             .flatten()
             .any(|p| p.path().join("test").exists()),
-        "a refused recipe was pinned anyway"
+        "a refused recipe was applied anyway"
     );
 }
 
@@ -457,28 +459,36 @@ fn a_directory_can_hold_several_named_boxes() {
     );
 }
 
-/// A boot runs the pinned recipe, never the file the manifest names; when that
+/// A boot runs the applied recipe, never the file the manifest names; when that
 /// file changed since setup, the boot says so instead of silently ignoring it.
 /// The boot runs `true`, so it ends whether or not a VM can launch here.
 #[test]
 fn a_start_notes_a_manifest_recipe_that_changed_since_setup() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
+    std::fs::write(
+        dir.path().join("dev.yaml"),
+        "hw: {cpus: 1}\nworkload: {run: 'true'}\n",
+    )
+    .unwrap();
     std::fs::write(dir.path().join("terra.yaml"), "boxes:\n  dev: ./dev.yaml\n").unwrap();
     let made = setup_without_vm(dir.path(), home.path(), &["dev", "setup"]);
     assert!(made.status.success());
 
-    let boot = ["dev", "--foreground", "--", "true"];
+    let boot = ["dev", "--foreground"];
     let unchanged = run_terra_in(dir.path(), home.path(), &boot);
     let stderr = String::from_utf8_lossy(&unchanged.stderr);
     assert!(!stderr.contains("differs from"), "{stderr}");
 
-    std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 2\n").unwrap();
+    std::fs::write(
+        dir.path().join("dev.yaml"),
+        "hw: {cpus: 3}\nworkload: {run: 'true'}\n",
+    )
+    .unwrap();
     let changed = run_terra_in(dir.path(), home.path(), &boot);
     let stderr = String::from_utf8_lossy(&changed.stderr);
     assert!(
-        stderr.contains("differs from dev's pinned recipe"),
+        stderr.contains("differs from dev's applied recipe"),
         "{stderr}"
     );
     assert!(
@@ -489,8 +499,8 @@ fn a_start_notes_a_manifest_recipe_that_changed_since_setup() {
 
 /// `terra.yaml` maps the project's box names to recipes - references only, so a
 /// guest that can write it (it lives in the tree boxes share) can at worst
-/// repoint a name at another recipe file, and pinning one of those is gated at
-/// `terra setup` - see `a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently`.
+/// repoint a name at another recipe file, and applying one of those is gated at
+/// `terra setup` - see `a_recipe_a_sibling_box_could_have_written_is_not_applied_silently`.
 #[test]
 fn the_manifest_names_the_projects_boxes() {
     let dir = tempfile::tempdir().unwrap();
@@ -520,8 +530,8 @@ fn the_manifest_names_the_projects_boxes() {
     );
     let state = find_only_box(home.path());
     assert_eq!(state.file_name().unwrap(), "dev");
-    let pinned = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
-    assert!(pinned.contains("cpus: 3"), "{pinned}");
+    let applied = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
+    assert!(applied.contains("cpus: 3"), "{applied}");
 
     // A bare word in neither the manifest nor on disk: a recipe is only ever
     // named by path, and the error says so.
@@ -694,7 +704,7 @@ fn a_command_line_terra_refuses_exits_as_a_usage_error() {
 /// A bare start with no terminal and neither `-d` nor `--foreground` is
 /// refused, naming both - it used to silently run the VM in this process,
 /// which turned any redirected script into a hung foreground VM. Refused
-/// before a VM exists, so no KVM is needed to pin it.
+/// before a VM exists, so no KVM is needed to test it.
 #[test]
 fn a_bare_start_without_a_terminal_names_both_ways_to_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -718,7 +728,7 @@ fn a_bare_start_without_a_terminal_names_both_ways_to_run() {
 /// about a box that does not exist and send the user off to boot it.
 ///
 /// `rm` reaches the same answer by its own route: it takes the box as an
-/// address whether or not a recipe was ever pinned (a setup that died mid-way
+/// address whether or not a recipe was ever applied (a setup that died mid-way
 /// leaves state and no recipe), so what it refuses on is having nothing on disk
 /// at all. It used to be the one verb that answered a name nobody has with
 /// success.
@@ -765,7 +775,7 @@ fn a_message_about_a_box_names_the_box() {
 }
 
 /// A bare `terra` with nothing set up never sets one up, terminal or not: only
-/// `terra <box> setup` creates or pins a box, so it says what to run instead.
+/// `terra <box> setup` creates or applies a box, so it says what to run instead.
 #[test]
 fn the_bare_form_without_a_recipe_says_how_to_set_one_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -1028,9 +1038,9 @@ fn ls_state_filters_succeed_with_no_matches() {
     }
 }
 
-/// A recipe *path* names a file to pin, so a missing file is an error - not a
-/// silent re-check of whatever recipe happens to be pinned under the same stem.
-/// A bare *name* still answers from the box's own pinned recipe: the box is
+/// A recipe *path* names a file to apply, so a missing file is an error - not a
+/// silent re-check of whatever recipe happens to be applied under the same stem.
+/// A bare *name* still answers from the box's own applied recipe: the box is
 /// self-contained, and the name stopped resolving to anything else.
 #[test]
 fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
@@ -1102,14 +1112,14 @@ fn show_prints_the_resolved_recipe_without_env_values() {
     );
 }
 
-/// `show` answers for a boot, and a boot reads the *pinned* recipe - so once a
+/// `show` answers for a boot, and a boot reads the *applied* recipe - so once a
 /// box exists, an edit to the file it was set up from is not what `show` prints.
 /// It used to re-resolve the name and print the edited source: a report of a
 /// boot that was not going to happen.
 ///
 /// A path is the exception, and the way a recipe is read before there is a box.
 #[test]
-fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
+fn show_answers_from_the_applied_recipe_not_the_source_it_came_from() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let shared = home.path().join(".terra");

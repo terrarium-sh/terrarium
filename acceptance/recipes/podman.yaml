@@ -7,5 +7,4 @@ mounts:
 hooks:
   on_create: [apk add podman]
 workload:
-  entrypoint: /bin/sh
-  args: ['-ec', 'while true; do sleep 60; done']
+  run: while true; do sleep 60; done

@@ -30,6 +30,7 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
 
 pub(crate) fn validate(recipe: &Recipe) -> Result<()> {
     validate_workdir(recipe)?;
+    validate_shell_lines(recipe)?;
     validate_hw(recipe)?;
     recipe.components.memory_limits()?;
     validate_sudo(recipe)?;
@@ -49,6 +50,32 @@ fn validate_workdir(recipe: &Recipe) -> Result<()> {
             "workload.workdir must be absolute: '{}'",
             crate::render::escape_printable_path(dir)
         );
+    }
+    Ok(())
+}
+
+/// A NUL cannot cross into a process argument, so the agent could not start
+/// the line; refusing it here fails setup instead of the boot.
+fn validate_shell_lines(recipe: &Recipe) -> Result<()> {
+    let hooks = &recipe.hooks;
+    let lists = [
+        ("hooks.on_create", &hooks.on_create),
+        ("hooks.on_start", &hooks.on_start),
+        ("hooks.pre_stop", &hooks.pre_stop),
+        ("daemons", &recipe.daemons),
+    ];
+    for (field, lines) in lists {
+        if let Some(index) = lines.iter().position(|line| line.contains('\0')) {
+            bail!("{field}[{index}] cannot contain a NUL");
+        }
+    }
+    if recipe
+        .workload
+        .run
+        .as_ref()
+        .is_some_and(|line| line.contains('\0'))
+    {
+        bail!("workload.run cannot contain a NUL");
     }
     Ok(())
 }

@@ -7,8 +7,8 @@ use crate::state::{self, BoxRef};
 use anyhow::Result;
 
 impl ResolvedRecipe {
-    /// Load the pinned recipe and verify its approved host paths.
-    pub(crate) fn load_pinned_recipe(self) -> Result<(BoxRef, Recipe)> {
+    /// Load the applied recipe and verify its approved host paths.
+    pub(crate) fn load_applied_recipe(self) -> Result<(BoxRef, Recipe)> {
         let (mut recipe, paths) = self.load_recipe()?;
         self.bx.verify_pinned_paths(&paths)?;
         merge_env_file(&mut recipe)?;
@@ -16,7 +16,7 @@ impl ResolvedRecipe {
     }
 
     /// The recipe with its mounts and `env_file` resolved, and the host paths
-    /// those would pin.
+    /// those would apply.
     pub(crate) fn load_recipe(&self) -> Result<(Recipe, state::PinnedPaths)> {
         self.bx.ensure_sockets_fit()?;
         crate::sys::validate_host_root()?;
@@ -29,7 +29,7 @@ impl ResolvedRecipe {
 
     pub(crate) fn parse_recipe_without_env_file(&self) -> Result<Recipe> {
         match &self.source {
-            Source::Pinned => load_path(
+            Source::Applied => load_path(
                 &self.bx.get_dir().join(state::RECIPE_FILE),
                 self.bx.get_project_dir(),
             ),

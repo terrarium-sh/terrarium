@@ -109,7 +109,7 @@ fn recipe_shell_command(
 ) -> std::io::Result<std::process::Command> {
     use std::os::unix::process::CommandExt as _;
 
-    let mut command = std::process::Command::new("sh");
+    let mut command = std::process::Command::new(terra_protocol::guest_root::RECIPE_SHELL);
     command
         .arg("-c")
         .arg(line)

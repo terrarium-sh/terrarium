@@ -190,31 +190,22 @@ pub struct Hooks {
     pub pre_stop: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Workload {
-    pub entrypoint: PathBuf,
-    pub args: Vec<String>,
+    /// A shell command, like a daemon's. Unset, the workload is an interactive
+    /// `/bin/sh`.
+    pub run: Option<String>,
     /// Where the workload starts, as an absolute guest path. Unset, the
     /// workload starts in the workload user's home (`/home/terri`).
     pub workdir: Option<PathBuf>,
-}
-
-impl Default for Workload {
-    fn default() -> Self {
-        Self {
-            entrypoint: PathBuf::from("/bin/sh"),
-            args: Vec::new(),
-            workdir: None,
-        }
-    }
 }
 
 /// The project manifest: the project's boxes by name (`ci: ./ci.yaml`),
 /// committed with the code. References only - each a recipe path,
 /// never a recipe: the manifest lives in a tree a guest can write, and the
 /// worst a reference can do is point at a recipe the user already has, which
-/// pinning asks about.
+/// applying asks about.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {

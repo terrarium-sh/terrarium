@@ -10,7 +10,7 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-# Setup on every start re-pins an edited recipe; an unchanged one is a no-op.
+# Setup on every start re-applies an edited recipe; an unchanged one is a no-op.
 # --trust-recipe is safe because no box can share ~/.terra, where the recipe lives.
 ExecStartPre=/usr/local/bin/terra %S/terra/.terra/%i.yaml setup --trust-recipe
 ExecStart=/usr/local/bin/terra %i --foreground

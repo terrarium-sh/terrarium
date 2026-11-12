@@ -3,5 +3,4 @@ network: {enabled: false}
 volumes:
   - {name: changes, rootfs_overlay: true, size_mib: 64, lifetime: boot}
 workload:
-  entrypoint: /bin/sh
-  args: ['-ec', 'while true; do sleep 60; done']
+  run: while true; do sleep 60; done

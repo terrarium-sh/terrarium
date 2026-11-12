@@ -43,10 +43,9 @@ impl Cli {
             root,
             detach,
             foreground,
-            command,
             agent,
         } = &self.boot;
-        *root || *detach || *foreground || agent.agent_timeout.is_some() || !command.is_empty()
+        *root || *detach || *foreground || agent.agent_timeout.is_some()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -144,8 +143,13 @@ pub fn parse_or_exit() -> Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Set up a box for this directory: read a recipe, pin it, build the guest
+    /// Set up a box for this directory: read a recipe, apply it, build the guest
     /// filesystem, and run `on_create`. Safe to run again.
+    ///
+    /// A changed recipe rebuilds the root filesystem and reruns `on_create`,
+    /// keeping volumes. A change only to run-time fields, such as
+    /// `workload.run` or `daemons`, applies without a rebuild; comments,
+    /// formatting and a field written with its default value are not changes.
     ///
     /// The box before it may be a recipe *path* as well as a name, the box then
     /// taking the file's stem: `terra ./pi-dev.yaml setup`.
@@ -183,13 +187,13 @@ pub enum Cmd {
     /// The client's connection is closed and its terminal restored, as if the
     /// detach key had been pressed.
     Detach(DetachArgs),
-    /// Print the fully-resolved recipe a boot would use: the box's pinned
+    /// Print the fully-resolved recipe a boot would use: the box's applied
     /// recipe, or - for a box not set up yet, or a recipe named by path - the
-    /// recipe that would be pinned.
+    /// recipe that would be applied.
     ///
     /// For review only - `env:` values are printed as a placeholder unless
     /// `--with-env-values`, and paths as the absolute ones they resolved to on
-    /// this machine, so it is not a recipe you can pin back.
+    /// this machine, so it is not a recipe you can apply back.
     Show(ShowArgs),
     /// List this directory's boxes and what state each is in - or, with
     /// `--all`, every box on this machine.
@@ -252,19 +256,19 @@ impl Cmd {
     }
 }
 
-const TRUST_RECIPE_HELP: &str = "Pin the recipe without asking, even when a guest could have \
+const TRUST_RECIPE_HELP: &str = "Apply the recipe without asking, even when a guest could have \
      written it. Required when there is no terminal to ask on.";
 
 #[derive(Args, Debug)]
 pub struct SetupArgs {
     #[arg(long, help = TRUST_RECIPE_HELP)]
     pub trust_recipe: bool,
-    /// Rebuild the guest filesystem from scratch, run `on_create` again, and
+    /// Rebuild the guest filesystem even when the recipe is unchanged, and
     /// remove the volume images the recipe no longer names.
     #[arg(long)]
     pub rebuild: bool,
     /// Run every refusal this setup would raise and stop before it changes
-    /// anything: nothing is pinned, no filesystem is built, no hook runs.
+    /// anything: nothing is applied, no filesystem is built, no hook runs.
     ///
     /// Exits 0 if the setup would go through, non-zero with the refusal if it
     /// would not - so a CI step is `terra <box> setup --dry-run`. The other two
@@ -397,7 +401,7 @@ pub enum StorageCmd {
     /// List the box's images: what each is sized to, what it costs on disk,
     /// and which the recipe no longer names.
     Show(StorageShowArgs),
-    /// Write the box's pinned recipe and images to one file, to be imported on
+    /// Write the box's applied recipe and images to one file, to be imported on
     /// another machine.
     ///
     /// The recipe's inline `env:` values travel with it; its `env_file` does
@@ -407,7 +411,7 @@ pub enum StorageCmd {
     /// wrote, creating the box if it does not exist. The box boots straight
     /// after an import, and must not be running.
     ///
-    /// The recipe is pinned like any other from outside the project: it is put
+    /// The recipe is applied like any other from outside the project: it is put
     /// to you first.
     Import(StorageImportArgs),
     /// Remove the volume images the recipe no longer names. Their data goes
@@ -516,12 +520,6 @@ pub struct BootArgs {
 
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
-
-    /// Command to run instead of the recipe's `workload:`, after `--`. argv is
-    /// passed literally to the guest exec, so use `-- sh -c '…'` for a shell
-    /// line.
-    #[arg(last = true, value_name = "CMD")]
-    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -722,7 +720,7 @@ mod tests {
         // …and the bare form still takes every one of them.
         assert!(Cli::parse_from(["terra", "dev", "-d"]).validate().is_ok());
         assert!(
-            Cli::parse_from(["terra", "dev", "--", "npm", "test"])
+            Cli::parse_from(["terra", "dev", "--root", "--foreground"])
                 .validate()
                 .is_ok()
         );

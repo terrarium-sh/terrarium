@@ -571,18 +571,19 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
     )?;
     ensure!(fs::metadata(&artifact)?.len() > 0, "empty storage export");
     suite.run(&["exercise", "storage", "prune"])?;
-    let foreground = suite.run(&[
+    suite.run(&["exercise", "-d"])?;
+    let restarted = suite.run(&[
         "exercise",
-        "--foreground",
+        "exec",
+        "--no-tty",
         "--root",
         "--",
         "sh",
         "-ec",
         guest_script!("storage-restart.sh"),
     ])?;
-    for marker in ["START_OK", "RESTART_OK", "STOP_OK"] {
-        require_output(&foreground, marker)?;
-    }
+    require_output(&restarted, "RESTART_OK")?;
+    suite.run(&["exercise", "stop"])?;
     require_file(&writable.join("hooks"), b"start\nstop\nstart\nstop\n")?;
     Suite::capture(
         suite
@@ -592,10 +593,12 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
         STORAGE_TIMEOUT,
     )?;
     suite.require_box_state("exercise", "stopped")?;
+    suite.run(&["exercise", "-d"])?;
     require_output(
         &suite.run(&[
             "exercise",
-            "--foreground",
+            "exec",
+            "--no-tty",
             "--",
             "sh",
             "-ec",
@@ -603,11 +606,7 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
         ])?,
         "RESTORED_OK",
     )?;
-    suite.run_expected(
-        &["exercise", "--foreground", "--", "sh", "-c", "exit 7"],
-        Some(7),
-        COMMAND_TIMEOUT,
-    )?;
+    suite.run(&["exercise", "stop"])?;
     suite.run(&["exercise", "logs", "--tail", "20"])?;
     suite.run(&["exercise", "logs", "--diagnostics", "--tail", "20"])?;
     let recipe: Value = yaml_serde::from_str(

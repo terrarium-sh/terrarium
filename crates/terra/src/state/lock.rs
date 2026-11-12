@@ -682,7 +682,7 @@ mod tests {
         );
     }
 
-    /// A box boots only once setup finished for its pinned recipe. Missing,
+    /// A box boots only once setup finished for its applied recipe. Missing,
     /// empty, and mismatched stamps all need a setup VM to succeed.
     #[test]
     fn a_box_whose_setup_did_not_finish_is_not_locked_for_a_boot() {

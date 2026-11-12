@@ -79,8 +79,8 @@ hooks:
   on_create:
     - apk add --no-cache nodejs npm git
 workload:
-  entrypoint: /bin/sh
   workdir: /work
+  # run: exec npm start   # what the box runs; defaults to a shell
 ```
 
 This recipe:

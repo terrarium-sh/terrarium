@@ -513,7 +513,7 @@ mod tests {
     }
 
     fn test_plan() -> Plan {
-        Plan::bare_run(Vec::new())
+        Plan::bare_run(None)
     }
 
     #[test]

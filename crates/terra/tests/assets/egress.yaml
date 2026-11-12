@@ -4,10 +4,7 @@ network:
   mode: allowlist
   allow: [example.com]
 workload:
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       # Any HTTP answer, even a CDN's 503, proves the policy let the name through.
       reach() { err=$(wget -q -T 10 -O /dev/null "$1" 2>&1) || { echo "$err"; case $err in *"server returned error"*) ;; *) return 1 ;; esac; }; }
       reach https://example.com/     && echo ALLOWED_OK     || echo ALLOWED_FAIL

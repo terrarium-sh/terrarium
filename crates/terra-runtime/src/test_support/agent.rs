@@ -99,7 +99,7 @@ impl GuestTransport {
 
 fn encode_plan() -> wasmtime::Result<Vec<u8>> {
     Ok(terra_protocol::encode_frame(
-        &terra_protocol::Plan::bare_run(vec!["/bin/true".into()]),
+        &terra_protocol::Plan::bare_run(Some("exec /bin/true".into())),
     )?)
 }
 

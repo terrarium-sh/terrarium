@@ -34,7 +34,7 @@ it wins.
    unless the user wants a single recipe set up by path (`terra ./box.yaml setup`).
 3. **Check it:** `terra <box> setup --dry-run` exits non-zero with the reason
    when terra would refuse it. `terra <box> show` prints the resolved recipe.
-4. **Set it up:** `terra <box> setup` pins the recipe, builds the disk and runs
+4. **Set it up:** `terra <box> setup` applies the recipe, builds the disk and runs
    `on_create`, printing its output.
 5. **Smoke-test:** `terra <box> -d` starts it in the background; `terra <box>
    exec -- CMD` runs a check inside, such as a version or a test. `-d`
@@ -66,7 +66,7 @@ it wins.
 - Mount the narrowest folder, `readonly: true` unless the box must write it.
   Never mount `~`, `~/.ssh`, cloud credentials or unrelated projects.
 - A writable mount over the project lets the guest edit the recipe and
-  `terra.yaml`. Terra then asks before pinning them; without a terminal it
+  `terra.yaml`. Terra then asks before applying them; without a terminal it
   needs `--trust-recipe`, which you pass only after reviewing both files. For
   untrusted workloads, keep the recipe outside every writable mount: put it and
   `terra.yaml` in a sibling folder, mount `host: ../app`, and run terra there
@@ -133,7 +133,7 @@ that the box can therefore edit `py.yaml` and `terra.yaml`.
 ## Recipe reference
 
 A recipe is the YAML policy for one box: its resources, host access, network
-and workload. `terra setup` pins a copy in the box; edit the source recipe and
+and workload. `terra setup` applies a copy to the box; edit the source recipe and
 run setup again to apply a change. A project's `terra.yaml` maps box names to
 recipes; see [the manifest reference](https://terrarium.sh/docs/manifest/).
 
@@ -183,8 +183,7 @@ hooks:
 daemons: []
 sudo: [apk]
 workload:
-  entrypoint: /bin/sh
-  args: []
+  run: exec npm run dev
   workdir: /work
 ```
 
@@ -212,15 +211,19 @@ every boot, even after a crash, so nothing written to it survives a restart.
 
 A box has at most 32 mounts and volumes combined on x86_64, or 11 on AArch64.
 
-Growing `rootfs_mib` or a `lifetime: box` volume takes effect at the next
-`terra <box> setup`; an existing image never shrinks. A `lifetime: boot` volume
+Changing `rootfs_mib` rebuilds the root filesystem at the new size at the next
+`terra <box> setup`, so it can shrink as well as grow. Any change to
+`volumes`, a size included, also rebuilds the root and reruns `on_create`,
+because `on_create` can write into volumes. Growing a
+`lifetime: box` volume takes effect at that setup; its image never shrinks. A
+`lifetime: boot` volume
 is recreated at its configured size on every boot, so it can shrink as well as
 grow. Renaming a volume creates a new empty one and leaves the old image
 behind.
 `terra <box> storage prune` removes images no longer named by the recipe;
 `setup --rebuild` does too.
-`terra <box> storage export` writes the pinned recipe, including inline `env:`
-values, and the images; `storage import` asks before pinning that recipe
+`terra <box> storage export` writes the applied recipe, including inline `env:`
+values, and the images; `storage import` asks before applying that recipe
 (`--trust-recipe` skips the question), and the box boots straight after it.
 The imported recipe's mounts and `env_file` resolve against the importing
 project, so the paths it names must exist there.
@@ -374,16 +377,19 @@ installed in the guest. Tools that ignore the proxy variables cannot connect.
 ### Processes
 
 - Setup prepares the root image in an isolated VM with the recipe's volumes but
-  no shares, with or without `on_create`, and sizes the root image and
-  `lifetime: box` volumes. A
-  start never prepares the root image. Running setup again on an unchanged
-  recipe boots no VM.
-- `hooks.on_create` runs as guest root only when setup builds a new root image
-  (the first setup and `--rebuild`), with volumes mounted and shares not; the
+  no shares, and sizes the root image and `lifetime: box` volumes. A start
+  never prepares the root image. Running setup again on an unchanged recipe
+  boots no VM.
+- `hooks.on_create` runs as guest root whenever setup builds a new root image
+  (the first setup, a recipe change that rebuilds and `--rebuild`), with volumes mounted and
+  shares not; the
   workload user `terri` already exists. Its writes under a volume's `guest`
   path land in the volume, so a `lifetime: boot` volume loses them at the next
   boot. It uses the recipe's network rules, and setup prints
   its output. If it fails, the next setup builds the root again from scratch.
+- Every boot, setup's included, writes `/terra/README.md`, a summary of the
+  sandbox's permissions for the software inside it: user, root filesystem,
+  shares, workload, recipe with environment values hidden, and egress policy.
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.
 - `on_start` and `pre_stop` output go to the box's session.
@@ -395,10 +401,12 @@ installed in the guest. Tools that ignore the proxy variables cannot connect.
 - `daemons` are background shell commands. A nonzero exit restarts the daemon
   after one second; exit zero ends it.
 
-The workload and daemons run as `terri` (UID 1000). `workload.entrypoint`
-defaults to `/bin/sh`, `args` are passed as written, and `workdir` must be
-absolute. `sudo` lets the workload user run the named commands as guest root,
-with any arguments. `terra <box> --root` runs that boot's workload and daemons
+The workload and daemons run as `terri` (UID 1000). `workload.run` is a shell
+command run with `/bin/sh -c`, like a daemon; unset, the workload is an interactive
+`/bin/sh`. Write `exec PROGRAM ...` to make the program the workload process, so
+stop signals reach it directly; `terra <box> exec -- CMD` runs anything else in
+the running box. `workdir` must be absolute. `sudo` lets the workload user run the named
+commands as guest root, with any arguments. `terra <box> --root` runs that boot's workload and daemons
 as root; `terra <box> exec --root -- CMD` runs only that command as root.
 
 ### Containers
@@ -447,9 +455,17 @@ them.
 ### Applying changes
 
 Stop the box and run `terra <box> setup` after editing a recipe. `--dry-run`
-checks it without changing anything. `--rebuild` discards the root filesystem,
-reruns `on_create` and removes volume images the recipe no longer names; without
-it, an edited `on_create` does not run, and setup says so. Read
+checks it without changing anything. A changed recipe rebuilds the root
+filesystem from scratch and reruns `on_create`; `lifetime: box` volumes are
+kept. A change only to fields that do not shape the root filesystem is applied without a
+rebuild: `workload.run`, `daemons`, `hooks.on_start`, `hooks.pre_stop`, `sudo`,
+`network.ports`, `hw.rootfs_readonly`, `components`, and a mount's `host` and
+`readonly`. `on_create` runs under the recipe's egress rules, so editing
+`network.enabled`, `mode`, `allow` or `hosts` rebuilds. Comments, layout, quoting, key order and a field written with the
+value it has when left out (`cpus: 2`) are not changes. An `env_file` counts by
+its path, not its contents: after changing a value `on_create` uses, run
+`setup --rebuild`. `--rebuild` rebuilds an unchanged
+recipe too and also removes volume images the recipe no longer names. Read
 [usage](https://terrarium.sh/docs/usage/) and [security](https://terrarium.sh/docs/security/) before granting host access.
 
 ## Project manifest
@@ -474,13 +490,13 @@ terra ci setup --dry-run
 terra dev
 ```
 
-Setup pins a copy of the recipe in the box, and boots use that copy. Editing
+Setup applies a copy of the recipe to the box, and boots use that copy. Editing
 the manifest or the recipe changes nothing until you run `terra <box> setup`
-again. `terra <box> show` prints the pinned recipe and says when the manifest
+again. `terra <box> show` prints the applied recipe and says when the manifest
 now points elsewhere.
 
 Keep the manifest and its recipes out of writable shares, because the guest
-could edit them. Terra asks before pinning a recipe a guest could have written;
+could edit them. Terra asks before applying a recipe a guest could have written;
 without a terminal, review both files and pass `--trust-recipe`. Terra checks
 only current shares, so files left by a removed share get no warning. See
 [where recipes live](https://terrarium.sh/docs/security/#where-recipes-live).

@@ -6,8 +6,5 @@ hooks:
     - mkdir -p /opt/baked
     - date +%s%N > /opt/baked/when
 workload:
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       echo "WHEN=$(cat /opt/baked/when)"
