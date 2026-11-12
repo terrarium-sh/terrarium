@@ -11,7 +11,7 @@ git submodule update --init --recursive
 
 ## bubblewrap
 
-[`bubblewrap`](bubblewrap) is a Git submodule pinned to upstream v0.13.0.
+[`bubblewrap`](bubblewrap) is a Git submodule pinned to upstream v0.13.1.
 Linux builds compile the embedded launcher directly from this checkout with
 static libcap and the Zig musl toolchain.
 

@@ -35,7 +35,7 @@ packaging/licenses/uds_windows-MIT.txt; its bundled third-party notices are in
 packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt. It supplies the native
 AF_UNIX control channel implementation.
 
-Linux releases embed Bubblewrap 0.13.0
+Linux releases embed Bubblewrap 0.13.1
 (https://github.com/containers/bubblewrap), with source files marked
 LGPL-2.0-or-later. Its upstream LGPL license text is included in
 packaging/licenses/bubblewrap-LGPL-2.1.txt. The embedded build uses libcap

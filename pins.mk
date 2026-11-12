@@ -10,8 +10,8 @@
 # Requires $(ARCH) — include it after those are set.
 
 # --- Terra guest kernel: upstream Linux LTS ---------------------------------
-KERNEL_VERSION := 6.18.62
-KERNEL_SHA256 := 490a7aedf1b355c565d3a6c05333ccccb5da82064eca46b590448a7099d7d651
+KERNEL_VERSION := 6.18.63
+KERNEL_SHA256 := 81764a545072d160748beff4d9de2e7d95aa9f16e8261110288f067a2cc61d71
 KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 
 # --- e2fsprogs --------------------------------------------------------------
@@ -24,8 +24,8 @@ E2FSPROGS_SHA256 := da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b9912
 E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
 
 # --- Linux VM launcher ------------------------------------------------------
-BUBBLEWRAP_VERSION := 0.13.0
-BUBBLEWRAP_COMMIT := 719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0
+BUBBLEWRAP_VERSION := 0.13.1
+BUBBLEWRAP_COMMIT := 362936aea0d5c6e70f7af75d2d44b5a914cb4ba2
 LIBCAP_VERSION := 2.78
 LIBCAP_SHA256 := 0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11
 LIBCAP_URL := https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-$(LIBCAP_VERSION).tar.xz
