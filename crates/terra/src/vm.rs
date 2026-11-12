@@ -180,9 +180,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         pre_stop: recipe.hooks.pre_stop.clone(),
         daemons: recipe.daemons.clone(),
         await_initial_session: spec.foreground || spec.mode == PlanMode::Create,
-        workload: std::iter::once(recipe.workload.entrypoint.to_string_lossy().into_owned())
-            .chain(recipe.workload.args.iter().cloned())
-            .collect(),
+        workload: recipe.workload.run.clone(),
         sandbox_info,
         host_tz: read_host_timezone(),
     };
@@ -335,8 +333,7 @@ mod tests {
 
     #[test]
     fn sandbox_info_carries_the_resolved_recipe_as_yaml() {
-        let mut recipe: Recipe =
-            yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
+        let mut recipe: Recipe = yaml_serde::from_str("workload:\n  run: make\n").unwrap();
         recipe.mounts = vec![Mount {
             host: PathBuf::from("/srv/models"),
             guest: PathBuf::from("/models"),
@@ -345,7 +342,7 @@ mod tests {
         let mut spec = build_run_spec(recipe);
         let info = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(info.contains("# Terrarium sandbox"));
-        assert!(info.contains("`/bin/sh -c make`"));
+        assert!(info.contains("`make`"));
         assert!(info.contains("(uid 1000, non-root)"));
         assert!(info.contains("```yaml"), "{info}");
         assert!(info.contains("host: /srv/models"), "{info}");
@@ -366,8 +363,7 @@ mod tests {
     /// the plan and only there, devices and stop mode as the recipe sets them.
     #[test]
     fn the_plan_carries_the_resolved_recipe() {
-        let mut recipe: Recipe =
-            yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
+        let mut recipe: Recipe = yaml_serde::from_str("workload:\n  run: make\n").unwrap();
         recipe.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
         recipe.daemons = vec!["ascend --serve".into()];
         let spec = BootSpec {
@@ -395,7 +391,7 @@ mod tests {
         let plan = build_plan(&spec, "My_Box").unwrap();
 
         assert_eq!(plan.hostname, "my-box");
-        assert_eq!(plan.workload, ["/bin/sh", "-c", "make"]);
+        assert_eq!(plan.workload.as_deref(), Some("make"));
         assert_eq!(plan.daemons, ["ascend --serve"]);
         assert_eq!(plan.env["API_KEY"], "sk-super-secret");
         assert!(!plan.sandbox_info.contains("sk-super-secret"));

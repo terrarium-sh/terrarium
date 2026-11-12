@@ -8,10 +8,7 @@
 volumes:
   - {name: data, guest: /data, size_mib: 64}
 workload:
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       echo EXEC=$(id -u)
       echo WORK=$(stat -c %u:%g /work)
       echo w > /work/wf 2>/dev/null && echo WF_OK || echo WF_FAIL

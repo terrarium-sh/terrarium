@@ -221,7 +221,7 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
     let recipe = project.join("mem.yaml");
     std::fs::write(
         &recipe,
-        "hw: {cpus: 2, mem_mib: 2048}\nworkload:\n  entrypoint: /bin/sh\n  args: [-ec, 'while :; do sleep 60; done']\n",
+        "hw: {cpus: 2, mem_mib: 2048}\nworkload:\n  run: 'while :; do sleep 60; done'\n",
     )
     .unwrap();
 

@@ -24,7 +24,7 @@ systemctl start terra@pi-dev
 
 The instance name is the recipe file's stem, so the box is named `%i` too. Setup
 runs on every start, which is what makes editing the recipe and restarting the
-service mean something; on an unchanged recipe it pins nothing and boots no
+service mean something; on an unchanged recipe it applies nothing and boots no
 setup VM.
 
 A box lives at `~/.terra/box/<slug of its project directory>/<name>`, so what the
@@ -75,8 +75,8 @@ systemctl enable --now terra@pi-dev
 journalctl -u terra@pi-dev -f
 ```
 
-The recipe should define a `workload:` — headless there's no interactive shell to
-fall back to. Use recipe mounts for shared directories, and `terra sync`
+The recipe should set `workload.run`: unset, the workload is an interactive
+shell, and under systemd nobody is attached to it. Use recipe mounts for shared directories, and `terra sync`
 or volumes for guest files.
 Linux binaries carry their seccomp allowlists compiled in; see the
 [host sandbox policy](../docs/sandbox-policy.md).

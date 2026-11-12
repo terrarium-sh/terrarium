@@ -9,10 +9,7 @@ network:
   allow:
     - vma.terra:18080
 workload:
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       for i in 1 2 3 4 5 6; do
         out=$(wget -q -T 5 -O - http://vma.terra:18080/) && { echo "$out"; exit 0; }
         sleep 1

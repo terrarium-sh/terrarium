@@ -20,13 +20,13 @@ terra ci setup --dry-run
 terra dev
 ```
 
-Setup pins a copy of the recipe in the box, and boots use that copy. Editing
+Setup applies a copy of the recipe to the box, and boots use that copy. Editing
 the manifest or the recipe changes nothing until you run `terra <box> setup`
-again. `terra <box> show` prints the pinned recipe and says when the manifest
+again. `terra <box> show` prints the applied recipe and says when the manifest
 now points elsewhere.
 
 Keep the manifest and its recipes out of writable shares, because the guest
-could edit them. Terra asks before pinning a recipe a guest could have written;
+could edit them. Terra asks before applying a recipe a guest could have written;
 without a terminal, review both files and pass `--trust-recipe`. Terra checks
 only current shares, so files left by a removed share get no warning. See
 [where recipes live](security.md#where-recipes-live).

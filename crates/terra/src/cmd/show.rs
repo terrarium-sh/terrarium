@@ -18,8 +18,8 @@ pub fn run(
     let target = resolve::resolve_recipe(name, project_dir, resolve::Purpose::Read { cwd })?;
     if let Some(from) = target.find_manifest_divergence() {
         eprintln!(
-            "terra: note: this is {}'s pinned recipe, which is what a boot runs - \
-             {} names {} instead, and `terra {} setup` would pin that one",
+            "terra: note: this is {}'s applied recipe, which is what a boot runs - \
+             {} names {} instead, and `terra {} setup` would apply that one",
             target.bx.get_name(),
             MANIFEST_FILE,
             render::escape_printable_path(&from),
@@ -27,7 +27,7 @@ pub fn run(
         );
     }
 
-    let is_pinned = matches!(target.source, resolve::Source::Pinned);
+    let is_applied = matches!(target.source, resolve::Source::Applied);
     let mut recipe = target.parse_recipe_without_env_file()?;
     match mount::resolve_mounts(&recipe, &target.bx) {
         Ok(mounts) => {
@@ -45,14 +45,14 @@ pub fn run(
             }
             recipe.mounts = mounts;
         }
-        Err(e) if is_pinned => return Err(e),
+        Err(e) if is_applied => return Err(e),
         Err(e) => eprintln!(
             "terra: warning: `terra setup` would refuse this recipe:\n{}",
             render::render_error(&e)
         ),
     }
     let env_values = resolve_env_file(&mut recipe).and_then(|()| {
-        if is_pinned {
+        if is_applied {
             target
                 .bx
                 .verify_pinned_paths(&crate::state::PinnedPaths::from_recipe(&recipe))?;
@@ -60,7 +60,7 @@ pub fn run(
         merge_env_file(&mut recipe)
     });
     if let Err(e) = env_values {
-        if is_pinned {
+        if is_applied {
             return Err(e);
         }
         eprintln!(
@@ -140,9 +140,9 @@ mod tests {
     /// exactly the reading `show` exists to replace. Only the values go
     /// missing, and a warning says so.
     ///
-    /// The other half is what makes the leniency safe to have: a pin exports
+    /// The other half is what makes the leniency safe to have: an applied recipe exports
     /// those values into the guest, so `terra setup` still refuses the same
-    /// recipe rather than pinning one whose environment is half there.
+    /// recipe rather than applying one whose environment is half there.
     #[tokio::test]
     async fn show_prints_a_recipe_whose_env_file_is_not_there_yet() {
         let dir = tempfile::tempdir().unwrap();
@@ -173,7 +173,7 @@ mod tests {
             false,
         )
         .await
-        .expect_err("a pin must still refuse a dotenv it cannot read")
+        .expect_err("an applied recipe must still refuse a dotenv it cannot read")
         .to_string();
         assert!(err.contains("resolving env file"), "{err}");
 
@@ -192,11 +192,11 @@ mod tests {
         assert_eq!(recipe.env["API_KEY"], "sk-1");
     }
 
-    /// `show` promises the recipe a boot runs, and a boot refuses a pin
+    /// `show` promises the recipe a boot runs, and a boot refuses an applied recipe
     /// whose share moved: it used to print the repointed target, a mount no
     /// boot would grant.
     #[test]
-    fn show_refuses_a_pinned_recipe_whose_paths_moved() {
+    fn show_refuses_an_applied_recipe_whose_paths_moved() {
         let _home = crate::sys::TestHome::new();
         for recipe in [
             "mounts:\n  - host: ./share\n    guest: /work\n",
@@ -236,7 +236,7 @@ mod tests {
             let err = run(&show, Some("dev"), &project, &project)
                 .expect_err("a repointed path must not print clean")
                 .to_string();
-            assert!(err.contains("moved since it was pinned"), "{err}");
+            assert!(err.contains("moved since the last setup"), "{err}");
         }
     }
 

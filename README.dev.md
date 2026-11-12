@@ -149,13 +149,25 @@ Shutdown responsibilities stay with their resource owners:
 | `component/vmm/native_task.rs` | Run cleanup independently of cancellation of a waiter |
 | `terra-hypervisor` `vcpus.rs` | Stop and join native vCPU threads |
 
-The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk,
-receives its boot plan over the fixed agent vsock stream and enters the Alpine
-root with `pivot_root`. Setup's VM grows the root filesystem, runs `on_create`
-when its commands differ from the guest-side stamp, and creates the recipe's
-directories. Run boots grow volume filesystems to their images, mount shares
-and volumes, then run hooks and the workload. Boot-plan environment values are
-sent through memory, not persisted as a host plan file.
+## Guest boot
+
+`crates/terra/src/vm.rs` builds each VM's boot plan: `PlanMode::Create` for
+setup's VM, `PlanMode::Run` for a start. The plan, environment values included,
+travels over vsock; no plan file is written on the host.
+
+The agent (`crates/terra-agent`) starts as PID 1 from the read-only 3 MiB
+memory-backed boot disk. `bootstrap.rs` reads the plan from the fixed agent
+vsock stream, grows the root and volume filesystems to fill their images and
+enters the Alpine root with `pivot_root`. `agent.rs` then runs the plan's mode:
+
+- **Create** mounts the volumes but not the shares and runs `on_create`.
+  Setup boots it only to create or rebuild a root.
+- **Run** mounts shares and volumes, runs `on_start`, the daemons and the
+  workload, and `pre_stop` on an orderly stop.
+
+Both remount their filesystems read-only on the way out, so the next boot needs
+no journal replay. Create retries a busy root and fails if it stays writable;
+Run makes one best-effort attempt and ignores a busy filesystem.
 
 ## Network transport
 
@@ -605,4 +617,4 @@ and a manifest recording source origins and aports commits.
 - **musl C compiler not found:** put Zig on `PATH`; `scripts/toolchain/zig-musl-*` supplies the toolchain.
 - **kernel build fails:** check unprivileged Podman, then rerun `make kernel`. Fix pin/configuration mismatches before retrying an import.
 - **image build fails at `unshare`:** check the host's unprivileged-user-namespace policy. Images must be built with correct root ownership.
-- **guest network is blocked:** inspect `terra logs`, adjust recipe `allow:` rules or network mode, then run `terra setup` to pin the change.
+- **guest network is blocked:** inspect `terra logs`, adjust recipe `allow:` rules or network mode, then run `terra setup` to apply the change.

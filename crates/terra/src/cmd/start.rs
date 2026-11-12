@@ -27,18 +27,12 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
         Holder::SettingUp => return Err(bx.setup_holds_it()),
         Holder::Running => {}
     }
-    if !args.command.is_empty() || args.root {
-        let asked = if args.command.is_empty() {
-            "as root"
-        } else {
-            "a command of its own"
-        };
+    if args.root {
         anyhow::bail!(
-            "{bx} is already running, so it cannot be started with {asked} - \
-             `terra {name} exec{root} -- …` runs one in it, or `terra {name} stop` \
-             first to boot it differently",
-            name = bx.get_name(),
-            root = if args.root { " --root" } else { "" }
+            "{bx} is already running, so it cannot be started as root - \
+             `terra {name} exec --root -- …` runs a command as root in it, or \
+             `terra {name} stop` first to boot it as root",
+            name = bx.get_name()
         );
     }
     if args.foreground {
@@ -106,17 +100,17 @@ pub async fn run(
     }
 
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
-    // Locked before the pin is read - a setup finishing in between would
+    // Locked before the applied recipe is read - a setup finishing in between would
     // otherwise boot the old recipe on the root it set up for the new one.
     let lock = target.bx.lock_finished()?;
     let manifest_divergence = target.find_manifest_divergence();
-    let (bx, recipe) = target.load_pinned_recipe()?;
+    let (bx, recipe) = target.load_applied_recipe()?;
     let project_dir = bx.get_project_dir().to_path_buf();
     let spec = boot::BootSpec::resolve(recipe, args, project_dir, mode);
     crate::vm::encode_boot_plan(&spec, bx.get_name())?;
     if let Some(from) = manifest_divergence {
         eprintln!(
-            "terra: note: {} differs from {}'s pinned recipe; this boot runs the pinned one \
+            "terra: note: {} differs from {}'s applied recipe; this boot runs the applied one \
              (`terra {} setup` applies the change)",
             crate::render::escape_printable_path(&from),
             bx.get_name(),
@@ -132,31 +126,7 @@ mod tests {
     use crate::sys::TestHome;
     use clap::Parser;
 
-    #[tokio::test]
-    async fn oversized_command_override_is_refused_before_booting() {
-        let _home = TestHome::new();
-        let dir = tempfile::tempdir().unwrap();
-        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.get_dir()).unwrap();
-        std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
-        std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"").unwrap();
-        bx.write_setup_stamp().unwrap();
-        let paths = crate::state::PinnedPaths::from_recipe(&crate::recipe::Recipe::default());
-        std::fs::write(
-            bx.get_dir().join(crate::state::PINNED_PATHS_FILE),
-            yaml_serde::to_string(&paths).unwrap(),
-        )
-        .unwrap();
-        let mut args = build_boot_args(&["--foreground"]);
-        args.command = vec!["echo".into(), "x".repeat(terra_protocol::MAX_PLAN_BYTES)];
-        let error = run(Some("dev"), &args, dir.path(), false)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("boot plan"), "{error:#}");
-        assert_eq!(bx.read_vm_process(), None, "a VM was launched");
-    }
-
-    /// Start never pins: a recipe path or a box nobody set up is sent to setup.
+    /// Start never applies: a recipe path or a box nobody set up is sent to setup.
     #[tokio::test]
     async fn a_recipe_path_or_a_missing_box_is_sent_to_setup() {
         let _home = TestHome::new();
@@ -234,13 +204,7 @@ mod tests {
     fn a_box_that_is_not_up_is_booted_however_it_was_asked_for() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home) = create_box_in(dir.path(), false);
-        for flags in [
-            &[][..],
-            &["-d"],
-            &["--foreground"],
-            &["--root"],
-            &["--", "npm"],
-        ] {
+        for flags in [&[][..], &["-d"], &["--foreground"], &["--root"]] {
             for is_at_a_terminal in [false, true] {
                 assert_eq!(
                     build_start_plan(&bx, &build_boot_args(flags), is_at_a_terminal).unwrap(),
@@ -278,15 +242,12 @@ mod tests {
         );
     }
 
-    /// `-- <cmd>`, `--root` and `--foreground` each shape a boot, and a box
-    /// that is already up booted without them: attaching anyway used to hand
-    /// back a session running the recipe's workload as `terri` while the
-    /// command typed on the line was dropped without a word.
+    /// `--root` and `--foreground` each shape a boot, and a box that is already
+    /// up booted without them: attaching anyway used to hand back a session
+    /// running the workload as `terri`, the flag dropped without a word.
     ///
     /// `--foreground` is the same drop by a different route - it asks for the
-    /// VM in *this* process, and attaching joins one running elsewhere. It went
-    /// unrefused after the other two were fixed, which is why it is pinned
-    /// beside them rather than in a test of its own.
+    /// VM in *this* process, and attaching joins one running elsewhere.
     #[test]
     fn boot_flags_are_refused_rather_than_dropped_on_a_running_box() {
         let dir = tempfile::tempdir().unwrap();
@@ -297,15 +258,7 @@ mod tests {
                 .to_string()
         };
 
-        let err = refused(&["--", "npm", "test"], false);
-        assert!(err.contains("a command of its own"), "{err}");
-        assert!(
-            err.contains("terra dev exec -- …"),
-            "the way to do it: {err}"
-        );
-
-        // Same for `--root`, where the surprise is worse: a session that
-        // silently is not the root one that was asked for.
+        // A session that silently is not the root one that was asked for.
         let err = refused(&["--root"], false);
         assert!(err.contains("as root"), "{err}");
         assert!(err.contains("terra dev exec --root"), "{err}");

@@ -22,6 +22,8 @@ daemons:
   - >-
     while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDENIED_ROUTE' | busybox nc -l -p 18081; done
 workload:
-  entrypoint: /bin/sh
   workdir: /work
-  args: ['-ec', 'echo $RECIPE_ENV > /work/ready; while true; do sleep 60; done']
+  run: |
+    set -e
+    echo $RECIPE_ENV > /work/ready
+    while true; do sleep 60; done

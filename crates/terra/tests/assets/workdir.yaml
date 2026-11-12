@@ -6,10 +6,7 @@ hooks:
     - echo ON_START_DIR=$(pwd)
 workload:
   workdir: /work/nested/deep
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       echo PWD=$(pwd)
       echo OWNER=$(stat -c %u:%g .)
       echo w > ./f 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL

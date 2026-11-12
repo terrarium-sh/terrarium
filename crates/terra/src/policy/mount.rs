@@ -331,7 +331,7 @@ mod tests {
             .verify_pinned_paths(&state::PinnedPaths::from_recipe(&changed))
             .expect_err("a changed target must not be granted")
             .to_string();
-        assert!(error.contains("moved since it was pinned"), "{error}");
+        assert!(error.contains("moved since the last setup"), "{error}");
     }
 
     /// A guest that can write the terra binary picks what the next run does, as

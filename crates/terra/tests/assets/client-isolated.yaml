@@ -5,10 +5,7 @@ network:
   mode: allowlist
   allow: [example.com]
 workload:
-  entrypoint: /bin/sh
-  args:
-    - "-c"
-    - |
+  run: |
       for i in 1 2 3; do
         wget -q -T 5 -O - http://vma.terra:18080/ && { echo REACHED; exit 0; }
         sleep 1

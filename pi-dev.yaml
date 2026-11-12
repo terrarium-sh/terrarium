@@ -32,9 +32,5 @@ hooks:
 sudo:
   - apk
 workload:
-  # Interactive shell, running as terri.
-  entrypoint: /bin/sh
-  args: []
-  # One-shot command instead (argv passed literally to exec):
-  #   entrypoint: /bin/sh
-  #   args: ["-c", "echo 123"]
+  # Unset: an interactive shell, running as terri. One shell line instead:
+  #   run: echo 123

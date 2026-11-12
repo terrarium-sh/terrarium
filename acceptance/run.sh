@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline podman readonly overlay bad-bake"
+boxes="probe isolated offline podman readonly overlay bad-bake rebuild"
 
 terra=terra
 suite=
@@ -360,9 +360,10 @@ expect_contains "$storage" vol-data.img
 run probe storage export "$work/storage.terra"
 test -s "$work/storage.terra"
 run probe storage prune
-restarted=$(output probe --foreground --root -- sh -e /suite/guest/storage-restart.sh)
-expect_contains "$restarted" RESTART_OK
-expect_contains "$restarted" STOP_OK
+run probe -d
+expect_contains "$(output probe exec --no-tty --root -- sh -e /suite/guest/storage-restart.sh)" RESTART_OK
+run probe stop
+expect "$(tr '\n' ' ' < work/hooks)" "start stop start stop "
 if refused=$(output probe storage import "$work/storage.terra"); then
   note "import without --trust-recipe succeeded"
   false
@@ -370,19 +371,19 @@ fi
 expect_contains "$refused" gate.test
 expect_contains "$refused" --trust-recipe
 run probe storage import --trust-recipe "$work/storage.terra"
-expect_contains "$(output probe --foreground -- \
+run probe -d
+expect_contains "$(output probe exec --no-tty -- \
   sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
+run probe stop
 imported="$work/imported"
 mkdir -p "$imported/work" "$imported/readonly"
 cp -R "$project/suite" "$imported/suite"
 run --project "$imported" probe storage import --trust-recipe "$work/storage.terra"
 expect_contains "$(output --project "$imported" ls --state stopped --quiet)" probe
-expect_contains "$(output --project "$imported" probe --foreground -- \
+run --project "$imported" probe -d
+expect_contains "$(output --project "$imported" probe exec --no-tty -- \
   sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
-passed
-
-begin "a foreground command's exit status is terra's"
-expect "$(exit_status probe --foreground -- sh -c 'exit 7')" 7
+run --project "$imported" probe stop
 passed
 
 begin "logs show host and guest diagnostics"
@@ -398,6 +399,32 @@ fi
 expect_contains "$bake" FAILED_BAKE
 expect_contains "$(output bad-bake logs --diagnostics)" "init failed"
 expect_listed bad-bake needs_setup
+passed
+
+begin "setup rebuilds from scratch only when the recipe says something new"
+expect_contains "$(output ./rebuild.yaml setup)" BAKED_ONE
+expect_setup_untouched() {
+  untouched=$(output ./rebuild.yaml setup) || { note "setup failed"; return 1; }
+  case "$untouched" in
+    *"from scratch"* | *BAKED_*) note "an unchanged recipe was rebuilt"; return 1 ;;
+  esac
+}
+expect_setup_untouched
+{ echo "# only a comment"; cat rebuild.yaml; } > rebuild.next
+mv rebuild.next rebuild.yaml
+expect_setup_untouched
+sed 's/BAKED_ONE/BAKED_TWO/' rebuild.yaml > rebuild.next
+mv rebuild.next rebuild.yaml
+changed=$(output ./rebuild.yaml setup)
+expect_contains "$changed" "from scratch: the recipe changed"
+expect_contains "$changed" BAKED_TWO
+passed
+
+begin "a new run keeps the root, and a foreground workload's exit status is terra's"
+printf 'workload: {run: exit 7}\n' >> rebuild.yaml
+kept=$(output ./rebuild.yaml setup)
+expect_contains "$kept" "keeps its root"
+expect "$(exit_status rebuild --foreground)" 7
 passed
 
 begin "rm discards the box, --purge forgets it"

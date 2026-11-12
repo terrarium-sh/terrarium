@@ -196,7 +196,7 @@ impl Agent {
         plan: &Plan,
         console: &Console,
     ) -> Result<(i32, crate::daemon::Daemons)> {
-        let mut command = workload_command(plan)?;
+        let mut command = workload_command(plan);
         let daemons = crate::daemon::spawn_all(
             &self.tasks,
             &plan.daemons,
@@ -351,14 +351,13 @@ async fn run_hook(
     Ok(())
 }
 
-fn workload_command(plan: &Plan) -> Result<PtyCommand> {
-    let Some((cmd, args)) = plan.workload.split_first() else {
-        bail!("empty workload argv");
-    };
-    let mut command = std::process::Command::new(cmd);
-    command.args(args);
+fn workload_command(plan: &Plan) -> PtyCommand {
+    let mut command = std::process::Command::new(terra_protocol::guest_root::RECIPE_SHELL);
+    if let Some(line) = &plan.workload {
+        command.arg("-c").arg(line);
+    }
     crate::workload::run_as(&mut command, GuestUser::from_plan(plan));
-    Ok(command.into())
+    command.into()
 }
 
 fn open_pty() -> Result<(OwnedFd, Pts)> {
@@ -508,7 +507,7 @@ mod tests {
         let (agent, _control_host, _diagnostic_host) = test_agent();
         let (_clients, clients) = mpsc::channel(1);
         let console = agent
-            .start_console(&Plan::bare_run(Vec::new()), clients, StartupState::Refused)
+            .start_console(&Plan::bare_run(None), clients, StartupState::Refused)
             .await
             .unwrap();
         let (mut host, guest) = UnixStream::pair().unwrap();

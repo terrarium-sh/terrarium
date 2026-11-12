@@ -39,7 +39,7 @@ fn kernel_boot_assets() -> (
 fn boot_plan(
     mode: terra_protocol::PlanMode,
     on_create: Vec<String>,
-    workload: Vec<String>,
+    workload: Option<String>,
     await_initial_session: bool,
 ) -> Vec<u8> {
     use terra_protocol::{Plan, encode_frame};
@@ -57,7 +57,7 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Create,
         vec![format!("test $(nproc) = {vcpus}")],
-        Vec::new(),
+        None,
         false,
     )
 }
@@ -72,7 +72,7 @@ fn agent_bridge_plan() -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Run,
         Vec::new(),
-        vec!["sleep".into(), "15".into()],
+        Some("exec sleep 15".into()),
         false,
     )
 }
@@ -96,7 +96,12 @@ async fn kernel_boots_directory_share() {
         std::fs::set_permissions(&executable, permissions).unwrap();
     }
     let tag = crate::component::fs::share_tag(0);
-    let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
+    let encoded = boot_plan(
+        PlanMode::Run,
+        Vec::new(),
+        Some("exec /bin/true".into()),
+        false,
+    );
     let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.on_start.push("set -ex; test $(/work/script) = executed; test $(cat /work/host-file) = host-data; printf guest-data >/work/guest-file; ln /work/guest-file /work/hardlink; ln -s guest-file /work/link; test $(cat /work/link) = guest-data; mv /work/guest-file /work/renamed; test $(cat /work/hardlink) = guest-data; cp /work/large-host /work/large-copy; cmp /work/large-host /work/large-copy; test $(wc -c </work/large-copy) = 65537; sync".into());
     let diagnostics = tempfile::NamedTempFile::new().unwrap();
@@ -179,7 +184,7 @@ const BOOT_RAM: u64 = 512 << 20;
 
 async fn boot_workload(
     ram_bytes: u64,
-    workload: Vec<String>,
+    workload: Option<String>,
 ) -> Result<super::orchestration::VmOutcome, String> {
     let vcpus = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
         1
@@ -253,7 +258,7 @@ async fn kernel_boots_to_agent_ready() {
 #[tokio::test]
 #[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_reports_free_pages_after_boot() {
-    let outcome = boot_workload(2048 << 20, vec!["sleep".into(), "4".into()])
+    let outcome = boot_workload(2048 << 20, Some("exec sleep 4".into()))
         .await
         .expect("worker runs");
     assert_eq!(
@@ -268,11 +273,7 @@ async fn kernel_reports_free_pages_after_boot() {
 async fn kernel_boots_with_high_ram_above_the_mmio_hole() {
     let outcome = boot_workload(
         8 << 30,
-        vec![
-            "sh".into(),
-            "-ec".into(),
-            "awk '/MemTotal:/ { exit !($2 > 7000000) }' /proc/meminfo; mount -o remount,size=4G /dev/shm; dd if=/dev/zero of=/dev/shm/high-ram bs=1M count=3584; test $(stat -c %s /dev/shm/high-ram) -eq 3758096384; test $(stat -c %b /dev/shm/high-ram) -ge 7000000".into(),
-        ],
+        Some("set -e; awk '/MemTotal:/ { exit !($2 > 7000000) }' /proc/meminfo; mount -o remount,size=4G /dev/shm; dd if=/dev/zero of=/dev/shm/high-ram bs=1M count=3584; test $(stat -c %s /dev/shm/high-ram) -eq 3758096384; test $(stat -c %b /dev/shm/high-ram) -ge 7000000".into()),
     )
     .await
     .expect("worker runs");
@@ -679,7 +680,7 @@ async fn kernel_boots_local_only_agent_control_and_session() {
     let encoded = boot_plan(
         PlanMode::Run,
         Vec::new(),
-        vec!["sleep".into(), "120".into()],
+        Some("exec sleep 120".into()),
         false,
     );
     let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -904,11 +905,9 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
     let encoded = boot_plan(
         PlanMode::Run,
         Vec::new(),
-        vec![
-            "sh".into(),
-            "-c".into(),
-            format!("exec busybox nc -l -p {STALLED_GUEST_PORT} -e /bin/sleep 120"),
-        ],
+        Some(format!(
+            "exec busybox nc -l -p {STALLED_GUEST_PORT} -e /bin/sleep 120"
+        )),
         false,
     );
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -1196,14 +1195,10 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
     let encoded = boot_plan(
         PlanMode::Run,
         Vec::new(),
-        vec![
-            "sh".into(),
-            "-c".into(),
-            format!(
-                "exec /work/vsock-probe {} {port} > /work/NETWORK_RESET_PROBE_LOG 2>&1",
-                terra_protocol::socket::HOST_SERVICE_IPV4
-            ),
-        ],
+        Some(format!(
+            "exec /work/vsock-probe {} {port} > /work/NETWORK_RESET_PROBE_LOG 2>&1",
+            terra_protocol::socket::HOST_SERVICE_IPV4
+        )),
         false,
     );
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -1327,7 +1322,7 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
     let encoded = boot_plan(
         PlanMode::Run,
         Vec::new(),
-        vec!["/work/socket-probe".into(), "--dns-tcp-fallback".into()],
+        Some("exec /work/socket-probe --dns-tcp-fallback".into()),
         true,
     );
     let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -1410,7 +1405,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
         plan: boot_plan(
             terra_protocol::PlanMode::Run,
             Vec::new(),
-            vec!["sleep".into(), "120".into()],
+            Some("exec sleep 120".into()),
             false,
         ),
         artifacts: crate::test_fixtures::trusted_artifacts(),
@@ -1456,11 +1451,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
         plan: boot_plan(
             terra_protocol::PlanMode::Run,
             Vec::new(),
-            vec![
-                "sh".into(),
-                "-c".into(),
-                "printf foreground-lifecycle; exit 7".into(),
-            ],
+            Some("printf foreground-lifecycle; exit 7".into()),
             true,
         ),
         artifacts: crate::test_fixtures::trusted_artifacts(),
@@ -1671,11 +1662,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     let encoded = boot_plan(
         terra_protocol::PlanMode::Run,
         Vec::new(),
-        vec![
-            "sh".into(),
-            "-c".into(),
-            "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 14\\r\\nConnection: close\\r\\n\\r\\npublished-body' | busybox nc -l -p 8080; done".into(),
-        ],
+        Some("while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 14\\r\\nConnection: close\\r\\n\\r\\npublished-body' | busybox nc -l -p 8080; done".into()),
         false,
     );
     let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -1852,11 +1839,7 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
         let encoded = boot_plan(
             PlanMode::Run,
             Vec::new(),
-            vec![
-                "/work/network-tx-probe".into(),
-                mode.into(),
-                port.to_string(),
-            ],
+            Some(format!("exec /work/network-tx-probe {mode} {port}")),
             true,
         );
         let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();

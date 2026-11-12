@@ -4,20 +4,20 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 
+mod applied;
 mod images;
 mod import;
 mod lock;
-mod pin;
 mod setup_state;
 
+pub use applied::{PINNED_PATHS_FILE, RECIPE_FILE};
+pub(crate) use applied::{PinnedPaths, list_applied_recipes_across_boxes, write_applied_recipe};
 pub(crate) use images::ROOTFS_FILE;
 pub(crate) use import::StagedImportFile;
 pub(crate) use lock::{HOST_PID_FILE, PID_FILE, SUPERVISOR_PID_FILE};
 pub use lock::{Holder, ProcessIdentity};
-pub use pin::{PINNED_PATHS_FILE, RECIPE_FILE};
-pub(crate) use pin::{PinnedPaths, list_pinned_recipes_across_boxes, write_pin};
 pub(crate) use setup_state::SETUP_STAMP;
-pub use setup_state::{BoxSetupState, BoxState};
+pub use setup_state::{BoxSetupState, BoxState, digest_setup_boot_inputs};
 
 const BOX_HOME: &str = "box";
 
@@ -699,7 +699,7 @@ mod tests {
         );
     }
 
-    /// Two spellings of one name are one box - one lock, one pin, one root -
+    /// Two spellings of one name are one box - one lock, one applied recipe, one root -
     /// as a case-insensitive filesystem would make them anyway.
     #[test]
     fn box_names_are_case_insensitive() {

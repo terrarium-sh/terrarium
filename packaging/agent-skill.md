@@ -33,7 +33,7 @@ it wins.
    unless the user wants a single recipe set up by path (`terra ./box.yaml setup`).
 3. **Check it:** `terra <box> setup --dry-run` exits non-zero with the reason
    when terra would refuse it. `terra <box> show` prints the resolved recipe.
-4. **Set it up:** `terra <box> setup` pins the recipe, builds the disk and runs
+4. **Set it up:** `terra <box> setup` applies the recipe, builds the disk and runs
    `on_create`, printing its output.
 5. **Smoke-test:** `terra <box> -d` starts it in the background; `terra <box>
    exec -- CMD` runs a check inside, such as a version or a test. `-d`
@@ -65,7 +65,7 @@ it wins.
 - Mount the narrowest folder, `readonly: true` unless the box must write it.
   Never mount `~`, `~/.ssh`, cloud credentials or unrelated projects.
 - A writable mount over the project lets the guest edit the recipe and
-  `terra.yaml`. Terra then asks before pinning them; without a terminal it
+  `terra.yaml`. Terra then asks before applying them; without a terminal it
   needs `--trust-recipe`, which you pass only after reviewing both files. For
   untrusted workloads, keep the recipe outside every writable mount: put it and
   `terra.yaml` in a sibling folder, mount `host: ../app`, and run terra there
