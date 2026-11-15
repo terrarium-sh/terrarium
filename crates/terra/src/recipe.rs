@@ -368,7 +368,7 @@ pub fn load_manifest_or_warn(project_dir: &Path) -> Option<Manifest> {
             eprintln!(
                 "terra: warning: {e:#}\n\
                  terra: continuing without it - box names resolve from what is set up on \
-                 disk, and `terra setup` needs it fixed"
+                 disk; fix {MANIFEST_FILE} so `terra setup` can use its aliases"
             );
             None
         }

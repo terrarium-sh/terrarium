@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use terra_protocol::{AgentOutput, DetachOutcome, TermSize};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -39,6 +39,22 @@ pub(crate) fn set_winsize(fd: BorrowedFd<'_>, rows: u16, cols: u16) {
 /// A client's resize request as a terminal size; a zero dimension is ignored rather than clamped.
 pub(crate) fn requested_term_size(size: TermSize) -> Option<(u16, u16)> {
     (size.rows > 0 && size.cols > 0).then(|| clamp_term_size(size.rows, size.cols))
+}
+
+pub(crate) fn drain_ready_output(
+    source: &mut (impl AsyncRead + Unpin),
+    bytes: &mut [u8],
+    mut len: usize,
+) -> usize {
+    use futures_util::FutureExt as _;
+
+    while len < bytes.len() {
+        match source.read(&mut bytes[len..]).now_or_never() {
+            Some(Ok(read)) if read > 0 => len += read,
+            Some(Ok(_) | Err(_)) | None => break,
+        }
+    }
+    len
 }
 
 /// Sizes come from [`clamp_term_size`] or the defaults, so neither is zero.
@@ -356,7 +372,25 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt as _;
+
+    #[tokio::test]
+    async fn draining_ready_output_stops_at_pending_input_or_a_full_buffer() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"one two three").await.unwrap();
+        let mut bytes = [0; 7];
+        let first = reader.read(&mut bytes[..4]).await.unwrap();
+        let len = drain_ready_output(&mut reader, &mut bytes, first);
+        assert_eq!(&bytes[..len], b"one two");
+
+        let first = reader.read(&mut bytes[..1]).await.unwrap();
+        let len = drain_ready_output(&mut reader, &mut bytes, first);
+        assert_eq!(&bytes[..len], b" three");
+        assert_eq!(drain_ready_output(&mut reader, &mut bytes, 0), 0);
+
+        writer.write_all(b"later").await.unwrap();
+        assert_eq!(drain_ready_output(&mut reader, &mut bytes, 0), 5);
+        assert_eq!(&bytes[..5], b"later");
+    }
 
     fn session() -> (Arc<Session>, AsyncFile) {
         let (input, sink) = std::os::unix::net::UnixStream::pair().unwrap();

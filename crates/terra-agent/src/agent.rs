@@ -5,7 +5,7 @@ use super::diagnostics::Diagnostics;
 use super::into_async_file;
 use super::services::{Server, StartupState};
 use super::{OUTPUT_DRAIN_GRACE, STOP_GRACE};
-use crate::session::Session;
+use crate::session::{Session, drain_ready_output};
 use crate::workload::GuestUser;
 use anyhow::{Context, Result, bail};
 use pty_process::blocking::{Command as PtyCommand, Pts};
@@ -382,12 +382,15 @@ fn forward_pty_output(
                 let Ok(mut reader) = into_async_file(reader) else {
                     return;
                 };
-                let mut bytes = [0; 4096];
+                let mut bytes = vec![0; terra_protocol::MAX_TERMINAL_CHUNK_BYTES];
                 loop {
                     use tokio::io::AsyncReadExt as _;
                     match reader.read(&mut bytes).await {
                         Ok(0) | Err(_) => return,
-                        Ok(len) => session.feed_output(&bytes[..len]).await,
+                        Ok(len) => {
+                            let len = drain_ready_output(&mut reader, &mut bytes, len);
+                            session.feed_output(&bytes[..len]).await;
+                        }
                     }
                 }
             })
@@ -550,6 +553,39 @@ mod tests {
         );
         assert_eq!(code, 3);
         agent.close(&Ok(0)).await;
+    }
+
+    /// Console output already waiting on the terminal reaches an attached client as one frame,
+    /// although it spans several pty reads. The output is written before the forwarder starts,
+    /// so every read is ready at once and scheduling cannot split the frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_console_output_reaches_the_client_as_one_frame() {
+        let (pty, pts) = pty_process::blocking::open().unwrap();
+        let tasks = TaskTracker::new();
+        let shutdown = CancellationToken::new();
+        let (input, _workload_input) = UnixStream::pair().unwrap();
+        let session = Session::new(&tasks, into_async_file(input).unwrap(), &shutdown).unwrap();
+        let (client, mut host) = UnixStream::pair().unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let client =
+            crate::session::ClientConn::from_file(File::from(OwnedFd::from(client))).unwrap();
+        session.attach_client(&client).await.unwrap();
+
+        let screen = vec![b'x'; 8 << 10];
+        rustix::io::ioctl_fionbio(&pts, true).unwrap();
+        File::from(pts.as_fd().try_clone_to_owned().unwrap())
+            .write_all(&screen)
+            .unwrap();
+        forward_pty_output(&tasks, OwnedFd::from(pty), session, &shutdown);
+        let frame = tokio::task::spawn_blocking(move || {
+            terra_protocol::read_frame::<terra_protocol::AgentOutput>(&mut host)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(frame, Some(terra_protocol::AgentOutput::Out(screen)));
+        shutdown.cancel();
+        drop(pts);
     }
 
     /// A terminal like the console's, and the reading end the session forwarder would hold.

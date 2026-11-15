@@ -1,7 +1,7 @@
 # Project manifest
 
-`terra.yaml` names a project's boxes and points each name at a recipe. Commit
-it so every clone uses the same names.
+`terra.yaml` optionally maps box names to recipe paths for setup. Commit it
+so every clone uses the same aliases.
 
 ```yaml
 boxes:
@@ -24,6 +24,13 @@ Setup applies a copy of the recipe to the box, and boots use that copy. Editing
 the manifest or the recipe changes nothing until you run `terra <box> setup`
 again. `terra <box> show` prints the applied recipe and says when the manifest
 now points elsewhere.
+
+An explicit recipe path always wins: `terra ./dev.yaml setup` applies that
+file to the box named `dev`, whether or not the manifest names it. Only a
+bare box name uses the manifest's alias. Without an alias, an existing box
+reuses its applied recipe; a new box needs a recipe path. To apply file edits
+to a box without an alias, pass the path again. An alias pointing at a missing
+file fails setup.
 
 Keep the manifest and its recipes out of writable shares, because the guest
 could edit them. Terra asks before applying a recipe a guest could have written;

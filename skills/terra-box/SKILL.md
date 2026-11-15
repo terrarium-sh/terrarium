@@ -454,8 +454,11 @@ them.
 
 ### Applying changes
 
-Stop the box and run `terra <box> setup` after editing a recipe. `--dry-run`
-checks it without changing anything. A changed recipe rebuilds the root
+Stop the box after editing its recipe. If the box has a [manifest alias](https://terrarium.sh/docs/manifest/),
+run `terra <box> setup`. Otherwise, pass the original recipe path again with
+`terra <recipe-path> setup`: a box name without an alias reuses the applied copy.
+An explicit path always reads that file and names the box by its file stem.
+`--dry-run` checks the recipe without changing anything. A changed recipe rebuilds the root
 filesystem from scratch and reruns `on_create`; `lifetime: box` volumes are
 kept. A change only to fields that do not shape the root filesystem is applied without a
 rebuild: `workload.run`, `daemons`, `hooks.on_start`, `hooks.pre_stop`, `sudo`,
@@ -470,8 +473,8 @@ recipe too and also removes volume images the recipe no longer names. Read
 
 ## Project manifest
 
-`terra.yaml` names a project's boxes and points each name at a recipe. Commit
-it so every clone uses the same names.
+`terra.yaml` optionally maps box names to recipe paths for setup. Commit it
+so every clone uses the same aliases.
 
 ```yaml
 boxes:
@@ -494,6 +497,13 @@ Setup applies a copy of the recipe to the box, and boots use that copy. Editing
 the manifest or the recipe changes nothing until you run `terra <box> setup`
 again. `terra <box> show` prints the applied recipe and says when the manifest
 now points elsewhere.
+
+An explicit recipe path always wins: `terra ./dev.yaml setup` applies that
+file to the box named `dev`, whether or not the manifest names it. Only a
+bare box name uses the manifest's alias. Without an alias, an existing box
+reuses its applied recipe; a new box needs a recipe path. To apply file edits
+to a box without an alias, pass the path again. An alias pointing at a missing
+file fails setup.
 
 Keep the manifest and its recipes out of writable shares, because the guest
 could edit them. Terra asks before applying a recipe a guest could have written;

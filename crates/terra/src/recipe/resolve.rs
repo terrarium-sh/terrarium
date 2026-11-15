@@ -648,16 +648,65 @@ mod tests {
         );
     }
 
-    /// `terra.yaml` lives in the project root, which is exactly what a box
-    /// shares, so its own guest can leave it unparseable. That must not take
-    /// the box away from the host: every verb that needs only a *box* carries
-    /// on from what is set up on disk, so the box that did it can still be
-    /// stopped, removed and read.
-    ///
-    /// `setup` is the exception, and the reason the split is by verb: it is
-    /// what reads the manifest to decide which recipe to apply, and falling back
-    /// to the box's own older applied recipe there would look like a recipe edit that took
-    /// effect.
+    #[test]
+    fn setup_uses_optional_manifest_aliases_for_names_and_always_honors_paths() {
+        let _home = crate::sys::TestHome::new();
+        for manifest in [
+            Some("boxes:\n  other: ./other.yaml\n"),
+            None,
+            Some("boxes:\n  dev: ./other.yaml\n"),
+            Some("boxes:\n  dev: ./missing.yaml\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
+            std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 2\n").unwrap();
+            std::fs::write(dir.path().join("other.yaml"), "hw:\n  cpus: 8\n").unwrap();
+            let apply =
+                |name| resolve_recipe(Some(name), dir.path(), Purpose::Apply { cwd: dir.path() });
+            if let Some(text) = manifest {
+                std::fs::write(dir.path().join(MANIFEST_FILE), text).unwrap();
+            }
+            for path in ["dev.yaml", "./dev.yaml"] {
+                let target = apply(path).unwrap();
+                assert_eq!(target.bx.get_name(), "dev");
+                let Source::File(recipe) = target.source else {
+                    panic!("an explicit path must win over both the manifest and applied recipe")
+                };
+                assert_eq!(recipe.from, dir.path().join("dev.yaml"));
+                assert!(recipe.text.contains("cpus: 2"));
+            }
+            match manifest {
+                None | Some("boxes:\n  other: ./other.yaml\n") => {
+                    assert_matches!(apply("dev").unwrap().source, Source::Applied);
+                }
+                Some("boxes:\n  dev: ./other.yaml\n") => {
+                    let Source::Manifest(recipe) = apply("dev").unwrap().source else {
+                        panic!("a bare name must use its manifest alias")
+                    };
+                    assert_eq!(recipe.from, dir.path().join("other.yaml"));
+                    assert!(recipe.text.contains("cpus: 8"));
+                }
+                Some(_) => assert!(apply("dev").is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_box_without_an_alias_requires_an_explicit_recipe_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
+        let apply =
+            |name| resolve_recipe(Some(name), dir.path(), Purpose::Apply { cwd: dir.path() });
+        let error = apply("dev").unwrap_err().to_string();
+        assert!(error.contains("terra ./dev.yaml setup"), "{error}");
+        assert_matches!(apply("./dev.yaml").unwrap().source, Source::File(_));
+    }
+
+    /// A broken manifest cannot take existing boxes away: operations and setup
+    /// still resolve their applied recipes, while manifest loading warns about the error.
     #[test]
     fn a_broken_manifest_does_not_take_the_box_away() {
         let dir = tempfile::tempdir().unwrap();

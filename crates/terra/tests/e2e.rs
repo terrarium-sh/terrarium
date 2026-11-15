@@ -165,6 +165,25 @@ fn help_lists_the_lifecycle_verbs() {
 }
 
 #[test]
+fn setup_by_path_warns_about_broken_aliases_without_requiring_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("terra.yaml"), "boxes: [not, a, map\n").unwrap();
+    std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
+    let output = run_terra_in(
+        dir.path(),
+        home.path(),
+        &["./dev.yaml", "setup", "--dry-run"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("fix terra.yaml so `terra setup` can use its aliases"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn setup_applies_a_recipe_and_the_box_then_answers_from_it() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

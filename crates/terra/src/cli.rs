@@ -151,8 +151,11 @@ pub enum Cmd {
     /// `workload.run` or `daemons`, applies without a rebuild; comments,
     /// formatting and a field written with its default value are not changes.
     ///
-    /// The box before it may be a recipe *path* as well as a name, the box then
-    /// taking the file's stem: `terra ./pi-dev.yaml setup`.
+    /// A recipe path wins over manifest aliases and names the box by its file
+    /// stem. A box name uses its optional `terra.yaml` alias, or reuses its
+    /// applied recipe; pass the path again to apply file edits without an alias.
+    #[command(after_long_help = "EXAMPLES:\n    \
+                           terra ./pi-dev.yaml setup   Apply a recipe file")]
     Setup(SetupArgs),
     /// Run a command in a running box, on a terminal of its own - a second
     /// process beside the workload, not a second view of it.

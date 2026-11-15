@@ -2,7 +2,7 @@
 
 use crate::AsyncFile;
 use crate::reap::OwnedPidfd;
-use crate::session::{clamp_term_size, requested_term_size, set_winsize};
+use crate::session::{clamp_term_size, drain_ready_output, requested_term_size, set_winsize};
 use crate::workload::GuestUser;
 use std::os::fd::AsFd;
 use std::time::Duration;
@@ -288,6 +288,7 @@ async fn pump_output<R: AsyncRead + Unpin>(
             }
             Err(_) => return Err(()),
         };
+        let count = drain_ready_output(&mut source, &mut bytes, count);
         send_output(
             &mut *writer.lock().await,
             &wrap(bytes[..count].to_vec()),
@@ -787,6 +788,8 @@ mod tests {
             &exec_request(&["sh", "-c", "sleep .1; cat"], false),
             &CancellationToken::new(),
         );
+        let mut output = client.try_clone().unwrap();
+        let reading = tokio::task::spawn_blocking(move || read_exec_output(&mut output));
         for chunk in first.chunks(terra_protocol::MAX_TERMINAL_CHUNK_BYTES) {
             client
                 .write_all(
@@ -802,7 +805,7 @@ mod tests {
         client
             .write_all(&terra_protocol::encode_frame(&ClientInput::Eof).unwrap())
             .unwrap();
-        let (out, err, code) = read_exec_output(&mut client);
+        let (out, err, code) = reading.await.unwrap();
         agent.await.unwrap();
         let mut expected = first;
         expected.extend(second);

@@ -322,8 +322,11 @@ them.
 
 ## Applying changes
 
-Stop the box and run `terra <box> setup` after editing a recipe. `--dry-run`
-checks it without changing anything. A changed recipe rebuilds the root
+Stop the box after editing its recipe. If the box has a [manifest alias](manifest.md),
+run `terra <box> setup`. Otherwise, pass the original recipe path again with
+`terra <recipe-path> setup`: a box name without an alias reuses the applied copy.
+An explicit path always reads that file and names the box by its file stem.
+`--dry-run` checks the recipe without changing anything. A changed recipe rebuilds the root
 filesystem from scratch and reruns `on_create`; `lifetime: box` volumes are
 kept. A change only to fields that do not shape the root filesystem is applied without a
 rebuild: `workload.run`, `daemons`, `hooks.on_start`, `hooks.pre_stop`, `sudo`,
