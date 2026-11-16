@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline podman readonly overlay bad-bake rebuild"
+boxes="probe isolated offline podman wireguard readonly overlay bad-bake rebuild"
 
 terra=terra
 suite=
@@ -218,9 +218,12 @@ chmod 755 work/host-run
 allowed_port=$(( $$ % 12000 + 20000 ))
 denied_port=$(( allowed_port + 1 ))
 podman_port=$(( allowed_port + 2 ))
+wireguard_port=$(( allowed_port + 3 ))
+wireguard_denied_port=$(( allowed_port + 4 ))
 for recipe in $boxes; do
   sed -e "s/{allowed_port}/$allowed_port/g" -e "s/{denied_port}/$denied_port/g" \
     -e "s/{podman_port}/$podman_port/g" \
+    -e "s/{wireguard_port}/$wireguard_port/g" -e "s/{wireguard_denied_port}/$wireguard_denied_port/g" \
     "suite/recipes/$recipe.yaml" > "$recipe.yaml"
 done
 
@@ -321,6 +324,14 @@ run podman exec --no-tty -- sh -e /suite/guest/podman-publish.sh
 expect "$(curl -fsS --retry 30 --retry-delay 1 --retry-all-errors --max-time 5 \
   "http://127.0.0.1:$podman_port/" 2>> "$log")" CONTAINER_NETWORK
 run podman stop
+passed
+
+begin "network: wireguard-go encrypts IPv4 and IPv6 through direct UDP sockets"
+run ./wireguard.yaml setup
+run wireguard -d
+expect_contains "$(output wireguard exec --no-tty -- sh -e /suite/guest/wireguard.sh)" WIREGUARD_UNPRIVILEGED_OK
+expect_contains "$(output wireguard exec --no-tty --root -- sh -e /suite/guest/wireguard.sh "$wireguard_port" "$wireguard_denied_port")" WIREGUARD_OK
+run wireguard stop
 passed
 
 begin "a read-only root refuses writes; boot-lifetime volumes start empty"

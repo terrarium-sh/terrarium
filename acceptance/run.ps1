@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "podman", "readonly", "overlay", "bad-bake", "rebuild"
+$boxes = "probe", "isolated", "offline", "podman", "wireguard", "readonly", "overlay", "bad-bake", "rebuild"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -218,11 +218,15 @@ try {
     $allowedPort = Get-Random -Minimum 20000 -Maximum 32000
     $deniedPort = $allowedPort + 1
     $podmanPort = $allowedPort + 2
+    $wireguardPort = $allowedPort + 3
+    $wireguardDeniedPort = $allowedPort + 4
     foreach ($recipe in $boxes) {
         $text = (Read-Text "suite/recipes/$recipe.yaml") `
             -replace "\{allowed_port\}", $allowedPort `
             -replace "\{denied_port\}", $deniedPort `
-            -replace "\{podman_port\}", $podmanPort
+            -replace "\{podman_port\}", $podmanPort `
+            -replace "\{wireguard_port\}", $wireguardPort `
+            -replace "\{wireguard_denied_port\}", $wireguardDeniedPort
         Write-Text "$recipe.yaml" $text
     }
 
@@ -327,6 +331,16 @@ try {
     Invoke-Terra @("podman", "exec", "--no-tty", "--", "sh", "-e", "/suite/guest/podman-publish.sh")
     Assert-Equal (Read-Http $podmanPort 30) "CONTAINER_NETWORK"
     Invoke-Terra @("podman", "stop")
+    Complete-Step
+
+    Start-Step "network: wireguard-go encrypts IPv4 and IPv6 through direct UDP sockets"
+    Invoke-Terra @("./wireguard.yaml", "setup")
+    Invoke-Terra @("wireguard", "-d")
+    Assert-Contains (Get-TerraOutput @("wireguard", "exec", "--no-tty", "--",
+        "sh", "-e", "/suite/guest/wireguard.sh")) "WIREGUARD_UNPRIVILEGED_OK"
+    Assert-Contains (Get-TerraOutput @("wireguard", "exec", "--no-tty", "--root", "--",
+        "sh", "-e", "/suite/guest/wireguard.sh", "$wireguardPort", "$wireguardDeniedPort")) "WIREGUARD_OK"
+    Invoke-Terra @("wireguard", "stop")
     Complete-Step
 
     Start-Step "a read-only root refuses writes; boot-lifetime volumes start empty"

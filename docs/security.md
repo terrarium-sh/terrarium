@@ -60,6 +60,9 @@ The default is an empty allowlist: nothing is reachable until a rule allows it.
 - The host's interface addresses are collected once, when the VM starts.
 - An allowed service is trusted with everything the guest sends it. Terra
   filters destinations, not protocols.
+- An allowed VPN or proxy can forward traffic to destinations outside the
+  allowlist. For WireGuard, the broker checks the outer UDP peer;
+  encrypted tunnel destinations must be restricted at the peer.
 - NAT64 is checked only for the well-known prefix `64:ff9b::/96`. A
   site-specific prefix needs filtering at the translator.
 - Learned DNS grants expire for new connections after 60 seconds unless

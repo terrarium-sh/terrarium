@@ -452,6 +452,29 @@ starts every boot clean. Keep the volume outside `/home/terri`: setup creates a
 volume's missing parent directories as root, so `terri` could not write in
 them.
 
+### WireGuard
+
+Use `wireguard-go` in the guest. Install `wireguard-go`, `wireguard-tools`
+and `iproute2` in `on_create`, then create and configure the TUN interface as
+guest root (`terra <box> exec --root -- ...`). Start the interface with
+`wireguard-go wg0` and configure it with `wg` and `ip`.
+
+The encrypted UDP socket goes through Terra's network broker directly. Allow
+the remote peer's address and port in `network.allow`. No separate UDP relay
+is needed. A 1280-byte MTU, the IPv6 minimum, fits comfortably inside Terra's
+4 KiB UDP datagram limit and leaves room for WireGuard's outer headers. Use a
+persistent keepalive for idle connections.
+
+Keep the peer's outer UDP traffic outside the tunnel routes. For a full tunnel,
+start `wireguard-go` in the initial guest network namespace, then move its TUN
+interface into a separate workload network namespace and install the default
+routes there. The process's UDP sockets remain in the initial namespace.
+An ordinary `wg-quick` default-route setup is not covered by this configuration.
+
+The broker checks the VPN peer's address and port, not destinations inside the
+encrypted tunnel. Only allow a VPN peer you trust to enforce the intended
+access restrictions. See [network security](https://terrarium.sh/docs/security/#network).
+
 ### Applying changes
 
 Stop the box after editing its recipe. If the box has a [manifest alias](https://terrarium.sh/docs/manifest/),

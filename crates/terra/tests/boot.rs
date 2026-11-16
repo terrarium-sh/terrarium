@@ -2813,6 +2813,69 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
     }
 }
 
+/// The acceptance fixture requires guest root to create `wireguard-go` TUN
+/// interfaces, exchanges IPv4 and IPv6 payloads through default tunnel routes
+/// using native loopback and direct brokered UDP sockets, and rejects unknown
+/// peers, disallowed addresses and outer UDP ports.
+#[test]
+#[ignore = "boots a real VM, requires a native hypervisor and downloads wireguard-tools and wireguard-go"]
+fn userspace_wireguard_tunnels_through_direct_udp_with_explicit_root() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("wireguard");
+    let allowed_socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let denied_socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let allowed_port = allowed_socket.local_addr().unwrap().port().to_string();
+    let denied_port = denied_socket.local_addr().unwrap().port().to_string();
+    drop((allowed_socket, denied_socket));
+    let guest_scripts = project.join("suite/guest");
+    std::fs::create_dir_all(&guest_scripts).unwrap();
+    let acceptance = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../acceptance");
+    std::fs::copy(
+        acceptance.join("guest/wireguard.sh"),
+        guest_scripts.join("wireguard.sh"),
+    )
+    .unwrap();
+    let recipe = suite.get_work_dir().join("wireguard.yaml");
+    let recipe_source = std::fs::read_to_string(acceptance.join("recipes/wireguard.yaml"))
+        .unwrap()
+        .replace("{wireguard_port}", &allowed_port)
+        .replace("{wireguard_denied_port}", &denied_port);
+    std::fs::write(&recipe, recipe_source).unwrap();
+    for args in [
+        vec![recipe.to_str().unwrap(), "setup"],
+        vec!["wireguard", "-d"],
+    ] {
+        let mut args = args;
+        args.extend(["--project", project.to_str().unwrap()]);
+        let (out, code) = suite.run_terra_status(&args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+    }
+    let outcomes = [false, true].map(|root| {
+        suite.exec_in(
+            "wireguard",
+            &project,
+            root,
+            &[
+                "sh",
+                "-e",
+                "/suite/guest/wireguard.sh",
+                &allowed_port,
+                &denied_port,
+            ],
+        )
+    });
+    let (out, code) =
+        suite.run_terra_status(&["wireguard", "stop", "--project", project.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    for ((out, code), expected) in outcomes
+        .into_iter()
+        .zip(["WIREGUARD_UNPRIVILEGED_OK", "WIREGUARD_OK"])
+    {
+        assert_eq!(code, 0, "{expected}: {out}");
+        assert!(out.contains(expected), "missing {expected}: {out}");
+    }
+}
+
 /// Rootless podman needs the network to install, so it runs apart from
 /// `read_only_rootfs`.
 #[cfg(target_os = "linux")]
