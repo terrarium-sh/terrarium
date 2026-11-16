@@ -15,7 +15,7 @@
   },
   "devDependencies": {
     "@alis-is/starlight": "https://codeload.github.com/alis-is/starlight/tar.gz/fa5483fdce64acb0b340c99e4d6cafe71654f981",
-    "@sveltejs/adapter-static": "^4.0.0",
+    "@sveltejs/adapter-static": "^4.0.1",
     "@sveltejs/kit": "^3.1.0",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@types/node": "^22.0.0",
