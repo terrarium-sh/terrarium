@@ -20,7 +20,7 @@ tempfile.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "=0.5.0"
 capstone = { version = "0.14", default-features = false, features = ["full", "std", "arch_x86", "arch_arm64"], optional = true }
-object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"], optional = true }
+object = { version = "0.41", default-features = false, features = ["read_core", "elf", "std"], optional = true }
 terra-build = { path = "../terra-build", optional = true }
 clap = { workspace = true, optional = true }
 

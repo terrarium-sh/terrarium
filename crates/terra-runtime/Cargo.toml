@@ -40,7 +40,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+object = { version = "0.41", default-features = false, features = ["read_core", "elf"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }

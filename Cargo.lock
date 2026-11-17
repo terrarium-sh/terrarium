@@ -1395,6 +1395,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2077,7 +2086,7 @@ dependencies = [
  "libc",
  "log",
  "notify",
- "object",
+ "object 0.41.0",
  "rustix",
  "target-lexicon",
  "tempfile",
@@ -2106,7 +2115,7 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "log",
- "object",
+ "object 0.41.0",
  "rustix",
  "seccompiler",
  "serde",
@@ -2478,7 +2487,7 @@ dependencies = [
  "log",
  "mach2",
  "memfd",
- "object",
+ "object 0.40.0",
  "once_cell",
  "postcard",
  "pulley-interpreter",
@@ -2518,7 +2527,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "log",
- "object",
+ "object 0.40.0",
  "postcard",
  "rustc-demangle",
  "semver",
@@ -2579,7 +2588,7 @@ dependencies = [
  "gimli",
  "itertools",
  "log",
- "object",
+ "object 0.40.0",
  "pulley-interpreter",
  "smallvec",
  "target-lexicon",
@@ -2634,7 +2643,7 @@ checksum = "bbf9357720c1477c43f88dace11923737e8aa87abe5f46f90e23c93a2a0fb3fe"
 dependencies = [
  "cranelift-codegen",
  "log",
- "object",
+ "object 0.40.0",
  "wasmtime-environ",
 ]
 
