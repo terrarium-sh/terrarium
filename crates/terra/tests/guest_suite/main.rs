@@ -275,16 +275,15 @@ fn run_exercises(suite: &mut Suite) -> Result<()> {
     fs::write(writable.join("host"), "HOST_SEED")?;
     fs::write(writable.join("host-update"), "INITIAL")?;
     fs::write(readonly.join("seed"), "READ_ONLY")?;
+    let executable = writable.join("host-run");
+    fs::write(&executable, "#!/bin/sh\necho HOST_EXECUTABLE\n")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let executable = writable.join("host-run");
-        fs::write(&executable, "#!/bin/sh\necho HOST_EXECUTABLE\n")?;
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
     }
-    let reservation = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    let published_port = reservation.local_addr()?.port();
-    drop(reservation);
+    let reservation = network::PublishedPortReservation::new()?;
+    let published_port = reservation.port;
     let allowed_port = allowed.port();
     let mut recipe: Value = yaml_serde::from_str(
         &include_str!("recipes/exercise.yaml")
@@ -308,6 +307,7 @@ fn run_exercises(suite: &mut Suite) -> Result<()> {
         resolved["env"]["WORKLOAD_ENV"] == "recipe-value",
         "recipe environment missing: {resolved}"
     );
+    drop(reservation);
     suite.run(&["exercise", "-d"])?;
     suite.execute(guest_script!("exercise-ready.sh"), &[])?;
     suite.require_box_state("exercise", "running")?;
@@ -419,7 +419,7 @@ fn exercise_exec(suite: &Suite) -> Result<()> {
         &["--env", "WORKLOAD_ENV=exec-value", "--workdir", "/tmp"],
     )?;
     suite.execute_expected("exit 7", &[], Some(7))?;
-    suite.execute_expected("doas id -u", &[], None)?;
+    suite.execute(guest_script!("doas-denied.sh"), &["--no-tty"])?;
     suite.execute("! grep -qw -e vmx -e svm /proc/cpuinfo", &[])?;
     let streams = suite.execute(
         "printf 'one\\ntwo\\n'; echo ERROR >&2; test ! -t 1",
@@ -441,8 +441,10 @@ fn exercise_exec(suite: &Suite) -> Result<()> {
 fn exercise_shares(suite: &Suite, writable: &Path, readonly: &Path) -> Result<()> {
     println!("guest suite: writable/read-only shares, file events and synchronization");
     suite.execute(guest_script!("shares.sh"), &[])?;
-    #[cfg(unix)]
-    suite.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
+    suite.execute(
+        "host_result=$(/work/host-run); test \"$host_result\" = HOST_EXECUTABLE",
+        &[],
+    )?;
     require_file(&writable.join("host"), b"linked")?;
     require_file(&writable.join("after"), b"renamed")?;
     require_file(&readonly.join("seed"), b"READ_ONLY")?;

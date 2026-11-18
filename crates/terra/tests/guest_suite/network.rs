@@ -1,5 +1,6 @@
 //! Host fixture services and published-port probes for the guest suite.
 
+use std::hash::{BuildHasher as _, RandomState};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
@@ -8,6 +9,49 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Result;
+
+pub(super) struct PublishedPortReservation {
+    pub(super) port: u16,
+    _tcp: [TcpListener; 2],
+    _udp: [UdpSocket; 2],
+}
+
+impl PublishedPortReservation {
+    pub(super) fn new() -> io::Result<Self> {
+        const PORT_ATTEMPTS: usize = 16;
+        let mut port = 0;
+        for _ in 1..PORT_ATTEMPTS {
+            match Self::bind(port) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    // Windows allocates ephemeral ports in sequence, including excluded ranges
+                    // in other families or transports.
+                    let random = RandomState::new().hash_one(());
+                    port = u16::try_from(20_000 + random % 40_000).unwrap_or(0);
+                }
+                result => return result,
+            }
+        }
+        Self::bind(port)
+    }
+
+    fn bind(port: u16) -> io::Result<Self> {
+        let tcp4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+        let port = tcp4.local_addr()?.port();
+        Ok(Self {
+            port,
+            _tcp: [tcp4, TcpListener::bind((Ipv6Addr::LOCALHOST, port))?],
+            _udp: [
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, port))?,
+                UdpSocket::bind((Ipv6Addr::LOCALHOST, port))?,
+            ],
+        })
+    }
+}
 
 pub(super) struct HostService {
     port: u16,
@@ -223,6 +267,19 @@ pub(super) fn exercise_quic(suite: &super::Suite, allowed: &HostService) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_port_reserves_both_transports_on_both_families() -> Result<()> {
+        let reservation = PublishedPortReservation::new()?;
+        for address in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, reservation.port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, reservation.port)),
+        ] {
+            assert!(TcpListener::bind(address).is_err());
+            assert!(UdpSocket::bind(address).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn host_service_waits_for_requests_on_a_nonblocking_accepted_stream() -> Result<()> {

@@ -260,9 +260,9 @@ Guest package updates never change the kernel.
   another machine. It asks before applying the carried recipe, as setup does;
   without a terminal it prints the recipe and refuses, and `--trust-recipe`
   applies it without asking. Its `workload.mounts` and `env_file` resolve
-  against the importing project, so those paths must exist there first. The box
-  boots straight after an import. The first build after import checks the
-  local setup mount targets and asks for approval.
+  against the importing project, so those paths must exist there first. Import
+  leaves the box stopped. Run `terra <box>` to start it. The first build after
+  import checks the local setup mount targets and asks for approval.
   `prune` deletes images the recipe no longer names.
 
 Box state lives under `~/.terra/box/t-<project-slug>/<box>/`; the slug is a

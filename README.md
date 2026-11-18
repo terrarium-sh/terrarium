@@ -29,8 +29,8 @@ a short YAML recipe.
   one-off scripts run in a box. You can also publish a box's services on host
   loopback.
 - **Take a box to an air-gapped machine.** Set up the box where there is
-  network and export it to one file. Then import it offline: it boots with its
-  tools installed and downloads nothing.
+  network and export it to one file. On the offline machine, import the box,
+  then start it with its tools already installed.
   [Carry one over →](docs/usage.md#air-gapped-machines)
 
 ## Install

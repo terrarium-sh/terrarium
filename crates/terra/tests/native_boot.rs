@@ -10,6 +10,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 struct BoxFixture {
+    name: &'static str,
     terra: PathBuf,
     project: PathBuf,
     home: PathBuf,
@@ -17,7 +18,7 @@ struct BoxFixture {
 }
 
 impl BoxFixture {
-    fn new() -> Self {
+    fn new(name: &'static str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
         let home = directory.path().join("home");
@@ -25,6 +26,7 @@ impl BoxFixture {
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(home.join(".terra")).unwrap();
         Self {
+            name,
             terra: std::env::var_os("TERRA_BIN")
                 .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from),
             project,
@@ -33,16 +35,24 @@ impl BoxFixture {
         }
     }
 
-    fn run(&self, arguments: &[&str]) -> (ExitStatus, String) {
-        let output = tempfile::NamedTempFile::new_in(self.directory.path()).unwrap();
-        let mut child = Command::new(&self.terra)
+    fn command(&self, target: &str, arguments: &[&str]) -> Command {
+        let mut command = Command::new(&self.terra);
+        command
             .arg("--project")
             .arg(&self.project)
+            .arg(target)
             .args(arguments)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn run(&self, target: &str, arguments: &[&str]) -> (ExitStatus, String) {
+        let output = tempfile::NamedTempFile::new_in(self.directory.path()).unwrap();
+        let mut child = self
+            .command(target, arguments)
             .stdout(output.as_file().try_clone().unwrap())
             .stderr(output.as_file().try_clone().unwrap())
             .spawn()
@@ -58,7 +68,7 @@ impl BoxFixture {
                 let diagnostics = self.diagnostics();
                 let cleanup = self.force_remove();
                 panic!(
-                    "terra {arguments:?} timed out:\n{}\nguest diagnostics:\n{diagnostics}\ncleanup:\n{cleanup}",
+                    "terra {target} {arguments:?} timed out:\n{}\nguest diagnostics:\n{diagnostics}\ncleanup:\n{cleanup}",
                     std::fs::read_to_string(output.path()).unwrap(),
                 );
             }
@@ -66,25 +76,26 @@ impl BoxFixture {
         }
     }
 
-    fn diagnostics(&self) -> String {
+    fn state_dir(&self) -> Option<PathBuf> {
         std::fs::read_dir(self.home.join(".terra/box"))
             .into_iter()
             .flatten()
             .flatten()
-            .map(|project| project.path().join("native/runtime-logs/diagnostics.log"))
-            .filter_map(|path| std::fs::read_to_string(path).ok())
-            .collect()
+            .map(|project| project.path().join(self.name))
+            .find(|directory| directory.is_dir())
+    }
+
+    fn diagnostics(&self) -> String {
+        self.state_dir()
+            .and_then(|directory| {
+                std::fs::read_to_string(directory.join("runtime-logs/diagnostics.log")).ok()
+            })
+            .unwrap_or_default()
     }
 
     fn force_remove(&self) -> String {
-        let output = Command::new(&self.terra)
-            .args(["native", "rm", "--force", "-t", "0"])
-            .arg("--project")
-            .arg(&self.project)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
+        let output = self
+            .command(self.name, &["rm", "--force", "-t", "0"])
             .output();
         match output {
             Ok(output) => format!(
@@ -96,12 +107,22 @@ impl BoxFixture {
         }
     }
 
+    fn setup(&self, recipe: &serde_json::Value) -> String {
+        let path = self.directory.path().join(format!("{}.yaml", self.name));
+        std::fs::write(&path, yaml_serde::to_string(recipe).unwrap()).unwrap();
+        self.require_success(path.to_str().unwrap(), &["setup"])
+    }
+
     fn successful(&self, arguments: &[&str]) -> String {
-        let (status, output) = self.run(arguments);
+        self.require_success(self.name, arguments)
+    }
+
+    fn require_success(&self, target: &str, arguments: &[&str]) -> String {
+        let (status, output) = self.run(target, arguments);
         if !status.success() {
-            let (_, mut diagnostics) = self.run(&["native", "logs"]);
+            let (_, mut diagnostics) = self.run(self.name, &["logs"]);
             diagnostics.push_str(&self.diagnostics());
-            panic!("terra {arguments:?}: {status}\n{output}\n{diagnostics}");
+            panic!("terra {target} {arguments:?}: {status}\n{output}\n{diagnostics}");
         }
         output
     }
@@ -109,21 +130,19 @@ impl BoxFixture {
 
 impl Drop for BoxFixture {
     fn drop(&mut self) {
-        let _ = self.run(&["stop", "-t", "5"]);
+        let _ = self.run(self.name, &["stop", "-t", "5"]);
     }
 }
 
 #[test]
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
-    let fixture = BoxFixture::new();
-    let recipe = fixture.directory.path().join("native.yaml");
+    let fixture = BoxFixture::new("bake");
     let recipe_json = serde_json::json!({
         "hw": {"cpus": 1, "mem_mib": 256},
         "setup": {"run": ["echo BAKE_STDOUT; echo BAKE_STDERR >&2"]}
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-    let output = fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+    let output = fixture.setup(&recipe_json);
     assert!(output.contains("BAKE_STDOUT"), "{output}");
     assert!(output.contains("BAKE_STDERR"), "{output}");
     let diagnostics = fixture.diagnostics();
@@ -143,17 +162,14 @@ fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_executes_shell() {
     for cpus in [1, 2] {
-        let fixture = BoxFixture::new();
-        let recipe = fixture.directory.path().join("native.yaml");
+        let fixture = BoxFixture::new("native");
         let recipe_json = serde_json::json!({
             "hw": {"cpus": cpus, "mem_mib": 256},
             "workload": {"run": "exec /bin/sleep 300"}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
-        fixture.successful(&["native", "-d"]);
+        fixture.setup(&recipe_json);
+        fixture.successful(&["-d"]);
         let output = fixture.successful(&[
-            "native",
             "exec",
             "--",
             "/bin/sh",
@@ -177,20 +193,19 @@ fn native_boot_executes_shell() {
             "{cpus}-CPU guest did not produce the shell marker:\n{output}\nguest diagnostics:\n{}",
             fixture.diagnostics()
         );
-        fixture.successful(&["native", "stop"]);
+        fixture.successful(&["stop"]);
     }
 }
 
 #[test]
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_shares_host_changes_between_running_boxes() {
-    let writer = BoxFixture::new();
-    let reader = BoxFixture::new();
+    let writer = BoxFixture::new("native");
+    let reader = BoxFixture::new("native");
     let shared = writer.directory.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     std::fs::write(shared.join("value"), "initial").unwrap();
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
-        let recipe = fixture.directory.path().join("native.yaml");
         let recipe_json = serde_json::json!({
             "hw": {"cpus": 2, "mem_mib": 256},
             "workload": {
@@ -198,12 +213,10 @@ fn native_boot_shares_host_changes_between_running_boxes() {
                 "run": "exec /bin/sleep 300"
             }
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
-        fixture.successful(&["native", "-d"]);
+        fixture.setup(&recipe_json);
+        fixture.successful(&["-d"]);
     }
     reader.successful(&[
-        "native",
         "exec",
         "--",
         "sh",
@@ -216,7 +229,6 @@ fn native_boot_shares_host_changes_between_running_boxes() {
         std::fs::rename(shared.join("replacement"), shared.join("value")).unwrap();
         std::fs::write(shared.join("new"), &value).unwrap();
         reader.successful(&[
-            "native",
             "exec",
             "--",
             "sh",
@@ -226,7 +238,6 @@ fn native_boot_shares_host_changes_between_running_boxes() {
             ),
         ]);
         writer.successful(&[
-            "native",
             "exec",
             "--",
             "sh",
@@ -234,7 +245,7 @@ fn native_boot_shares_host_changes_between_running_boxes() {
             "printf guest > /shared/value; rm /shared/new; sync",
         ]);
         reader.successful(&[
-            "native", "exec", "--", "sh", "-ec",
+            "exec", "--", "sh", "-ec",
             "test \"$(cat /shared/value)\" = guest; test ! -e /shared/new; if echo forbidden > /shared/value; then exit 1; fi",
         ]);
         assert_eq!(
@@ -243,9 +254,9 @@ fn native_boot_shares_host_changes_between_running_boxes() {
         );
         assert!(!shared.join("new").exists());
     }
-    writer.successful(&["native", "stop"]);
-    reader.successful(&["native", "exec", "--", "cat", "/shared/value"]);
-    reader.successful(&["native", "stop"]);
+    writer.successful(&["stop"]);
+    reader.successful(&["exec", "--", "cat", "/shared/value"]);
+    reader.successful(&["stop"]);
 }
 
 #[test]
@@ -261,7 +272,7 @@ fn native_boot_runs_rootless_podman_with_slirp4netns_on_a_private_disk() {
 }
 
 fn run_rootless_podman_on_a_private_disk(network: Option<&str>) {
-    let fixture = BoxFixture::new();
+    let fixture = BoxFixture::new("native");
     let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
     allowed.set_nonblocking(true).unwrap();
     let allowed_port = allowed.local_addr().unwrap().port();
@@ -273,7 +284,6 @@ fn run_rootless_podman_on_a_private_disk(network: Option<&str>) {
     std::fs::write(readonly.join("seed"), "HOST_SEED").unwrap();
     let large_body = vec![b'L'; 128 * 1024];
     std::fs::write(readonly.join("large"), &large_body).unwrap();
-    let recipe = fixture.directory.path().join("native.yaml");
     let packages = if network.is_some() {
         " slirp4netns"
     } else {
@@ -318,6 +328,7 @@ tar -C $d -cf /home/terri/rootfs.tar .
 rm -rf $d
 chown 1000:1000 /home/terri/rootfs.tar"
     );
+    let doas_denied = include_str!("../../../acceptance/guest/doas-denied.sh");
     let script = format!(
         r#"network_diagnostics() {{
 status=$?
@@ -389,7 +400,7 @@ test "$(podman exec rootless /bin/busybox cat /readonly/seed)" = HOST_SEED
 if podman exec rootless sh -c 'echo nope > /readonly/new-file'; then exit 1; fi
 podman stop rootless
 test "$container_id" = "$(podman ps -aq --filter name=rootless --filter status=exited)"
-if doas id -u; then exit 1; fi
+{doas_denied}
 echo ROOTLESS_PODMAN_OK"#
     );
     let recipe_json = serde_json::json!({
@@ -409,8 +420,7 @@ echo ROOTLESS_PODMAN_OK"#
             "run": format!("set -ex\n{script}")
         }
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-    fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+    fixture.setup(&recipe_json);
     for boot in 0..2 {
         let server = allowed.try_clone().unwrap();
         let response_body = large_body.clone();
@@ -418,7 +428,7 @@ echo ROOTLESS_PODMAN_OK"#
             serve_request(&server, b"HOST_NETWORK");
             serve_request(&server, &response_body);
         });
-        let output = fixture.successful(&["native", "--foreground"]);
+        let output = fixture.successful(&["--foreground"]);
         response.join().unwrap();
         assert!(output.contains("ROOTLESS_PODMAN_OK"), "{output}");
         assert_eq!(
@@ -432,7 +442,7 @@ echo ROOTLESS_PODMAN_OK"#
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock,
         "guest reached an ungranted host-loopback service"
     );
-    let logs = fixture.successful(&["native", "logs"]);
+    let logs = fixture.successful(&["logs"]);
     assert!(
         logs.contains("egress: blocked") && logs.contains("169.254.169.254"),
         "metadata denial absent from logs:\n{logs}"
@@ -473,23 +483,21 @@ fn serve_request(listener: &TcpListener, body: &[u8]) {
 #[test]
 #[ignore = "requires a release binary, a file-events probe or Zig, and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_forwards_shared_file_events() {
-    let writer = BoxFixture::new();
-    let reader = BoxFixture::new();
+    let writer = BoxFixture::new("native");
+    let reader = BoxFixture::new("native");
     let shared = writer.directory.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     let probe = shared.join("probe");
     prepare_file_events_probe(&probe);
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
-        let recipe = fixture.directory.path().join("native.yaml");
         let recipe_json = serde_json::json!({
             "workload": {
                 "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
                 "run": "exec /bin/sleep 300"
             }
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
-        fixture.successful(&["native", "-d"]);
+        fixture.setup(&recipe_json);
+        fixture.successful(&["-d"]);
     }
     std::fs::create_dir(shared.join("nested")).unwrap();
     for (index, (name, expected)) in [
@@ -508,11 +516,10 @@ fn native_boot_forwards_shared_file_events() {
             std::fs::write(shared.join(name), "initial").unwrap();
         }
         let (parent, basename) = name.rsplit_once('/').unwrap_or(("", name));
-        reader.successful(&["native", "exec", "--", "rm", "-f", "/tmp/event-ready"]);
+        reader.successful(&["exec", "--", "rm", "-f", "/tmp/event-ready"]);
         std::thread::scope(|scope| {
             let probe = scope.spawn(|| {
                 reader.successful(&[
-                    "native",
                     "exec",
                     "--",
                     "/shared/probe",
@@ -522,7 +529,7 @@ fn native_boot_forwards_shared_file_events() {
                     expected,
                 ])
             });
-            reader.successful(&["native", "exec", "--", "sh", "-ec", "for i in $(seq 1 100); do test ! -e /tmp/event-ready || exit 0; sleep .1; done; exit 1"]);
+            reader.successful(&["exec", "--", "sh", "-ec", "for i in $(seq 1 100); do test ! -e /tmp/event-ready || exit 0; sleep .1; done; exit 1"]);
             match index {
                 0 | 3 | 5 => std::fs::write(shared.join(name), expected).unwrap(),
                 1 => {
@@ -553,8 +560,8 @@ fn native_boot_forwards_shared_file_events() {
         std::fs::read_to_string(shared.join("value")).unwrap(),
         "resumed"
     );
-    writer.successful(&["native", "stop"]);
-    reader.successful(&["native", "stop"]);
+    writer.successful(&["stop"]);
+    reader.successful(&["stop"]);
 }
 
 fn prepare_file_events_probe(probe: &std::path::Path) {
@@ -592,14 +599,7 @@ fn assert_guest_write_notifies_host(writer: &BoxFixture, shared: &std::path::Pat
     watcher
         .watch(shared, notify::RecursiveMode::Recursive)
         .unwrap();
-    writer.successful(&[
-        "native",
-        "exec",
-        "--",
-        "sh",
-        "-ec",
-        "printf guest > /shared/value",
-    ]);
+    writer.successful(&["exec", "--", "sh", "-ec", "printf guest > /shared/value"]);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let event = receiver
@@ -617,7 +617,7 @@ fn assert_guest_write_notifies_host(writer: &BoxFixture, shared: &std::path::Pat
 #[test]
 #[ignore = "requires a release binary, package downloads, and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_reloads_node_server_from_host_events() {
-    let fixture = BoxFixture::new();
+    let fixture = BoxFixture::new("native");
     let shared = fixture.directory.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     let script = |value| {
@@ -626,7 +626,6 @@ fn native_boot_reloads_node_server_from_host_events() {
         )
     };
     std::fs::write(shared.join("server.js"), script("initial")).unwrap();
-    let recipe = fixture.directory.path().join("native.yaml");
     let recipe_json = serde_json::json!({
         "network": {"mode": "unrestricted-public"},
         "setup": {"run": ["apk add --no-cache nodejs"]},
@@ -635,9 +634,8 @@ fn native_boot_reloads_node_server_from_host_events() {
             "run": "exec /usr/bin/node --watch /shared/server.js"
         }
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-    fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
-    fixture.successful(&["native", "-d"]);
+    fixture.setup(&recipe_json);
+    fixture.successful(&["-d"]);
     for value in ["initial", "edited", "replaced"] {
         if value == "edited" {
             std::fs::write(shared.join("server.js"), script(value)).unwrap();
@@ -645,9 +643,9 @@ fn native_boot_reloads_node_server_from_host_events() {
             std::fs::write(shared.join("replacement.js"), script(value)).unwrap();
             std::fs::rename(shared.join("replacement.js"), shared.join("server.js")).unwrap();
         }
-        fixture.successful(&["native", "exec", "--", "sh", "-ec", &format!("for i in $(seq 1 150); do if test \"$(wget -q -T 1 -O - http://127.0.0.1:3000/ || true)\" = {value}; then exit 0; fi; sleep .1; done; exit 1")]);
+        fixture.successful(&["exec", "--", "sh", "-ec", &format!("for i in $(seq 1 150); do if test \"$(wget -q -T 1 -O - http://127.0.0.1:3000/ || true)\" = {value}; then exit 0; fi; sleep .1; done; exit 1")]);
     }
-    fixture.successful(&["native", "stop"]);
+    fixture.successful(&["stop"]);
 }
 
 #[cfg(windows)]
@@ -807,21 +805,6 @@ impl Drop for WindowsNativeBoxGuard<'_> {
 }
 
 #[cfg(windows)]
-fn windows_box_state(fixture: &BoxFixture) -> PathBuf {
-    let boxes = std::fs::read_dir(fixture.home.join(".terra/box"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        boxes.len(),
-        1,
-        "fixture must own exactly one box: {boxes:?}"
-    );
-    boxes[0].join("native")
-}
-
-#[cfg(windows)]
 fn windows_box_pid(path: &std::path::Path) -> u32 {
     std::fs::read_to_string(path)
         .unwrap()
@@ -844,20 +827,18 @@ fn windows_ports_available(tcp_port: u16, udp_port: u16) -> bool {
 #[ignore = "requires bundled guest artifacts, native WHP, AppContainer, and PowerShell CIM"]
 fn windows_broker_and_supervisor_death_release_published_ports() {
     for kill_supervisor in [false, true] {
-        let fixture = BoxFixture::new();
+        let fixture = BoxFixture::new("native");
         let tcp_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let tcp_port = tcp_reservation.local_addr().unwrap().port();
         let udp_port = udp_reservation.local_addr().unwrap().port();
-        let recipe = fixture.directory.path().join("native.yaml");
         let recipe_json = serde_json::json!({
             "network": {"ports": [format!("{tcp_port}:8080/tcp"), format!("{udp_port}:8081/udp")]},
             "workload": {"run": "exec /bin/sleep 300"}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
-        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+        fixture.setup(&recipe_json);
         drop((tcp_reservation, udp_reservation));
-        fixture.successful(&["native", "-d"]);
+        fixture.successful(&["-d"]);
         assert!(
             TcpListener::bind(("127.0.0.1", tcp_port)).is_err(),
             "published TCP port is not held by the box"
@@ -867,7 +848,7 @@ fn windows_broker_and_supervisor_death_release_published_ports() {
             "published UDP port is not held by the box"
         );
 
-        let state = windows_box_state(&fixture);
+        let state = fixture.state_dir().unwrap();
         let supervisor_pid = windows_box_pid(&state.join("supervisor.pid"));
         let vm_pid = windows_box_pid(&state.join("host.pid"));
         let rows = windows_process_descendants(supervisor_pid);
@@ -925,7 +906,7 @@ fn windows_broker_and_supervisor_death_release_published_ports() {
             std::thread::sleep(Duration::from_millis(20));
         }
         if !kill_supervisor {
-            fixture.successful(&["native", "stop"]);
+            fixture.successful(&["stop"]);
             let stop_deadline = Instant::now() + Duration::from_secs(15);
             for process in &guard.processes {
                 process.wait_exited(stop_deadline);

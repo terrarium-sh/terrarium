@@ -10,6 +10,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
+$isWindowsHost = $env:OS -eq "Windows_NT"
+$curl = if ($isWindowsHost) { "curl.exe" } else { "curl" }
 $boxes = "probe", "setup-mounts", "setup-workdir", "setup-bad-workdir", "nested-mounts", "isolated", "offline", "podman", "wireguard", "readonly", "overlay", "bad-bake", "rebuild"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
@@ -24,7 +26,9 @@ if (-not $Suite -and $PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSSc
 # A release or git build reports <version>+<hash>; a build outside a git checkout
 # reports only the crate version, which names no release.
 function Get-TerraVersion {
-    $version = ((& $Terra --version) -split " ")[1]
+    $output = & $Terra --version
+    if ($LASTEXITCODE -ne 0) { throw "terra --version exited $LASTEXITCODE" }
+    $version = ($output -split " ")[1]
     if ($version -match "\+") { $version -replace "\+.*", "" } else { "dev" }
 }
 
@@ -49,7 +53,6 @@ if (-not $Suite) {
     New-Item -ItemType Directory -Path (Join-Path $download "suite") | Out-Null
     try {
         $base = "https://github.com/$repo/releases/download/v$version"
-        $curl = if ($env:OS -eq "Windows_NT") { "curl.exe" } else { "curl" }
         $sums = Join-Path $download "SHA256SUMS"
         $archive = Join-Path $download "suite.tar.gz"
         & $curl -fsSL --proto "=https" --tlsv1.2 "$base/SHA256SUMS" -o $sums
@@ -176,6 +179,10 @@ function Assert-Listed($Name, $State) {
     Assert-Contains (Get-TerraOutput @("ls", "--state", $State, "--quiet")) $Name
 }
 
+function Assert-Unlisted($Name) {
+    if ((Get-TerraOutput @("ls", "--quiet")) -split "`n" -contains $Name) { throw "$Name is still listed" }
+}
+
 function Read-Text($Path) {
     [IO.File]::ReadAllText((Join-Path $project $Path))
 }
@@ -188,14 +195,14 @@ function Get-FileSha256($Path) {
     Get-Sha256 (Join-Path $project $Path)
 }
 
-function Read-Http($Port, $Attempts) {
-    for ($attempt = 1; ; $attempt++) {
-        try {
-            return (New-Object Net.WebClient).DownloadString("http://127.0.0.1:$Port/")
-        } catch {
-            if ($attempt -ge $Attempts) { Write-Note "$_"; throw }
-            Start-Sleep -Seconds 1
-        }
+function Read-Http($Port, $Retries) {
+    $ErrorActionPreference = "Continue"
+    for ($attempt = 0; ; $attempt++) {
+        $response = (& $curl -fsS --max-time 5 "http://127.0.0.1:$Port/" 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        if ($LASTEXITCODE -eq 0) { return $response }
+        Write-Note $response
+        if ($attempt -ge $Retries) { throw "could not read HTTP response from port $Port" }
+        Start-Sleep -Seconds 1
     }
 }
 
@@ -214,6 +221,11 @@ try {
     Write-Text "work/host" "HOST_SEED"
     Write-Text "work/host-update" "INITIAL"
     Write-Text "readonly/seed" "READ_ONLY"
+    Write-Text "work/host-run" "#!/bin/sh`necho HOST_EXECUTABLE`n"
+    if (-not $isWindowsHost) {
+        chmod 755 (Join-Path $project "work/host-run")
+        if ($LASTEXITCODE -ne 0) { throw "could not make work/host-run executable" }
+    }
     # Below every OS's ephemeral range, so no outgoing connection already holds the port.
     $allowedPort = Get-Random -Minimum 20000 -Maximum 32000
     $deniedPort = $allowedPort + 1
@@ -248,12 +260,16 @@ try {
     Assert-Equal (Read-Text "work/daemon") "DAEMON"
     Invoke-Terra @("setup-mounts", "stop")
     Assert-Equal (Read-Text "work/pre-stop") "PRE_STOP"
+    Move-Item -LiteralPath (Join-Path $project "setup-work") -Destination (Join-Path $work "previous-setup-work")
+    $shown = Get-TerraOutput @("setup-mounts", "show", "--json") | ConvertFrom-Json
+    $suiteMount = $shown.setup.mounts | Where-Object { $_.guest -ceq "/work" }
+    Assert-Equal $suiteMount.host (Join-Path $project "suite")
+    if ($suiteMount.readonly -isnot [bool] -or -not $suiteMount.readonly) { throw "expected a read-only setup mount at /work" }
     Complete-Step
 
     Start-Step "storage import defers setup sources and local approval"
     $setupArtifact = Join-Path $work "setup-mounts.terra"
     Invoke-Terra @("setup-mounts", "storage", "export", $setupArtifact)
-    Move-Item -LiteralPath (Join-Path $project "setup-work") -Destination (Join-Path $work "previous-setup-work")
     Invoke-Terra @("setup-mounts", "storage", "import", "--trust-recipe", $setupArtifact)
     Invoke-Terra @("setup-mounts", "setup", "--dry-run")
     Invoke-Terra @("setup-mounts", "-d")
@@ -278,6 +294,7 @@ try {
     $failed = Get-TerraOutput @("./nested-mounts.yaml", "setup") -Fails
     Assert-Contains $failed "overlap in setup"
     Assert-Contains $failed "mount at separate paths"
+    Assert-Unlisted "nested-mounts"
     Complete-Step
 
     Start-Step "a detached box runs on_start commands, daemons and its workload"
@@ -292,15 +309,16 @@ try {
     Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--root", "--", "id", "-u")) "0"
     Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--", "hostname")) "probe"
     Invoke-Terra @("probe", "exec", "--no-tty", "--env", "PROBE=exec-value", "--workdir", "/tmp", "--",
-        "sh", "-ec", 'test $PROBE = exec-value; test $(pwd) = /tmp')
+        "sh", "-ec", 'test $PROBE = exec-value; current_workdir=$(pwd); test $current_workdir = /tmp')
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "exit 7") -ExitCode 7
     $ErrorActionPreference = "Continue"
     $stdout = (& $Terra probe exec --no-tty "--" sh -c 'echo out; echo err >&2' 2>$null) -join "`n"
     $ErrorActionPreference = "Stop"
+    if ($LASTEXITCODE -ne 0) { throw "exec stream check exited $LASTEXITCODE" }
     Assert-Equal $stdout "out"
     Assert-Contains (Get-TerraOutput @("probe", "exec", "--no-tty", "--", "sh", "-c", 'echo out; echo err >&2')) "err"
     Assert-Contains (Get-TerraOutput @("probe", "exec", "--tty", "--",
-        "sh", "-c", 'test -t 0; test -t 1; echo TTY_OK')) "TTY_OK"
+        "sh", "-ec", 'test -t 0; test -t 1; echo TTY_OK')) "TTY_OK"
     Complete-Step
 
     Start-Step "the guest runs containers: namespaces, cgroups, overlayfs"
@@ -315,6 +333,7 @@ try {
 
     Start-Step "shares: read-write, read-only, links"
     Invoke-GuestCheck "shares.sh"
+    Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--", "/work/host-run")) "HOST_EXECUTABLE"
     Assert-Equal (Read-Text "work/host") "linked"
     Assert-Equal (Read-Text "work/after") "renamed"
     Assert-Equal ((Get-ChildItem -Force -LiteralPath (Join-Path $project "readonly")).Name -join " ") "seed"
@@ -344,12 +363,12 @@ try {
     Invoke-Terra @("probe", "sync", "--delete", "--checksum", "./sync-source/", ":/tmp/synced/")
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "test ! -e /tmp/synced/extra")
     Invoke-Terra @("probe", "sync", "./sync-source/", ":/tmp/owned/deep/")
-    Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", 'test $(stat -c %u /tmp/owned) = $(id -u)')
+    Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-ec", 'owner=$(stat -c %u /tmp/owned); user=$(id -u); test $owner = $user')
     Complete-Step
 
     Start-Step "network: published ports, allowlist, local DNS, denial"
     Assert-Equal (Read-Http $allowedPort 60) "GUEST_NETWORK"
-    Assert-Equal (Read-Http $deniedPort 5) "DENIED_ROUTE"
+    Assert-Equal (Read-Http $deniedPort 0) "DENIED_ROUTE"
     Assert-Contains (Get-TerraOutput @("probe", "exec", "--no-tty",
         "--env", "ALLOWED_PORT=$allowedPort", "--env", "DENIED_PORT=$deniedPort",
         "--", "sh", "-e", "/suite/guest/network.sh")) "NETWORK_OK"
@@ -489,7 +508,7 @@ try {
     Invoke-Terra @("probe", "rm")
     Assert-Listed "probe" "not_created"
     Invoke-Terra @("probe", "rm", "--purge")
-    if ((Get-TerraOutput @("ls", "--quiet")) -split "`n" -contains "probe") { throw "probe is still listed" }
+    Assert-Unlisted "probe"
     Complete-Step
 
     Write-Host "terra $version works on this machine"

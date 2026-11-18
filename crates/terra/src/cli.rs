@@ -415,9 +415,8 @@ pub enum StorageCmd {
     /// The recipe's inline `env:` values travel with it; its `env_file` does
     /// not. The box must be set up, and must not be running.
     Export(StorageFileArgs),
-    /// Replace the box's recipe and images with those in a file `export`
-    /// wrote, creating the box if it does not exist. The box boots straight
-    /// after an import, and must not be running.
+    /// Restore an exported recipe and images into a stopped or new box.
+    /// Import leaves the box stopped. Run `terra <box>` to start it.
     ///
     /// The recipe is applied like any other from outside the project: it is put
     /// to you first.

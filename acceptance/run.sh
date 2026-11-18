@@ -31,7 +31,8 @@ fi
 # A release or git build reports <version>+<hash>; a build outside a git checkout
 # reports only the crate version, which names no release.
 terra_version() {
-  version=$("$terra" --version | cut -d' ' -f2)
+  version_text=$("$terra" --version) || return $?
+  version=$(printf '%s\n' "$version_text" | cut -d' ' -f2) || return $?
   case "$version" in
     *+*) echo "${version%%+*}" ;;
     *) echo dev ;;
@@ -40,10 +41,11 @@ terra_version() {
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum < "$1" | cut -d' ' -f1
+    checksum=$(sha256sum < "$1") || return $?
   else
-    shasum -a 256 < "$1" | cut -d' ' -f1
+    checksum=$(shasum -a 256 < "$1") || return $?
   fi
+  printf '%s\n' "${checksum%% *}"
 }
 
 # --- Without a suite: hand over to the runner of the release terra reports,
@@ -61,7 +63,7 @@ if [ -z "$suite" ]; then
   curl -fsSL --proto '=https' --tlsv1.2 "$base/SHA256SUMS" -o "$download/SHA256SUMS"
   curl -fsSL --proto '=https' --tlsv1.2 "$base/terra-acceptance.tar.gz" -o "$download/suite.tar.gz"
   expected=$(awk '$2 == "terra-acceptance.tar.gz" { print $1 }' "$download/SHA256SUMS")
-  if [ -z "$expected" ] || [ "$(sha256 "$download/suite.tar.gz")" != "$expected" ]; then
+  if [ -z "$expected" ] || ! actual=$(sha256 "$download/suite.tar.gz") || [ "$actual" != "$expected" ]; then
     echo "terra-acceptance.tar.gz does not match the v$version SHA256SUMS - not running it" >&2
     exit 1
   fi
@@ -170,8 +172,8 @@ run() {
 output() {
   status=0
   "$terra" "$@" > "$work/output" 2>&1 || status=$?
-  cat "$work/output" >> "$log"
-  cat "$work/output"
+  cat "$work/output" >> "$log" || return $?
+  cat "$work/output" || return $?
   return "$status"
 }
 
@@ -189,6 +191,11 @@ expect() {
   [ "$1" = "$2" ] || { note "expected '$2', got '$1'"; return 1; }
 }
 
+expect_file() {
+  file_text=$(cat "$1" 2>> "$log") || return $?
+  expect "$file_text" "$2"
+}
+
 expect_contains() {
   case "$1" in
     *"$2"*) ;;
@@ -199,6 +206,14 @@ expect_contains() {
 expect_listed() {
   listed=$(output ls --state "$2" --quiet)
   expect_contains "$listed" "$1"
+}
+
+expect_unlisted() {
+  listed=$(output ls --quiet)
+  if printf '%s\n' "$listed" | grep -Fxq "$1"; then
+    note "$1 is still listed"
+    return 1
+  fi
 }
 
 # --- Steps.
@@ -232,7 +247,8 @@ begin "setup bakes the recipe, and again is a no-op"
 setup_output=$(output ./probe.yaml setup)
 expect_contains "$setup_output" BAKE_OK
 run probe setup
-expect_contains "$(output probe show --json --with-env-values)" recipe-value
+shown=$(output probe show --json --with-env-values)
+expect_contains "$shown" recipe-value
 passed
 
 begin "setup mounts: writable default, explicit read-only, phase isolation"
@@ -240,18 +256,23 @@ printf RUNTIME_ONLY > work/runtime-only-seed
 setup_output=$(output ./setup-mounts.yaml setup)
 expect_contains "$setup_output" SETUP_MOUNTS_OK
 test ! -e suite/forbidden
-expect "$(cat setup-work/setup-result)" SETUP_WROTE
+expect_file setup-work/setup-result SETUP_WROTE
 run setup-mounts -d
 run setup-mounts exec --no-tty -- sh -ec 'for i in $(seq 1 30); do [ -s /work/runtime-result ] && break; sleep 1; done; grep -qx RUNTIME_WROTE /work/runtime-result; test ! -e /work/guest/namespaces.sh; test ! -e /setup-only/setup-result; grep -qx SETUP_COPY /setup-output'
-expect "$(cat work/on-start)" ON_START
-expect "$(cat work/daemon)" DAEMON
+expect_file work/on-start ON_START
+expect_file work/daemon DAEMON
 run setup-mounts stop
-expect "$(cat work/pre-stop)" PRE_STOP
+expect_file work/pre-stop PRE_STOP
+mv setup-work "$work/previous-setup-work"
+shown=$(output setup-mounts show --json)
+setup_json=$(printf '%s\n' "$shown" | sed -n '/^  "setup": {/,/^  }/s/^ *//p')
+setup_json=$(printf '%s' "$setup_json" | tr -d '\n')
+physical_project=$(pwd -P)
+expect_contains "$setup_json" "\"host\": \"$physical_project/suite\",\"guest\": \"/work\",\"readonly\": true}"
 passed
 
 begin "storage import defers setup sources and local approval"
 run setup-mounts storage export "$work/setup-mounts.terra"
-mv setup-work "$work/previous-setup-work"
 run setup-mounts storage import --trust-recipe "$work/setup-mounts.terra"
 run setup-mounts setup --dry-run
 run setup-mounts -d
@@ -287,25 +308,34 @@ if failed=$(output ./nested-mounts.yaml setup); then
 fi
 expect_contains "$failed" "overlap in setup"
 expect_contains "$failed" "mount at separate paths"
+expect_unlisted nested-mounts
 passed
 
 begin "a detached box runs on_start commands, daemons and its workload"
 run probe -d
 guest_check exercise-ready.sh
-expect "$(cat work/ready)" recipe-value
+expect_file work/ready recipe-value
 expect_listed probe running
 passed
 
 begin "exec: user, root, hostname, env, workdir, status, streams"
-expect "$(output probe exec --no-tty -- id -u)" 1000
-expect "$(output probe exec --no-tty --root -- id -u)" 0
-expect "$(output probe exec --no-tty -- hostname)" probe
+user_id=$(output probe exec --no-tty -- id -u)
+expect "$user_id" 1000
+root_id=$(output probe exec --no-tty --root -- id -u)
+expect "$root_id" 0
+hostname=$(output probe exec --no-tty -- hostname)
+expect "$hostname" probe
 run probe exec --no-tty --env PROBE=exec-value --workdir /tmp -- \
-  sh -ec 'test "$PROBE" = exec-value; test "$(pwd)" = /tmp'
+  sh -ec 'test "$PROBE" = exec-value; current_workdir=$(pwd); test "$current_workdir" = /tmp'
 expect "$(exit_status probe exec --no-tty -- sh -c 'exit 7')" 7
-expect "$("$terra" probe exec --no-tty -- sh -c 'echo out; echo err >&2' 2> "$work/stderr")" out
-expect "$(cat "$work/stderr")" err
-expect_contains "$(output probe exec --tty -- sh -c 'test -t 0; test -t 1; echo TTY_OK')" TTY_OK
+streams_status=0
+"$terra" probe exec --no-tty -- sh -c 'echo out; echo err >&2' > "$work/stdout" 2> "$work/stderr" || streams_status=$?
+cat "$work/stdout" "$work/stderr" >> "$log"
+[ "$streams_status" -eq 0 ] || exit "$streams_status"
+expect_file "$work/stdout" out
+expect_file "$work/stderr" err
+tty_output=$(output probe exec --tty -- sh -ec 'test -t 0; test -t 1; echo TTY_OK')
+expect_contains "$tty_output" TTY_OK
 passed
 
 begin "the guest runs containers: namespaces, cgroups, overlayfs"
@@ -320,10 +350,12 @@ passed
 
 begin "shares: read-write, read-only, links"
 guest_check shares.sh
-run probe exec --no-tty -- sh -ec 'test "$(/work/host-run)" = HOST_EXECUTABLE'
-expect "$(cat work/host)" linked
-expect "$(cat work/after)" renamed
-expect "$(ls -A readonly)" seed
+host_run_output=$(output probe exec --no-tty -- /work/host-run)
+expect "$host_run_output" HOST_EXECUTABLE
+expect_file work/host linked
+expect_file work/after renamed
+readonly_entries=$(ls -A readonly 2>> "$log")
+expect "$readonly_entries" seed
 passed
 
 begin "shares: host edits reach the guest as file events"
@@ -343,32 +375,37 @@ printf first > sync-source/value
 run probe sync ./sync-source/ :/tmp/synced/
 run probe sync :/tmp/synced/ ./sync-back/
 cmp sync-source/nested/binary sync-back/nested/binary >> "$log" 2>&1
-expect "$(cat sync-back/value)" first
+expect_file sync-back/value first
 run probe exec --no-tty -- sh -c 'printf extra > /tmp/synced/extra'
 run probe sync --delete --checksum ./sync-source/ :/tmp/synced/
 run probe exec --no-tty -- sh -c 'test ! -e /tmp/synced/extra'
 run probe sync ./sync-source/ :/tmp/owned/deep/
-run probe exec --no-tty -- sh -c 'test $(stat -c %u /tmp/owned) = $(id -u)'
+run probe exec --no-tty -- sh -ec 'owner=$(stat -c %u /tmp/owned); user=$(id -u); test "$owner" = "$user"'
 passed
 
 begin "network: published ports, allowlist, local DNS, denial"
-expect "$(curl -fsS --retry 60 --retry-delay 1 --retry-all-errors --max-time 5 \
-  "http://127.0.0.1:$allowed_port/" 2>> "$log")" GUEST_NETWORK
-expect "$(curl -fsS --max-time 5 "http://127.0.0.1:$denied_port/" 2>> "$log")" DENIED_ROUTE
-expect_contains "$(output probe exec --no-tty \
+body=$(curl -fsS --retry 60 --retry-delay 1 --retry-all-errors --max-time 5 \
+  "http://127.0.0.1:$allowed_port/" 2>> "$log")
+expect "$body" GUEST_NETWORK
+body=$(curl -fsS --max-time 5 "http://127.0.0.1:$denied_port/" 2>> "$log")
+expect "$body" DENIED_ROUTE
+network_output=$(output probe exec --no-tty \
   --env "ALLOWED_PORT=$allowed_port" --env "DENIED_PORT=$denied_port" \
-  -- sh -e /suite/guest/network.sh)" NETWORK_OK
+  -- sh -e /suite/guest/network.sh)
+expect_contains "$network_output" NETWORK_OK
 passed
 
 begin "network: a box without an allowlist reaches nothing"
 run ./isolated.yaml setup
-expect_contains "$(output isolated --foreground)" ISOLATED_OK
+network_output=$(output isolated --foreground)
+expect_contains "$network_output" ISOLATED_OK
 passed
 
 begin "network: a box with networking off keeps loopback"
 run ./offline.yaml setup
 run offline -d
-expect_contains "$(output offline exec --no-tty -- sh -e /suite/guest/local-only.sh)" LOCAL_ONLY_OK
+network_output=$(output offline exec --no-tty -- sh -e /suite/guest/local-only.sh)
+expect_contains "$network_output" LOCAL_ONLY_OK
 run offline stop
 expect_listed offline stopped
 passed
@@ -377,16 +414,19 @@ begin "network: podman's published port reaches the host"
 run ./podman.yaml setup
 run podman -d
 run podman exec --no-tty -- sh -e /suite/guest/podman-publish.sh
-expect "$(curl -fsS --retry 30 --retry-delay 1 --retry-all-errors --max-time 5 \
-  "http://127.0.0.1:$podman_port/" 2>> "$log")" CONTAINER_NETWORK
+body=$(curl -fsS --retry 30 --retry-delay 1 --retry-all-errors --max-time 5 \
+  "http://127.0.0.1:$podman_port/" 2>> "$log")
+expect "$body" CONTAINER_NETWORK
 run podman stop
 passed
 
 begin "network: wireguard-go encrypts IPv4 and IPv6 through direct UDP sockets"
 run ./wireguard.yaml setup
 run wireguard -d
-expect_contains "$(output wireguard exec --no-tty -- sh -e /suite/guest/wireguard.sh)" WIREGUARD_UNPRIVILEGED_OK
-expect_contains "$(output wireguard exec --no-tty --root -- sh -e /suite/guest/wireguard.sh "$wireguard_port" "$wireguard_denied_port")" WIREGUARD_OK
+network_output=$(output wireguard exec --no-tty -- sh -e /suite/guest/wireguard.sh)
+expect_contains "$network_output" WIREGUARD_UNPRIVILEGED_OK
+network_output=$(output wireguard exec --no-tty --root -- sh -e /suite/guest/wireguard.sh "$wireguard_port" "$wireguard_denied_port")
+expect_contains "$network_output" WIREGUARD_OK
 run wireguard stop
 passed
 
@@ -395,14 +435,15 @@ run ./readonly.yaml setup
 run readonly -d
 workdir=$(output readonly exec --no-tty -- pwd)
 expect "$workdir" /prepared/deep
-expect_contains "$(output readonly exec --no-tty --root -- sh -c 'touch /etc/probe 2>&1; true')" \
-  "Read-only file system"
+touch_error=$(output readonly exec --no-tty --root -- sh -c 'touch /etc/probe 2>&1; true')
+expect_contains "$touch_error" "Read-only file system"
 run readonly exec --no-tty -- sh -ec 'echo KEPT > /kept/value; echo GONE > /scratch/value'
 run readonly stop
 run readonly -d
 workdir=$(output readonly exec --no-tty -- pwd)
 expect "$workdir" /prepared/deep
-expect "$(output readonly exec --no-tty -- cat /kept/value)" KEPT
+kept_value=$(output readonly exec --no-tty -- cat /kept/value)
+expect "$kept_value" KEPT
 run readonly exec --no-tty -- sh -ec 'test ! -e /scratch/value'
 run readonly stop
 passed
@@ -411,7 +452,8 @@ begin "a rootfs overlay makes a read-only root writable for one boot"
 run ./overlay.yaml setup
 run overlay -d
 run overlay exec --no-tty --root -- sh -ec 'echo CHANGED > /etc/overlay-probe'
-expect "$(output overlay exec --no-tty -- cat /etc/overlay-probe)" CHANGED
+overlay_value=$(output overlay exec --no-tty -- cat /etc/overlay-probe)
+expect "$overlay_value" CHANGED
 run overlay stop
 run overlay -d
 run overlay exec --no-tty -- sh -ec 'test ! -e /etc/overlay-probe'
@@ -421,7 +463,8 @@ passed
 begin "stop runs pre_stop and keeps the box"
 run probe stop
 expect_listed probe stopped
-expect "$(tr '\n' ' ' < work/hooks)" "start stop "
+hooks=$(tr '\n' ' ' 2>> "$log" < work/hooks)
+expect "$hooks" "start stop "
 passed
 
 begin "storage: inspect, export, persist, import"
@@ -432,9 +475,11 @@ run probe storage export "$work/storage.terra"
 test -s "$work/storage.terra"
 run probe storage prune
 run probe -d
-expect_contains "$(output probe exec --no-tty --root -- sh -e /suite/guest/storage-restart.sh)" RESTART_OK
+restart_output=$(output probe exec --no-tty --root -- sh -e /suite/guest/storage-restart.sh)
+expect_contains "$restart_output" RESTART_OK
 run probe stop
-expect "$(tr '\n' ' ' < work/hooks)" "start stop start stop "
+hooks=$(tr '\n' ' ' 2>> "$log" < work/hooks)
+expect "$hooks" "start stop start stop "
 if refused=$(output probe storage import "$work/storage.terra"); then
   note "import without --trust-recipe succeeded"
   false
@@ -443,17 +488,20 @@ expect_contains "$refused" gate.test
 expect_contains "$refused" --trust-recipe
 run probe storage import --trust-recipe "$work/storage.terra"
 run probe -d
-expect_contains "$(output probe exec --no-tty -- \
-  sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
+restore_output=$(output probe exec --no-tty -- \
+  sh -ec 'value=$(cat /data/value); test "$value" = PERSISTED; echo RESTORED_OK')
+expect_contains "$restore_output" RESTORED_OK
 run probe stop
 imported="$work/imported"
 mkdir -p "$imported/work" "$imported/readonly"
 cp -R "$project/suite" "$imported/suite"
 run --project "$imported" probe storage import --trust-recipe "$work/storage.terra"
-expect_contains "$(output --project "$imported" ls --state stopped --quiet)" probe
+listed=$(output --project "$imported" ls --state stopped --quiet)
+expect_contains "$listed" probe
 run --project "$imported" probe -d
-expect_contains "$(output --project "$imported" probe exec --no-tty -- \
-  sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
+restore_output=$(output --project "$imported" probe exec --no-tty -- \
+  sh -ec 'value=$(cat /data/value); test "$value" = PERSISTED; echo RESTORED_OK')
+expect_contains "$restore_output" RESTORED_OK
 run --project "$imported" probe stop
 passed
 
@@ -468,7 +516,8 @@ if bake=$(output ./bad-bake.yaml setup); then
   false
 fi
 expect_contains "$bake" FAILED_BAKE
-expect_contains "$(output bad-bake logs --diagnostics)" "init failed"
+diagnostics=$(output bad-bake logs --diagnostics)
+expect_contains "$diagnostics" "init failed"
 expect_listed bad-bake needs_setup
 passed
 
@@ -503,9 +552,7 @@ begin "rm discards the box, --purge forgets it"
 run probe rm
 expect_listed probe not_created
 run probe rm --purge
-case " $(output ls --quiet | tr '\n' ' ') " in
-  *" probe "*) note "probe is still listed"; false ;;
-esac
+expect_unlisted probe
 passed
 
 echo "terra $version works on this machine"

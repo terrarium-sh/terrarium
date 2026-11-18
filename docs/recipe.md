@@ -98,8 +98,9 @@ behind.
 `terra <box> storage prune` removes images no longer named by the recipe;
 `setup --rebuild` does too.
 `terra <box> storage export` writes the applied recipe, including inline `env:`
-values, and the images; `storage import` asks before applying that recipe
-(`--trust-recipe` skips the question), and the box boots straight after it.
+values, and the images. `storage import` asks before applying that recipe
+(`--trust-recipe` skips the question). Import leaves the box stopped and ready
+to start with `terra <box>`.
 The imported recipe's `workload.mounts` and `env_file` resolve against the
 importing project, so those paths must exist there. The first build after
 import checks the local `setup.mounts` targets and asks for approval.
