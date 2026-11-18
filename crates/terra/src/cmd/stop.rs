@@ -300,7 +300,7 @@ mod tests {
         let lock = bx.lock_run().unwrap();
         let marked = BoxRef::mark_setting_up(&lock).unwrap();
         let mut child = sys::build_test_child_command().spawn().unwrap();
-        BoxRef::publish_pid(&lock, child.id(), PlanMode::Create).unwrap();
+        BoxRef::publish_pid(&lock, child.id(), PlanMode::Setup).unwrap();
         assert_matches!(bx.get_holder().unwrap(), Holder::SettingUp);
         let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
             .expect_err("stop must leave setup running");

@@ -173,9 +173,12 @@ impl BoxRef {
             std::io::Error::other(format!("reading start identity for pid {pid}"))
         })?;
         let mut line = format!("{pid} {process_identity}");
-        if mode == PlanMode::Create {
-            line.push(' ');
-            line.push_str(SETUP_MARK);
+        match mode {
+            PlanMode::Setup => {
+                line.push(' ');
+                line.push_str(SETUP_MARK);
+            }
+            PlanMode::Run => {}
         }
         Self::rewrite_lock_line(lock, &line)
     }
@@ -447,7 +450,7 @@ mod tests {
             crate::sys::read_process_start_time(std::process::id()),
             "the start identity is read from the host and round-trips"
         );
-        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Create).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Setup).unwrap();
         let marked = b.read_vm_process().unwrap();
         assert_eq!(
             marked.pid,
@@ -486,7 +489,7 @@ mod tests {
             None,
             "a setup marks the box before it has a pid"
         );
-        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Create).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Setup).unwrap();
         assert_eq!(b.get_holder().unwrap(), Holder::SettingUp);
         assert_eq!(
             b.read_vm_process().map(|vm| vm.pid),
@@ -639,7 +642,7 @@ mod tests {
         let before = identity(&b.get_dir().join(PID_FILE));
 
         // Longer, then shorter than what it replaced - no tail may survive.
-        BoxRef::publish_pid(&held, std::process::id(), PlanMode::Create).unwrap();
+        BoxRef::publish_pid(&held, std::process::id(), PlanMode::Setup).unwrap();
         BoxRef::publish_pid(&held, std::process::id(), PlanMode::Run).unwrap();
         #[cfg(unix)]
         assert_eq!(

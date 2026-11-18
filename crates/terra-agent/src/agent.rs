@@ -71,14 +71,21 @@ impl Agent {
 
     pub(crate) async fn setup(&self, plan: &Plan, clients: mpsc::Receiver<File>) -> Result<i32> {
         self.prepare_guest(plan).await?;
-        crate::mounts::mount_volumes(plan)?;
         // A setup boot never starts the workload, so sync and exec are refused from the start.
         let console = self
             .start_console(plan, clients, StartupState::Refused)
             .await?;
+        if let Err(error) =
+            crate::mounts::mount_shares_and_volumes(plan).and_then(|()| enter_setup_workdir(plan))
+        {
+            console
+                .say(&format!("terra-agent: setup failed: {error:#}"))
+                .await;
+            return console.exit(Err(error)).await;
+        }
         self.report_ready().await?;
-        let created = self.run_on_create(plan, &console).await.map(|()| 0);
-        console.exit(created).await
+        let outcome = self.run_setup(plan, &console).await.map(|()| 0);
+        console.exit(outcome).await
     }
 
     pub(crate) async fn run(&self, plan: &Plan, clients: mpsc::Receiver<File>) -> Result<i32> {
@@ -102,15 +109,11 @@ impl Agent {
         console.exit(outcome).await
     }
 
-    pub(crate) async fn close(self, outcome: &Result<i32>) {
+    pub(crate) async fn close(self) -> Diagnostics {
         self.shutdown.cancel();
         self.tasks.close();
         self.tasks.wait().await;
-        if let Err(error) = outcome {
-            self.diagnostic
-                .record(format!("terra-agent: init failed: {error:#}").as_bytes());
-        }
-        self.diagnostic.finish().await;
+        self.diagnostic
     }
 
     async fn report_ready(&self) -> Result<()> {
@@ -167,13 +170,12 @@ impl Agent {
         })
     }
 
-    async fn run_on_create(&self, plan: &Plan, console: &Console) -> Result<()> {
+    async fn run_setup(&self, plan: &Plan, console: &Console) -> Result<()> {
         self.diagnostic.record_boot_stage("hooks_start");
-        if !plan.on_create.is_empty() {
-            self.diagnostic.record(b"terra: baking on_create...\n");
+        if !plan.setup.is_empty() {
+            self.diagnostic.record(b"terra: running setup...\n");
         }
-        console.run_hooks(&plan.on_create, &self.stop).await?;
-        write_persistent_state(plan)?;
+        console.run_hooks(&plan.setup, &self.stop).await?;
         self.diagnostic.record_boot_stage("workload_ready");
         Ok(())
     }
@@ -314,16 +316,11 @@ fn restrict_ptrace() {
     }
 }
 
-/// Creates what the recipe names in the root image; a run boot only finds it there.
-fn write_persistent_state(plan: &Plan) -> Result<()> {
-    terra_protocol::guest_root::link_per_boot_files(Path::new("/"))
-        .context("restoring the per-boot links on_create replaced")?;
-    crate::mounts::prepare_mount_points(plan)?;
-    if let Some(workdir) = &plan.workdir {
-        crate::sync::ensure_directory(Path::new(workdir), GuestUser::Workload)
-            .with_context(|| format!("creating workdir {workdir}"))?;
-    }
-    Ok(())
+fn enter_setup_workdir(plan: &Plan) -> Result<()> {
+    let workdir = plan.workdir.as_deref().unwrap_or("/");
+    crate::sync::ensure_directory(Path::new(workdir), GuestUser::Root)
+        .with_context(|| format!("creating setup workdir {workdir}"))?;
+    std::env::set_current_dir(workdir).with_context(|| format!("entering setup workdir {workdir}"))
 }
 
 fn enter_workdir(plan: &Plan) -> Result<()> {
@@ -496,7 +493,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(event, Some(LifecycleEvent::AgentReady));
-        agent.close(&Ok(0)).await;
+        agent.close().await.finish().await;
     }
 
     /// Hook output, the agent's own lines and the exit reach a client in the order they were
@@ -552,7 +549,7 @@ mod tests {
             "hook\r\nlastagent line\r\n"
         );
         assert_eq!(code, 3);
-        agent.close(&Ok(0)).await;
+        agent.close().await.finish().await;
     }
 
     /// Console output already waiting on the terminal reaches an attached client as one frame,

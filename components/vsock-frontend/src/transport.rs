@@ -33,6 +33,11 @@ struct State {
     held_tx_completions: usize,
 }
 
+enum QueueSnapshot {
+    WithDescriptors(Vec<u8>),
+    RingsOnly(Vec<u8>),
+}
+
 struct QueueBatch {
     size: u16,
     used_ring: u64,
@@ -71,6 +76,7 @@ fn reset_transport(state: &mut State) {
     state.pending_rx = None;
     state.pending = [false; 2];
     state.held_tx_completions = 0;
+    super::network::reset();
     super::switch().reset_connections();
     super::wake_worker();
 }
@@ -95,6 +101,17 @@ fn new_state() -> State {
 }
 
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+pub(super) fn set_test_pending_reply(reply: Option<Reply>) {
+    *STATE.lock().unwrap() = reply.map(|reply| State {
+        mmio: MmioTransport::new(4096, 19, VIRTIO_F_VERSION_1, QUEUE_SIZE, Vec::new()),
+        next: [0; 2],
+        pending_rx: Some(reply),
+        pending: [false; 2],
+        held_tx_completions: 0,
+    });
+}
 
 terra_device_transport::device_error!(DeviceError);
 terra_device_transport::guest_memory!(DeviceError);
@@ -177,39 +194,15 @@ fn capture_queue_batch(
             len: 2,
         },
     ];
-    let (snapshot, has_descriptor_table) = match read_snapshot(&ranges) {
-        Ok(snapshot) => (snapshot, true),
+    let snapshot = match read_snapshot(&ranges) {
+        Ok(bytes) => QueueSnapshot::WithDescriptors(bytes),
         Err(DeviceError::Unmapped) => {
-            let mut metadata = read_snapshot(&[
-                memory::ReadRange {
-                    offset: ranges[0].offset,
-                    len: ranges[0].len,
-                },
-                memory::ReadRange {
-                    offset: ranges[2].offset,
-                    len: ranges[2].len,
-                },
-            ])?;
-            let available_bytes = 4 + usize::from(size) * 2;
-            if metadata.len() != available_bytes + 2 {
-                return Err(DeviceError::BadLen);
-            }
-            let index = [metadata[available_bytes], metadata[available_bytes + 1]];
-            metadata.truncate(available_bytes);
-            metadata.resize(
-                available_bytes + usize::from(size) * SPLIT_RING_DESCRIPTOR_BYTES,
-                0,
-            );
-            metadata.extend_from_slice(&index);
-            (metadata, false)
+            let [available_ring, _, used_index] = ranges;
+            QueueSnapshot::RingsOnly(read_snapshot(&[available_ring, used_index])?)
         }
         Err(error) => return Err(error),
     };
-    let mut batch = decode_queue_batch(next, available, size, max_steps, used_ring, snapshot)?;
-    if !has_descriptor_table {
-        batch.descriptor_table_offset = None;
-    }
-    Ok(Some(batch))
+    decode_queue_batch(next, available, size, max_steps, used_ring, snapshot).map(Some)
 }
 
 fn decode_queue_batch(
@@ -218,10 +211,17 @@ fn decode_queue_batch(
     size: u16,
     max_steps: usize,
     used_ring: u64,
-    snapshot: Vec<u8>,
+    snapshot: QueueSnapshot,
 ) -> Result<QueueBatch, DeviceError> {
     let available_bytes = 4 + usize::from(size) * 2;
-    let used_offset = available_bytes + usize::from(size) * SPLIT_RING_DESCRIPTOR_BYTES;
+    let (snapshot, descriptor_table_offset, used_offset) = match snapshot {
+        QueueSnapshot::WithDescriptors(bytes) => (
+            bytes,
+            Some(available_bytes),
+            available_bytes + usize::from(size) * SPLIT_RING_DESCRIPTOR_BYTES,
+        ),
+        QueueSnapshot::RingsOnly(bytes) => (bytes, None, available_bytes),
+    };
     if size == 0
         || size > QUEUE_SIZE
         || !size.is_power_of_two()
@@ -244,7 +244,7 @@ fn decode_queue_batch(
         used_ring,
         used_index: u16::from_le_bytes([snapshot[used_offset], snapshot[used_offset + 1]]),
         snapshot,
-        descriptor_table_offset: Some(available_bytes),
+        descriptor_table_offset,
         heads,
         completions: Vec::with_capacity(usize::from(head_count)),
         has_more: count > usize::from(head_count),
@@ -315,9 +315,9 @@ fn publish_batch(
     let flags = state
         .mmio
         .queue_addrs_for(queue)
-        .and_then(|(_, available_ring, _, _)| read_flags(available_ring, 2).ok())
-        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-        .map(u16::from_le_bytes);
+        .and_then(|(_, available_ring, _, _)| {
+            terra_device_transport::read_ring_index(available_ring, read_flags).ok()
+        });
     Ok(flags.is_none_or(|flags| flags & NO_INTERRUPT == 0))
 }
 
@@ -547,19 +547,13 @@ fn rearm_tx_notifications(
         return Ok(false);
     };
     if let Err(error) = write_memory(used_ring, &0_u16.to_le_bytes()) {
-        let flags = read_memory(used_ring, 2)
-            .ok()
-            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-            .map(u16::from_le_bytes);
+        let flags = terra_device_transport::read_ring_index(used_ring, &mut read_memory).ok();
         if flags.is_some_and(|flags| flags & NO_NOTIFY != 0) {
             return Err(error);
         }
     }
-    let available = u16::from_le_bytes(
-        read_memory(at(available_ring, 2)?, 2)?
-            .try_into()
-            .map_err(|_| DeviceError::BadLen)?,
-    );
+    let available =
+        terra_device_transport::read_ring_index(at(available_ring, 2)?, &mut read_memory)?;
     state.pending[TX] = resync_pending_queue_entries(&mut state.next[TX], available, size) != 0;
     Ok(state.pending[TX])
 }
@@ -776,7 +770,11 @@ mod tests {
         ]
     }
 
-    fn queue_snapshot(size: u16, available: u16, used: u16) -> Vec<u8> {
+    fn queue_snapshot(size: u16, available: u16, used: u16) -> QueueSnapshot {
+        QueueSnapshot::WithDescriptors(queue_snapshot_bytes(size, available, used))
+    }
+
+    fn queue_snapshot_bytes(size: u16, available: u16, used: u16) -> Vec<u8> {
         let available_bytes = 4 + usize::from(size) * 2;
         let used_offset = available_bytes + usize::from(size) * SPLIT_RING_DESCRIPTOR_BYTES;
         let mut bytes = vec![0; used_offset + 2];
@@ -951,7 +949,7 @@ mod tests {
                 },
                 |ranges| {
                     snapshots.push(ranges[0].offset);
-                    Ok(queue_snapshot(
+                    Ok(queue_snapshot_bytes(
                         8,
                         if ranges[0].offset == 0x5000 {
                             available
@@ -1279,7 +1277,7 @@ mod tests {
     fn queue_batch_observes_publication_before_metadata_and_excludes_late_heads() {
         let mut next = 0;
         let order = std::cell::RefCell::new(Vec::new());
-        let mut guest = queue_snapshot(8, 4, 7);
+        let mut guest = queue_snapshot_bytes(8, 4, 7);
         let batch = capture_queue_batch(
             &queue_mmio(8),
             RX,
@@ -1341,7 +1339,17 @@ mod tests {
             );
         }
         assert!(decode_queue_batch(&mut 0, 1, 8, 0, 0, queue_snapshot(8, 1, 0)).is_err());
-        assert!(decode_queue_batch(&mut 0, 1, 8, 32, 0, vec![0; 8]).is_err());
+        assert!(
+            decode_queue_batch(
+                &mut 0,
+                1,
+                8,
+                32,
+                0,
+                QueueSnapshot::WithDescriptors(vec![0; 8])
+            )
+            .is_err()
+        );
         let mut next = 0;
         let batch = decode_queue_batch(&mut next, 9, 8, 32, 0, queue_snapshot(8, 9, 0)).unwrap();
         assert_eq!(next, 9);
@@ -1365,7 +1373,7 @@ mod tests {
     #[test]
     fn unmapped_descriptor_table_keeps_valid_queue_metadata_recoverable() {
         let mut calls = 0;
-        let snapshot = queue_snapshot(8, 2, 6);
+        let snapshot = queue_snapshot_bytes(8, 2, 6);
         let mut batch = capture_queue_batch(
             &queue_mmio(8),
             RX,
@@ -1688,6 +1696,7 @@ mod tests {
     fn guest_status_reset_wakes_role_retirement_without_a_queue_bell() {
         use terra_vsock_device::{Role, VsockSwitch};
 
+        let _guard = crate::SWITCH_TEST.lock().unwrap();
         for bytes in [vec![0], 0_u32.to_le_bytes().to_vec()] {
             *super::super::switch() = VsockSwitch::new();
             for port in [

@@ -19,22 +19,24 @@ it wins.
 
    | Requirement | Recipe field |
    | --- | --- |
-   | What runs: a shell, an agent CLI, a server, a one-shot command | `workload`, `daemons` |
-   | Tools and packages | `hooks.on_create`, and their registries in `network.allow` |
-   | Host folders, and whether the box may write them | `mounts`, `readonly` |
+   | What runs: a shell, an agent CLI, a server, a one-shot command | `workload`, `workload.daemons` |
+   | Tools and packages | `setup.run`, and their registries in `network.allow` |
+   | Host folders used while preparing the box | `setup.mounts`, `readonly` |
+   | Host folders, and whether the box may write them | `workload.mounts`, `readonly` |
    | State that persists but stays off the host | `volumes` |
    | Hosts, APIs and host services it calls | `network.allow`, `network.hosts` |
    | Services the user opens from the host | `network.ports` |
    | Secrets and API keys | `env_file` |
    | CPU, memory, disk | `hw` |
-   | Root for named commands at runtime | `sudo` |
+   | Root for named commands at runtime | `workload.sudo` |
 
 2. **Write the recipe** with the reference below, and a `terra.yaml` naming it
    unless the user wants a single recipe set up by path (`terra ./box.yaml setup`).
 3. **Check it:** `terra <box> setup --dry-run` exits non-zero with the reason
-   when terra would refuse it. `terra <box> show` prints the resolved recipe.
-4. **Set it up:** `terra <box> setup` applies the recipe, builds the disk and runs
-   `on_create`, printing its output.
+   when terra would refuse it. `terra <box> show` prints the recipe, including
+   the setup mount declarations.
+4. **Set it up:** `terra <box> setup` applies the recipe, builds the disk and
+   runs `setup.run`, printing its output.
 5. **Smoke-test:** `terra <box> -d` starts it in the background; `terra <box>
    exec -- CMD` runs a check inside, such as a version or a test. `-d`
    returns before `on_start` finishes, so retry a check that depends on it.
@@ -51,15 +53,18 @@ it wins.
   Alpine package names (`build-base`, `python3`, `py3-pip`, `nodejs`, `npm`,
   `git`, `openssh-client`), which need `dl-cdn.alpinelinux.org:443`. glibc-only
   binaries need the `gcompat` package.
-- `on_create` installs system packages and global tools. Project dependencies
-  need the mount, so install them with `exec` or in the daemon or workload
-  that uses them.
-- A server the user opens from the host belongs in `daemons`, restarted when
+- `setup.run` installs system packages and global tools. For project files,
+  list the directory in `setup.mounts`; use `readonly: true` for inputs setup
+  only reads. Both mount lists default to read-write and apply only in their
+  own phase. After changing files setup consumes or retargeting a setup mount
+  source symlink, run `setup --rebuild`.
+- A server the user opens from the host belongs in `workload.daemons`, restarted when
   it fails, and must listen on `0.0.0.0`, as in
   `cd /work && npm install && exec npm run dev -- --host 0.0.0.0`. Through
   `ports`, a `127.0.0.1` listener is unreachable.
 - The workload, daemons and `exec` run as `terri` (UID 1000, home
-  `/home/terri`). Root is for hooks, `sudo` entries and `exec --root`.
+  `/home/terri`). Root is for setup, lifecycle commands, `workload.sudo` and
+  `exec --root`.
 - Size `hw` for the work. The 512 MiB default root filesystem holds little
   beyond Alpine; toolchains want `rootfs_mib: 4096` and `mem_mib: 2048` or more.
 - Mount the narrowest folder, `readonly: true` unless the box must write it.
@@ -98,18 +103,18 @@ nothing else should be reachable."
 hw:
   mem_mib: 2048
   rootfs_mib: 4096
-mounts:
-  - host: .
-    guest: /work
 network:
   allow:
     - dl-cdn.alpinelinux.org:443
     - pypi.org:443
     - files.pythonhosted.org:443
-hooks:
-  on_create: [apk add --no-cache python3 py3-pip]
+setup:
+  run: [apk add --no-cache python3 py3-pip]
 workload:
   workdir: /work
+  mounts:
+    - host: .
+      guest: /work
 ```
 
 `terra.yaml`:

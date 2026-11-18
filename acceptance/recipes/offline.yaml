@@ -1,5 +1,5 @@
 hw: {cpus: 1, mem_mib: 256}
 network: {enabled: false}
-mounts: [{host: ./suite, guest: /suite, readonly: true}]
 workload:
+  mounts: [{host: ./suite, guest: /suite, readonly: true}]
   run: while true; do sleep 60; done

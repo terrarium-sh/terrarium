@@ -49,10 +49,10 @@ fn validate_mounts_against_terra_paths(mounts: &[Mount], bx: &BoxRef) -> Result<
         }),
     ];
 
-    for m in mounts {
-        let host = canonicalize_existing_prefix(&m.host);
+    for mount in mounts {
+        let host = canonicalize_existing_prefix(&mount.host);
         for p in protected.iter().flatten() {
-            if m.readonly && !p.refuse_even_readonly {
+            if mount.readonly && !p.refuse_even_readonly {
                 continue;
             }
             if p.path.starts_with(&host) || host.starts_with(&p.path) {
@@ -62,7 +62,7 @@ fn validate_mounts_against_terra_paths(mounts: &[Mount], bx: &BoxRef) -> Result<
                      what it may reach, so this is refused.\n\
                      (share a subdirectory instead - `host: ./src` - or keep the \
                      whole box elsewhere: `terra --project <dir>`)",
-                    crate::render::escape_printable_path(&m.host),
+                    crate::render::escape_printable_path(&mount.host),
                     p.what_shared,
                     crate::render::escape_printable_path(&p.path),
                 );
@@ -72,25 +72,53 @@ fn validate_mounts_against_terra_paths(mounts: &[Mount], bx: &BoxRef) -> Result<
     Ok(())
 }
 
-pub(crate) fn resolve_mounts(recipe: &Recipe, bx: &BoxRef) -> Result<Vec<Mount>> {
-    let mut mounts = recipe.mounts.clone();
-    for m in &mut mounts {
-        m.host = std::fs::canonicalize(&m.host).with_context(|| {
+pub(crate) fn resolve_setup_mounts(recipe: &mut Recipe, bx: &BoxRef) -> Result<()> {
+    resolve_phase_mounts(&mut recipe.setup.mounts, bx)
+}
+
+pub(crate) fn resolve_workload_mounts(recipe: &mut Recipe, bx: &BoxRef) -> Result<()> {
+    resolve_phase_mounts(&mut recipe.workload.mounts, bx)
+}
+
+fn resolve_phase_mounts(mounts: &mut [Mount], bx: &BoxRef) -> Result<()> {
+    for mount in mounts.iter_mut() {
+        mount.host = std::fs::canonicalize(&mount.host).with_context(|| {
             format!(
                 "resolving mount host path '{}'",
-                crate::render::escape_printable_path(&m.host)
+                crate::render::escape_printable_path(&mount.host)
             )
         })?;
+        anyhow::ensure!(
+            mount.host.is_dir(),
+            "mount host '{}' must be a directory",
+            crate::render::escape_printable_path(&mount.host)
+        );
     }
-    validate_mounts_against_terra_paths(&mounts, bx)?;
-    Ok(mounts)
+    validate_mounts_against_terra_paths(mounts, bx)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SensitiveMount<'a> {
-    pub mount: &'a Mount,
-    pub sensitive_path: PathBuf,
+    pub phase: &'static str,
+    pub host: &'a Path,
+    pub readonly: bool,
     pub category: &'static str,
+}
+
+impl SensitiveMount<'_> {
+    pub(crate) fn warning(&self) -> String {
+        let access = if self.readonly {
+            "read-only"
+        } else {
+            "read-write"
+        };
+        format!(
+            "{} mount '{}' shares sensitive host {} ({access}) with the sandbox",
+            self.phase,
+            crate::render::escape_printable_path(self.host),
+            self.category
+        )
+    }
 }
 
 pub(crate) struct SensitiveTarget {
@@ -131,17 +159,18 @@ fn sensitive_targets() -> Vec<SensitiveTarget> {
 }
 
 pub(crate) fn find_sensitive_mounts_with_targets<'a>(
-    mounts: &'a [Mount],
+    mounts: impl IntoIterator<Item = (&'static str, &'a Path, bool)>,
     targets: &[SensitiveTarget],
 ) -> Vec<SensitiveMount<'a>> {
     let mut sensitive = Vec::new();
-    for m in mounts {
-        let host = canonicalize_existing_prefix(&m.host);
+    for (phase, mount, readonly) in mounts {
+        let host = canonicalize_existing_prefix(mount);
         for target in targets {
             if host.starts_with(&target.path) || target.path.starts_with(&host) {
                 sensitive.push(SensitiveMount {
-                    mount: m,
-                    sensitive_path: target.path.clone(),
+                    phase,
+                    host: mount,
+                    readonly,
                     category: target.category,
                 });
                 break;
@@ -151,14 +180,37 @@ pub(crate) fn find_sensitive_mounts_with_targets<'a>(
     sensitive
 }
 
-pub(crate) fn find_sensitive_mounts(mounts: &[Mount]) -> Vec<SensitiveMount<'_>> {
+#[derive(Clone, Copy)]
+pub(crate) enum GrantPhases {
+    SetupAndWorkload,
+    Workload,
+}
+
+pub(crate) fn find_sensitive_mounts(
+    recipe: &Recipe,
+    phases: GrantPhases,
+) -> Vec<SensitiveMount<'_>> {
+    let setup_mounts = match phases {
+        GrantPhases::SetupAndWorkload => recipe.setup.mounts.as_slice(),
+        GrantPhases::Workload => &[],
+    };
+    let mounts = setup_mounts
+        .iter()
+        .map(|mount| ("setup", mount.host.as_path(), mount.readonly))
+        .chain(
+            recipe
+                .workload
+                .mounts
+                .iter()
+                .map(|mount| ("workload", mount.host.as_path(), mount.readonly)),
+        );
     find_sensitive_mounts_with_targets(mounts, &sensitive_targets())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::resolve_env_file;
+    use crate::recipe::{Mount, resolve_env_file};
 
     fn resolve_box_ref(project_dir: &Path) -> BoxRef {
         BoxRef::resolve(project_dir, "dev").unwrap()
@@ -170,6 +222,12 @@ mod tests {
             guest: PathBuf::from("/work"),
             readonly,
         }]
+    }
+
+    fn paths(mounts: &[Mount]) -> impl Iterator<Item = (&'static str, &Path, bool)> {
+        mounts
+            .iter()
+            .map(|mount| ("workload", mount.host.as_path(), mount.readonly))
     }
 
     /// A mount containing the box's own state lets the guest rewrite what its
@@ -307,16 +365,19 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
 
         let recipe = || Recipe {
-            mounts: build_mounts(&project.join("share"), false),
+            workload: crate::recipe::Workload {
+                mounts: build_mounts(&project.join("share"), false),
+                ..crate::recipe::Workload::default()
+            },
             env_file: Some(project.join("env")),
             ..Recipe::default()
         };
         let mut approved = recipe();
-        approved.mounts = resolve_mounts(&approved, &bx).unwrap();
+        resolve_workload_mounts(&mut approved, &bx).unwrap();
         resolve_env_file(&mut approved).unwrap();
         std::fs::write(
             bx.get_dir().join(state::PINNED_PATHS_FILE),
-            yaml_serde::to_string(&state::PinnedPaths::from_recipe(&approved)).unwrap(),
+            yaml_serde::to_string(&state::PinnedPaths::new(&approved, Vec::new())).unwrap(),
         )
         .unwrap();
 
@@ -325,10 +386,10 @@ mod tests {
         std::fs::remove_file(project.join("env")).unwrap();
         crate::sys::symlink_file(private.join("env"), project.join("env")).unwrap();
         let mut changed = recipe();
-        changed.mounts = resolve_mounts(&changed, &bx).unwrap();
+        resolve_workload_mounts(&mut changed, &bx).unwrap();
         resolve_env_file(&mut changed).unwrap();
         let error = bx
-            .verify_pinned_paths(&state::PinnedPaths::from_recipe(&changed))
+            .verify_workload_pins(&changed)
             .expect_err("a changed target must not be granted")
             .to_string();
         assert!(error.contains("moved since the last setup"), "{error}");
@@ -353,6 +414,11 @@ mod tests {
             validate_mounts_against_terra_paths(&build_mounts(exe.parent().unwrap(), true), &b)
                 .is_ok()
         );
+        for readonly in [false, true] {
+            let mut recipe = Recipe::default();
+            recipe.setup.mounts = build_mounts(exe.parent().unwrap(), readonly);
+            assert_eq!(resolve_setup_mounts(&mut recipe, &b).is_ok(), readonly);
+        }
     }
 
     #[test]
@@ -394,24 +460,52 @@ mod tests {
             },
         ];
 
-        let sensitive = find_sensitive_mounts_with_targets(&mounts, &targets);
+        let sensitive = find_sensitive_mounts_with_targets(paths(&mounts), &targets);
         assert_eq!(sensitive.len(), 2);
-        assert_eq!(sensitive[0].mount.host, ssh_dir);
-        assert!(!sensitive[0].mount.readonly);
+        assert_eq!(sensitive[0].host, ssh_dir);
+        assert!(!sensitive[0].readonly);
         assert_eq!(sensitive[0].category, "SSH keys and configuration");
 
-        assert_eq!(sensitive[1].mount.host, id_rsa);
-        assert!(sensitive[1].mount.readonly);
+        assert_eq!(sensitive[1].host, id_rsa);
+        assert!(sensitive[1].readonly);
         assert_eq!(sensitive[1].category, "SSH keys and configuration");
     }
 
     #[test]
-    fn default_sensitive_targets_scans_mounts() {
-        let mounts = vec![Mount {
-            host: PathBuf::from("/tmp"),
-            guest: PathBuf::from("/work"),
-            readonly: false,
-        }];
-        assert_eq!(find_sensitive_mounts(&mounts), []);
+    fn sensitive_mount_warnings_cover_the_requested_phases() {
+        let home = crate::sys::TestHome::new();
+        let ssh_dir = home.get_path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let recipe = Recipe {
+            setup: crate::recipe::Setup {
+                mounts: vec![Mount {
+                    host: ssh_dir.clone(),
+                    guest: PathBuf::from("/setup"),
+                    readonly: false,
+                }],
+                ..crate::recipe::Setup::default()
+            },
+            workload: crate::recipe::Workload {
+                mounts: vec![Mount {
+                    host: ssh_dir.clone(),
+                    guest: PathBuf::from("/workload"),
+                    readonly: true,
+                }],
+                ..crate::recipe::Workload::default()
+            },
+            ..Recipe::default()
+        };
+        let sensitive = find_sensitive_mounts(&recipe, GrantPhases::SetupAndWorkload);
+        assert_eq!(sensitive.len(), 2);
+        assert_eq!(sensitive[0].phase, "setup");
+        assert_eq!(sensitive[0].host, ssh_dir);
+        assert!(!sensitive[0].readonly);
+        assert_eq!(sensitive[1].phase, "workload");
+        assert_eq!(sensitive[1].host, ssh_dir);
+        assert!(sensitive[1].readonly);
+        assert_eq!(
+            find_sensitive_mounts(&recipe, GrantPhases::Workload),
+            sensitive[1..]
+        );
     }
 }

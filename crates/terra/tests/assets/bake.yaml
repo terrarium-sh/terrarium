@@ -1,10 +1,9 @@
-# on_create runs once, on the fresh root: the same box booted twice must print
-# the same WHEN.
 hw: {rootfs_mib: 1024}
-hooks:
-  on_create:
+setup:
+  run:
+    - test "$(pwd)" = /
     - mkdir -p /opt/baked
-    - date +%s%N > /opt/baked/when
+    - cat /proc/sys/kernel/random/uuid > /opt/baked/id
 workload:
   run: |
-      echo "WHEN=$(cat /opt/baked/when)"
+      echo "BAKE_ID=$(cat /opt/baked/id)"

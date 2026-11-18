@@ -155,8 +155,12 @@
   mem_mib: 1024
 
 <span class="code-key">network:</span>
-  mode: unrestricted-public</code></pre><CopyButton text={() => recipeCode?.textContent?.trimEnd() ?? ''} label="Copy dev.yaml recipe" /></div>
-      <p>This recipe allows public network access.<br />Host files stay private until you share them.</p>
+  mode: unrestricted-public
+
+<span class="code-key">setup:</span>
+  run:
+    - apk add --no-cache git</code></pre><CopyButton text={() => recipeCode?.textContent?.trimEnd() ?? ''} label="Copy dev.yaml recipe" /></div>
+      <p>Setup installs Git. The box has public network access during setup and normal runs.<br />Host files stay private until you share them.</p>
     </div>
     <a class="recipe-link" href="https://github.com/terrarium-sh/terrarium_examples" target="_blank" rel="noopener noreferrer">Find a recipe for your project <span aria-hidden="true">↗</span></a>
   </div>

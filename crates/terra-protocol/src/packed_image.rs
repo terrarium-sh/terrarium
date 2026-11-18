@@ -4,7 +4,7 @@ use crate::guest_image::{GuestImage, MARKER_BYTES};
 use std::io;
 use std::ops::Range;
 
-const MAGIC: [u8; 8] = *b"TERRALZ\x02";
+const MAGIC: [u8; 8] = *b"TERRALZ\x01";
 const KERNEL_CHUNK_BYTES: u32 = 1024 * 1024;
 const BOOT_CHUNK_BYTES: u32 = 64 * 1024;
 
@@ -23,10 +23,10 @@ pub const fn chunk_bytes(kind: GuestImage) -> u32 {
     }
 }
 
-/// Whether `bytes` carries `kind`'s marker where a packed image does.
+/// Whether the packed image has the current container header and the expected guest marker.
 #[must_use]
 pub const fn has_marker(bytes: &[u8], kind: GuestImage) -> bool {
-    if bytes.len() < MARKER_RANGE.end {
+    if bytes.len() < MARKER_RANGE.end || !matches!(bytes.first_chunk(), Some(&MAGIC)) {
         return false;
     }
     let (_, rest) = bytes.split_at(MARKER_RANGE.start);
@@ -308,6 +308,7 @@ mod tests {
         for index in [0, MAGIC.len() - 1] {
             let mut bytes = packed.clone();
             bytes[index] ^= 1;
+            assert!(!has_marker(&bytes, GuestImage::Boot));
             assert_invalid(PackedImage::parse(&bytes, GuestImage::Boot));
         }
     }

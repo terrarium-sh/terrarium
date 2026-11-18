@@ -5,7 +5,8 @@ facts that matter for working here:
 
 - You run as {who}.
 - {rootfs}
-- {shares}
+- Only the `workload.mounts` listed below are shared with the host.
+  Everything else you write stays inside the sandbox.
 - Network egress is filtered (see Network below). When an address is
   unreachable, the egress policy - not an outage - is the likely reason.
 
@@ -23,11 +24,13 @@ The command this sandbox runs:
 What each option means from inside the sandbox:
 
 - `hw` - your resources; `rootfs_mib` caps the root filesystem, and
-  `rootfs_readonly: true` keeps its image unchanged after setup.
-- `mounts` - host directories shared into the sandbox: files under a `guest`
-  path are visible on the host at its `host` path, and vice versa. A
-  `readonly: true` mount rejects writes. Nothing outside these mounts reaches
-  the host filesystem.
+  `rootfs_readonly: true` prevents writes to its image.
+- `workload` - `mounts` are host directories shared into the sandbox during
+  normal runs: files under a `guest` path are visible on the host at its `host`
+  path, and vice versa. A `readonly: true` mount rejects writes. Nothing outside
+  these mounts reaches the host filesystem. `on_start` ran before your
+  workload, `pre_stop` runs on an orderly stop, and `daemons` are background
+  commands started with you.
 - `volumes` - bounded scratch disks: each an ext4 image of `size_mib`, mounted
   at its `guest` path. `lifetime: box` keeps its data across restarts of this
   box; `lifetime: boot` gives it an empty filesystem on every boot. A volume
@@ -35,12 +38,8 @@ What each option means from inside the sandbox:
   for one boot.
 - `env` - variable names exported to you. Values are deliberately not written
   into this file; read them from your environment.
-- `sudo` - the commands you may run as root via `doas` (or `sudo`). Every
-  other command is denied root.
-- `hooks` - `on_create` was baked into this filesystem once; `on_start` ran
-  before your workload; `pre_stop` runs on an orderly stop.
-- `daemons` - background commands started with you, restarted on failure until
-  the box stops.
+- `workload.sudo` - the commands you may run as root via `doas` (or `sudo`).
+  Every other command is denied root.
 - `network` - the egress policy (next section).
 
 ## Network

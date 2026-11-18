@@ -75,7 +75,7 @@ pub fn resolve_box(arg: Option<&str>, project_dir: &Path, existence: Existence) 
     };
     let bx = BoxRef::resolve(project_dir, &name)?;
     match existence {
-        Existence::MustExist if !is_applied(&bx) => Err(build_missing_box_error(
+        Existence::MustExist if !bx.has_applied_recipe() => Err(build_missing_box_error(
             project_dir,
             Some(bx.get_name()),
             manifest.as_ref(),
@@ -155,7 +155,7 @@ fn choose_named_source(
     manifest: Option<&Manifest>,
     purpose: Purpose<'_>,
 ) -> Result<Source> {
-    let is_applied = is_applied(bx);
+    let is_applied = bx.has_applied_recipe();
     let project_dir = bx.get_project_dir();
     match purpose {
         Purpose::Boot if !is_applied => Err(build_missing_box_error(
@@ -192,10 +192,6 @@ fn choose_named_source(
             }
         }
     }
-}
-
-fn is_applied(bx: &BoxRef) -> bool {
-    bx.get_dir().join(state::RECIPE_FILE).exists()
 }
 
 fn refuse_recipe_path(path: &str) -> anyhow::Error {
@@ -369,13 +365,13 @@ mod tests {
     #[test]
     fn a_bare_word_names_no_recipe_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pi-dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        assert_matches!(BoxArg::parse("pi-dev").unwrap(), BoxArg::Name(n) if n == "pi-dev");
-        assert!(read_recipe("pi-dev", dir.path()).unwrap().is_none());
-        let err = build_missing_recipe_error("pi-dev", "pi-dev", dir.path()).to_string();
+        std::fs::write(dir.path().join("example.yaml"), "hw:\n  cpus: 1\n").unwrap();
+        assert_matches!(BoxArg::parse("example").unwrap(), BoxArg::Name(n) if n == "example");
+        assert!(read_recipe("example", dir.path()).unwrap().is_none());
+        let err = build_missing_recipe_error("example", "example", dir.path()).to_string();
         assert!(err.contains("named by path"), "{err}");
         assert!(
-            err.contains("terra ./pi-dev.yaml setup"),
+            err.contains("terra ./example.yaml setup"),
             "the fix is spelled out: {err}"
         );
     }
@@ -383,8 +379,8 @@ mod tests {
     #[test]
     fn dotted_path_is_local() {
         let project = tempfile::tempdir().unwrap();
-        let p = resolve_recipe_path("./pi-dev.yaml", project.path()).unwrap();
-        assert_eq!(p, project.path().join("pi-dev.yaml"));
+        let p = resolve_recipe_path("./example.yaml", project.path()).unwrap();
+        assert_eq!(p, project.path().join("example.yaml"));
     }
 
     #[test]
@@ -465,7 +461,7 @@ mod tests {
     /// A `terra.yaml` reference is the manifest's, so it resolves beside the
     /// manifest - never against the shell's directory, which would give
     /// `terra --project` a different recipe per caller and make one name mean
-    /// two files. The same rule a relative `mounts[].host` follows.
+    /// two files. The same rule a relative `workload.mounts[].host` follows.
     #[test]
     fn a_manifest_reference_resolves_against_the_project_not_the_shell() {
         let dir = tempfile::tempdir().unwrap();

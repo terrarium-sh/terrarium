@@ -586,8 +586,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_agent_on_a_different_protocol_is_refused() {
-        const { assert!(protocol::AGENT_PROTOCOL_VERSION > 1) };
-        for version in [1, protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1)] {
+        let current = protocol::AGENT_PROTOCOL_VERSION;
+        for version in [current.wrapping_sub(1), current.wrapping_add(1)] {
             let home = crate::sys::TestHome::new();
             let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
             std::fs::create_dir_all(bx.get_dir()).unwrap();

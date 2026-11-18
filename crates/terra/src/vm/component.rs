@@ -19,8 +19,10 @@ use terra_runtime::{TrustedArtifact, TrustedArtifacts};
 
 macro_rules! embedded_artifact {
     ($variable:literal) => {{
-        static BYTES: &PageAligned<[u8]> = &PageAligned(*include_bytes!(env!($variable)));
-        TrustedArtifact::from_trusted_page_aligned(BYTES)
+        #[cfg_attr(target_os = "linux", unsafe(link_section = env!("TERRA_ARTIFACT_SECTION")))]
+        static BYTES: PageAligned<[u8; include_bytes!(env!($variable)).len()]> =
+            PageAligned(*include_bytes!(env!($variable)));
+        TrustedArtifact::from_trusted_page_aligned(&BYTES)
     }};
 }
 
@@ -54,18 +56,15 @@ fn prepare_vm_process(bx: &BoxRef, mode: PlanMode) -> Result<()> {
     #[cfg(unix)]
     super::resources::limit_vm_process()?;
     logs::init(bx)?;
-    if mode == PlanMode::Run {
-        sys::install_stop_signal_handlers();
+    match mode {
+        PlanMode::Run => sys::install_stop_signal_handlers(),
+        PlanMode::Setup => {}
     }
     Ok(())
 }
 
 fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
-    if spec.mode == PlanMode::Create {
-        return Ok(Vec::new());
-    }
-
-    let mounts = &spec.recipe.mounts;
+    let mounts = spec.active_mounts();
     let mut grants = Vec::with_capacity(mounts.len());
     for (index, mount) in mounts.iter().enumerate() {
         #[cfg(not(windows))]
@@ -132,37 +131,36 @@ pub async fn run(
         super::supervisor::AGENT_LISTENER_FD,
         crate::state::AGENT_SOCKET,
     )?);
-    let port_mappings = if spec.mode == PlanMode::Run {
-        rules::parse_port_mappings(&spec.recipe.network.ports)?
-    } else {
-        Vec::new()
+    let port_mappings = match spec.mode {
+        PlanMode::Run => rules::parse_port_mappings(&spec.recipe.network.ports)?,
+        PlanMode::Setup => Vec::new(),
     };
     let network_backend = prepare_network_backend(spec)?;
 
     log::info!(
         "terra: {} {bx} ({} vCPU, {} MiB)",
-        if spec.mode == PlanMode::Create {
-            "setting up"
-        } else {
-            "starting"
+        match spec.mode {
+            PlanMode::Setup => "setting up",
+            PlanMode::Run => "starting",
         },
         spec.recipe.hw.cpus,
         spec.recipe.hw.mem_mib
     );
     let diagnostics_path = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
     let diagnostics = Some(sys::create_regular_file(&diagnostics_path)?);
-    let control = if spec.mode == PlanMode::Run {
-        let (host, worker) = create_local_pair().context("creating the VM stop channel")?;
-        sys::register_stop_channel(host.try_clone()?);
-        let stop = claim_box_listener(
-            bx,
-            super::supervisor::CONTROL_LISTENER_FD,
-            crate::state::CONTROL_SOCKET,
-        )?;
-        relay_stop(stop, host);
-        Some(worker)
-    } else {
-        None
+    let control = match spec.mode {
+        PlanMode::Run => {
+            let (host, worker) = create_local_pair().context("creating the VM stop channel")?;
+            sys::register_stop_channel(host.try_clone()?);
+            let stop = claim_box_listener(
+                bx,
+                super::supervisor::CONTROL_LISTENER_FD,
+                crate::state::CONTROL_SOCKET,
+            )?;
+            relay_stop(stop, host);
+            Some(worker)
+        }
+        PlanMode::Setup => None,
     };
 
     if !spec.host_publishes_pid {
@@ -246,7 +244,7 @@ mod tests {
     use crate::recipe::{Mount, Recipe};
     use std::path::{Path, PathBuf};
 
-    /// Setup sees the same volumes a run does, so `on_create` writes land where the workload
+    /// Setup sees the same volumes a run does, so setup writes land where the workload
     /// reads them.
     #[test]
     fn setup_attaches_the_runs_volume_disks() {
@@ -264,7 +262,7 @@ mod tests {
             },
             project_dir: PathBuf::from("/project"),
             root: false,
-            mode: PlanMode::Create,
+            mode: PlanMode::Setup,
             foreground: false,
             host_publishes_pid: false,
             network_broker: None,
@@ -416,11 +414,14 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let spec = BootSpec {
             recipe: Recipe {
-                mounts: vec![Mount {
-                    host: root,
-                    guest: PathBuf::from("/work"),
-                    readonly: true,
-                }],
+                workload: crate::recipe::Workload {
+                    mounts: vec![Mount {
+                        host: root,
+                        guest: PathBuf::from("/work"),
+                        readonly: true,
+                    }],
+                    ..crate::recipe::Workload::default()
+                },
                 ..Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
@@ -451,11 +452,14 @@ mod tests {
         std::fs::create_dir(bx.get_dir()).unwrap();
         let spec = BootSpec {
             recipe: Recipe {
-                mounts: vec![Mount {
-                    host: share.clone(),
-                    guest: PathBuf::from("/data"),
-                    readonly: false,
-                }],
+                workload: crate::recipe::Workload {
+                    mounts: vec![Mount {
+                        host: share.clone(),
+                        guest: PathBuf::from("/data"),
+                        readonly: false,
+                    }],
+                    ..crate::recipe::Workload::default()
+                },
                 ..Recipe::default()
             },
             project_dir,
@@ -476,7 +480,7 @@ mod tests {
         let child = share.join("child");
         std::fs::create_dir(&child).unwrap();
         let mut spec = spec;
-        spec.recipe.mounts[0].host = child;
+        spec.recipe.workload.mounts[0].host = child;
         assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir_all(&share).unwrap();
         std::fs::create_dir(bx.get_dir().join("child")).unwrap();
@@ -484,24 +488,95 @@ mod tests {
         assert!(open_shares(&spec).is_err());
     }
 
+    /// Setup opens only its own mounts with each mount's configured access.
     #[test]
-    fn setup_boot_has_no_host_shares() {
-        let spec = BootSpec {
-            recipe: Recipe {
-                mounts: vec![Mount {
-                    host: PathBuf::from("/not-opened-for-a-setup-boot"),
-                    guest: PathBuf::from("/work"),
-                    readonly: false,
-                }],
-                ..Recipe::default()
+    fn setup_mounts_honor_access_and_exclude_workload_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut recipe = Recipe {
+            setup: crate::recipe::Setup {
+                mounts: vec![
+                    Mount {
+                        host: root.clone(),
+                        guest: "/setup".into(),
+                        readonly: false,
+                    },
+                    Mount {
+                        host: root,
+                        guest: "/setup-two".into(),
+                        readonly: true,
+                    },
+                ],
+                ..crate::recipe::Setup::default()
             },
+            ..Recipe::default()
+        };
+        recipe.workload.mounts.push(Mount {
+            host: PathBuf::from("/not-opened-for-a-setup-boot"),
+            guest: PathBuf::from("/work"),
+            readonly: false,
+        });
+        let spec = BootSpec {
+            recipe,
             project_dir: PathBuf::from("/project"),
             root: false,
-            mode: PlanMode::Create,
+            mode: PlanMode::Setup,
             foreground: false,
             host_publishes_pid: false,
             network_broker: None,
         };
-        assert!(open_shares(&spec).unwrap().is_empty());
+        let grants = open_shares(&spec).unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].access, AccessMode::ReadWrite);
+        assert_eq!(grants[1].access, AccessMode::ReadOnly);
+        let plan = super::super::build_plan(&spec, "dev").unwrap();
+        assert_eq!(plan.shares.len(), 2);
+        assert_eq!(plan.shares[0].tag, "terra-share-0");
+        assert_eq!(plan.shares[0].guest, "/setup");
+        assert!(!plan.shares[0].readonly);
+        assert_eq!(plan.shares[1].tag, "terra-share-1");
+        assert_eq!(plan.shares[1].guest, "/setup-two");
+        assert!(plan.shares[1].readonly);
+        assert_eq!(plan.mount_points, ["/work"]);
+    }
+
+    /// Normal runs see only `workload.mounts`, each with its configured access.
+    #[test]
+    fn workload_mounts_exclude_setup_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut recipe = Recipe {
+            setup: crate::recipe::Setup {
+                mounts: vec![Mount {
+                    host: PathBuf::from("/not-opened-for-a-run"),
+                    guest: "/setup".into(),
+                    readonly: false,
+                }],
+                ..crate::recipe::Setup::default()
+            },
+            ..Recipe::default()
+        };
+        recipe.workload.mounts.push(Mount {
+            host: root,
+            guest: PathBuf::from("/work"),
+            readonly: false,
+        });
+        let spec = BootSpec {
+            recipe,
+            project_dir: PathBuf::from("/project"),
+            root: false,
+            mode: PlanMode::Run,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        };
+        let grants = open_shares(&spec).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].access, AccessMode::ReadWrite);
+        let plan = super::super::build_plan(&spec, "dev").unwrap();
+        assert_eq!(plan.shares.len(), 1);
+        assert_eq!(plan.shares[0].guest, "/work");
+        assert!(!plan.shares[0].readonly);
+        assert_eq!(plan.mount_points, [] as [String; 0]);
     }
 }

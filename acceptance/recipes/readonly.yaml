@@ -4,4 +4,8 @@ volumes:
   - {name: kept, guest: /kept, size_mib: 64}
   - {name: scratch, guest: /scratch, size_mib: 64, lifetime: boot}
 workload:
-  run: while true; do sleep 60; done
+  workdir: /prepared/deep
+  run: |
+    set -e
+    test "$(pwd)" = /prepared/deep
+    while true; do sleep 60; done

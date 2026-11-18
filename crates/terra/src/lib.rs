@@ -20,8 +20,6 @@ pub mod recipe;
 pub use render::render_error;
 #[doc(hidden)]
 pub use state::digest_setup_boot_inputs;
-#[doc(hidden)]
-pub use vm::boot::SETUP_VM_STOPPED_BEFORE_CONSOLE;
 mod render;
 #[doc(hidden)]
 pub mod role;

@@ -40,7 +40,7 @@ pub const KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 quiet loglevel
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlanMode {
     Run,
-    Create,
+    Setup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,8 +81,11 @@ pub enum Net {
 pub struct Plan {
     pub mode: PlanMode,
     pub hostname: String,
+    /// Where this boot's shell commands start.
     pub workdir: Option<String>,
     pub shares: Vec<Share>,
+    /// Directories setup creates in the root image for later runs.
+    pub mount_points: Vec<String>,
     pub volumes: Vec<VolumeMount>,
     pub net: Net,
     pub published_ports: Vec<u16>,
@@ -92,7 +95,8 @@ pub struct Plan {
     pub as_root: bool,
     pub rootfs: RootfsMount,
     pub sudo: Vec<String>,
-    pub on_create: Vec<String>,
+    /// Setup shell lines, run only by a setup boot.
+    pub setup: Vec<String>,
     pub on_start: Vec<String>,
     pub pre_stop: Vec<String>,
     /// Background shell lines, restarted on failure until the box stops.
@@ -100,6 +104,8 @@ pub struct Plan {
     /// The recipe's `run` shell line; `None` runs an interactive
     /// [`RECIPE_SHELL`](crate::guest_root::RECIPE_SHELL).
     pub workload: Option<String>,
+    /// The workdir a later run starts in; setup creates it in the root image.
+    pub workload_workdir: Option<String>,
     pub sandbox_info: String,
     /// Wait for the foreground host session before starting the workload.
     pub await_initial_session: bool,
@@ -120,6 +126,7 @@ impl Plan {
             hostname: "terrarium".to_owned(),
             workdir: None,
             shares: Vec::new(),
+            mount_points: Vec::new(),
             volumes: Vec::new(),
             net: Net::Brokered,
             published_ports: Vec::new(),
@@ -128,11 +135,12 @@ impl Plan {
             as_root: false,
             rootfs: RootfsMount::Writable,
             sudo: Vec::new(),
-            on_create: Vec::new(),
+            setup: Vec::new(),
             on_start: Vec::new(),
             pre_stop: Vec::new(),
             daemons: Vec::new(),
             workload,
+            workload_workdir: None,
             sandbox_info: String::new(),
             await_initial_session: false,
             host_tz: None,
@@ -165,7 +173,7 @@ mod tests {
 
     #[test]
     fn plan_mode_retains_its_wire_format() {
-        assert_eq!(postcard::to_allocvec(&PlanMode::Create).unwrap(), [1]);
+        assert_eq!(postcard::to_allocvec(&PlanMode::Setup).unwrap(), [1]);
     }
 
     #[test]
@@ -181,7 +189,7 @@ mod tests {
     fn round_trip_plan() {
         for host_tz in [None, Some(vec![1, 2, 3])] {
             let plan = Plan {
-                mode: PlanMode::Create,
+                mode: PlanMode::Setup,
                 hostname: "dev".into(),
                 workdir: Some("/work".into()),
                 shares: vec![Share {
@@ -189,6 +197,7 @@ mod tests {
                     guest: "/etc/x".into(),
                     readonly: true,
                 }],
+                mount_points: vec!["/work".into()],
                 volumes: vec![VolumeMount {
                     dev: to_volume_device(0),
                     guest: "/data".into(),
@@ -202,11 +211,12 @@ mod tests {
                     upper_dev: to_volume_device(1),
                 },
                 sudo: vec!["apk".into()],
-                on_create: vec!["apk add git".into()],
+                setup: vec!["apk add git".into()],
                 on_start: vec!["date".into()],
                 pre_stop: vec!["sync".into()],
                 daemons: vec!["while true; do sleep 60; done".into()],
                 workload: Some("make".into()),
+                workload_workdir: Some("/work".into()),
                 sandbox_info: "# Terrarium sandbox".into(),
                 await_initial_session: true,
                 host_tz,

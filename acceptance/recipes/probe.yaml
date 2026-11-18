@@ -3,26 +3,26 @@ network:
   allow: ['gate.test:{allowed_port}']
   hosts: [{name: gate.test, addr: HOST_LOOPBACK}]
   ports: ['{allowed_port}:18080', '{denied_port}:18081']
-mounts:
-  - {host: ./suite, guest: /suite, readonly: true}
-  - {host: ./work, guest: /work}
-  - {host: ./readonly, guest: /readonly, readonly: true}
 volumes: [{name: data, guest: /data, size_mib: 8}]
 env: {RECIPE_ENV: recipe-value}
-hooks:
-  on_create: ['mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo baked > /data/from-setup; echo BAKE_OK']
-  on_start: ['echo start >> hooks; echo START_OK']
-  pre_stop: ['echo stop >> hooks; echo STOP_OK']
-daemons:
-  - echo daemon >> /work/daemon; test $(wc -l < /work/daemon) -ge 2
-  - >-
-    echo $$ > /tmp/workload-watcher-pid; exec busybox inotifyd - /work/host-update:c /work:nmdy > /tmp/workload-events
-  - >-
-    while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nGUEST_NETWORK' | busybox nc -l -p 18080; done
-  - >-
-    while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDENIED_ROUTE' | busybox nc -l -p 18081; done
+setup:
+  run: ['mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo baked > /data/from-setup; echo BAKE_OK']
 workload:
   workdir: /work
+  mounts:
+    - {host: ./suite, guest: /suite, readonly: true}
+    - {host: ./work, guest: /work}
+    - {host: ./readonly, guest: /readonly, readonly: true}
+  on_start: ['echo start >> hooks; echo START_OK']
+  pre_stop: ['echo stop >> hooks; echo STOP_OK']
+  daemons:
+    - echo daemon >> /work/daemon; test $(wc -l < /work/daemon) -ge 2
+    - >-
+      echo $$ > /tmp/workload-watcher-pid; exec busybox inotifyd - /work/host-update:c /work:nmdy > /tmp/workload-events
+    - >-
+      while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nGUEST_NETWORK' | busybox nc -l -p 18080; done
+    - >-
+      while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDENIED_ROUTE' | busybox nc -l -p 18081; done
   run: |
     set -e
     echo $RECIPE_ENV > /work/ready

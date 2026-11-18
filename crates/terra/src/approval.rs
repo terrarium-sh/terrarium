@@ -40,13 +40,12 @@ impl ApprovedRecipe {
 pub(crate) struct RecipeReview {
     bx: BoxRef,
     recipe: Recipe,
-    paths: state::PinnedPaths,
     previous_paths: Option<state::PinnedPaths>,
     changed_recipe: Option<ChangedRecipe>,
 }
 
 pub(crate) fn review_recipe(target: ResolvedRecipe) -> Result<RecipeReview> {
-    let (recipe, paths) = target.load_recipe()?;
+    let recipe = target.load_workload_paths()?;
     let ResolvedRecipe {
         bx,
         source,
@@ -57,7 +56,6 @@ pub(crate) fn review_recipe(target: ResolvedRecipe) -> Result<RecipeReview> {
     Ok(RecipeReview {
         bx,
         recipe,
-        paths,
         previous_paths,
         changed_recipe,
     })
@@ -84,19 +82,26 @@ impl RecipeReview {
         let RecipeReview {
             bx,
             mut recipe,
-            paths,
             previous_paths,
             changed_recipe,
         } = self;
-        let has_changed_targets = previous_paths
-            .as_ref()
-            .is_some_and(|applied| applied != &paths);
-        if changed_recipe.is_some() || has_changed_targets {
+        let paths = match effect {
+            ApplyEffect::Create | ApplyEffect::Rebuild => {
+                mount::resolve_setup_mounts(&mut recipe, &bx)?;
+                state::PinnedPaths::for_setup(&recipe)
+            }
+            ApplyEffect::Update | ApplyEffect::PinPaths => {
+                state::PinnedPaths::for_kept_root(&recipe, previous_paths.as_ref())
+            }
+            ApplyEffect::Import => state::PinnedPaths::new(&recipe, Vec::new()),
+        };
+        let path_warning = describe_path_warning(&bx, &recipe, &paths, previous_paths.as_ref());
+        if changed_recipe.is_some() || path_warning.is_some() {
             ask_to_apply_recipe(
                 &bx,
                 changed_recipe.as_ref(),
                 &recipe,
-                has_changed_targets,
+                path_warning.as_deref(),
                 effect,
                 approval,
                 is_at_a_terminal,
@@ -112,6 +117,34 @@ impl RecipeReview {
             pinned_paths,
         })
     }
+}
+
+fn describe_path_warning(
+    bx: &BoxRef,
+    recipe: &Recipe,
+    paths: &state::PinnedPaths,
+    previous_paths: Option<&state::PinnedPaths>,
+) -> Option<String> {
+    let Some(applied) = previous_paths else {
+        return bx.has_applied_recipe().then(|| {
+            format!(
+                "{} is missing. Review the host paths before approving.",
+                state::PINNED_PATHS_FILE
+            )
+        });
+    };
+    if !paths.setup_mounts.is_empty() && applied.setup_mounts != paths.setup_mounts {
+        let reason = if applied.setup_mounts.is_empty() {
+            "setup mount targets have not been approved for a local build"
+        } else {
+            "a setup mount target changed since the last setup"
+        };
+        return Some(format!("{reason}. Review the host paths before approving."));
+    }
+    (!applied.matches_workload(recipe)).then(|| {
+        "a share or env_file target changed since the last setup. Review the new host paths before approving."
+            .to_string()
+    })
 }
 
 /// A recipe that differs from the applied recipe, and what brought it to setup.
@@ -145,15 +178,15 @@ fn ask_to_apply_recipe(
     bx: &BoxRef,
     changed_recipe: Option<&ChangedRecipe>,
     recipe: &Recipe,
-    has_changed_targets: bool,
+    path_warning: Option<&str>,
     effect: ApplyEffect,
     approval: &Approval,
     is_at_a_terminal: bool,
 ) -> Result<()> {
     let authorship = changed_recipe.and_then(|recipe| find_recipe_authorship(bx, recipe));
-    let sensitive_mounts = mount::find_sensitive_mounts(&recipe.mounts);
-    let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.mount.readonly);
-    let is_suspect = has_changed_targets || authorship.is_some() || has_readwrite_sensitive;
+    let sensitive_mounts = mount::find_sensitive_mounts(recipe, effect.grant_phases());
+    let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.readonly);
+    let is_suspect = path_warning.is_some() || authorship.is_some() || has_readwrite_sensitive;
     let new_file = changed_recipe.map(|changed| &changed.file);
     let page = ApprovalPage {
         bx,
@@ -163,7 +196,7 @@ fn ask_to_apply_recipe(
             new_file,
             authorship.as_ref(),
             &sensitive_mounts,
-            has_changed_targets,
+            path_warning,
         ),
         recipe,
     };
@@ -218,12 +251,17 @@ fn find_writable_mount_containing(
     project_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     let file = canonicalize_existing_prefix(recipe_file);
-    Ok(list_declared_writable_shares(ran_recipe, project_dir)?
+    let share = list_declared_writable_shares(ran_recipe, project_dir)?
         .into_iter()
         .find_map(|share| {
             let share = canonicalize_existing_prefix(&share);
             file.starts_with(&share).then_some(share)
-        }))
+        });
+    if share.is_none() {
+        // Only trust a missing match if we understand every field that could grant write access.
+        yaml_serde::from_str::<Recipe>(ran_recipe)?;
+    }
+    Ok(share)
 }
 
 fn build_apply_lead(
@@ -253,13 +291,11 @@ fn build_apply_warnings(
     file: Option<&resolve::RecipeFile>,
     authorship: Option<&RecipeAuthorship>,
     sensitive_mounts: &[mount::SensitiveMount<'_>],
-    has_changed_targets: bool,
+    path_warning: Option<&str>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    if has_changed_targets {
-        warnings.push(
-            "WARNING: a share or env_file target changed since the last setup; review the new host paths before approving.".to_string(),
-        );
+    if let Some(warning) = path_warning {
+        warnings.push(format!("WARNING: {warning}"));
     }
     if let (Some(file), Some(authorship)) = (file, authorship) {
         warnings.push(format!(
@@ -268,16 +304,7 @@ fn build_apply_warnings(
         ));
     }
     for sensitive in sensitive_mounts {
-        let access = if sensitive.mount.readonly {
-            "read-only"
-        } else {
-            "read-write"
-        };
-        warnings.push(format!(
-            "WARNING: mount '{}' shares sensitive host {} ({access}) with the sandbox.",
-            escape_printable_path(&sensitive.mount.host),
-            sensitive.category
-        ));
+        warnings.push(format!("WARNING: {}.", sensitive.warning()));
     }
     warnings
 }
@@ -329,6 +356,15 @@ pub(crate) enum ApplyEffect {
     Import,
 }
 
+impl ApplyEffect {
+    fn grant_phases(self) -> mount::GrantPhases {
+        match self {
+            Self::Create | Self::Rebuild => mount::GrantPhases::SetupAndWorkload,
+            Self::Update | Self::PinPaths | Self::Import => mount::GrantPhases::Workload,
+        }
+    }
+}
+
 /// What applying puts to the person: what it applies, why to doubt it, what it grants.
 struct ApprovalPage<'a> {
     bx: &'a BoxRef,
@@ -348,11 +384,14 @@ impl ApprovalPage<'_> {
             page.push('\n');
         }
         page.push_str("It would grant:\n");
-        page.push_str(&render_policy_summary(self.recipe));
+        page.push_str(&render_policy_summary(
+            self.recipe,
+            self.effect.grant_phases(),
+        ));
         if self.effect == ApplyEffect::Rebuild {
             let _ = writeln!(
                 page,
-                "Rebuilding replaces {}'s root filesystem and runs on_create again; \
+                "Rebuilding replaces {}'s root filesystem and runs setup commands again; \
                  box volumes are kept.",
                 self.bx
             );
@@ -453,18 +492,23 @@ fn answer_is_yes(answer: &str) -> bool {
 }
 
 fn ensure_boot_plan_fits(bx: &BoxRef, recipe: &Recipe) -> Result<()> {
-    crate::vm::encode_boot_plan(
-        &boot::BootSpec {
-            recipe: recipe.clone(),
-            project_dir: bx.get_project_dir().to_path_buf(),
-            root: false,
-            mode: terra_protocol::PlanMode::Run,
-            foreground: false,
-            host_publishes_pid: false,
-            network_broker: None,
-        },
-        bx.get_name(),
-    )?;
+    for mode in [
+        terra_protocol::PlanMode::Setup,
+        terra_protocol::PlanMode::Run,
+    ] {
+        crate::vm::encode_boot_plan(
+            &boot::BootSpec {
+                recipe: recipe.clone(),
+                project_dir: bx.get_project_dir().to_path_buf(),
+                root: false,
+                mode,
+                foreground: false,
+                host_publishes_pid: false,
+                network_broker: None,
+            },
+            bx.get_name(),
+        )?;
+    }
     Ok(())
 }
 
@@ -518,6 +562,62 @@ mod tests {
     }
 
     #[test]
+    fn keeping_or_importing_the_root_grants_workload_access() {
+        let home = crate::sys::TestHome::new();
+        let ssh_dir = home.get_path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let from = dir.path().join("dev.yaml");
+        let text = format!(
+            "setup:\n  run: ['echo bake-root']\n  mounts:\n    - host: {}\n      guest: /during-setup\n\
+             workload:\n  mounts:\n    - host: {}\n      guest: /during-workload\n",
+            ssh_dir.display(),
+            ssh_dir.display()
+        );
+        let mut recipe: Recipe = yaml_serde::from_str(&text).unwrap();
+        let ask = |recipe: &Recipe, effect, carrier| {
+            let changed = ChangedRecipe {
+                file: resolve::RecipeFile {
+                    from: from.clone(),
+                    text: text.clone(),
+                },
+                carrier,
+            };
+            ask_to_apply_recipe(
+                &bx,
+                Some(&changed),
+                recipe,
+                None,
+                effect,
+                &Approval::ChosenByHand {
+                    trust_recipe: false,
+                },
+                false,
+            )
+        };
+        for (effect, carrier) in [
+            (ApplyEffect::Update, RecipeCarrier::File),
+            (ApplyEffect::Import, RecipeCarrier::StorageArtifact),
+        ] {
+            let error = ask(&recipe, effect, carrier).unwrap_err().to_string();
+            let (review, grants) = error.split_once("It would grant:\n").unwrap();
+            assert!(review.contains("echo bake-root"), "{error}");
+            assert!(review.contains("/during-setup"), "{error}");
+            assert!(!review.contains("WARNING: setup mount"), "{error}");
+            assert!(review.contains("WARNING: workload mount"), "{error}");
+            if effect == ApplyEffect::Import {
+                assert!(review.contains("written by whoever exported it"), "{error}");
+            }
+            assert!(grants.contains("mount:    /during-workload"), "{error}");
+            assert!(!grants.contains("/during-setup"), "{error}");
+            assert!(!grants.contains("echo bake-root"), "{error}");
+        }
+        recipe.workload.mounts.clear();
+        ask(&recipe, ApplyEffect::Update, RecipeCarrier::File).unwrap();
+    }
+
+    #[test]
     fn oversized_boot_plans_are_refused_after_dotenv_merge_before_preparation() {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
@@ -561,7 +661,7 @@ mod tests {
         writer.write_origin().unwrap();
         std::fs::write(
             writer.get_dir().join(state::RECIPE_FILE),
-            "mounts:\n  - host: ../target\n    guest: /work\n",
+            "workload:\n  mounts:\n    - host: ../target\n      guest: /work\n",
         )
         .unwrap();
         let bx = BoxRef::resolve(&target, "dev").unwrap();
@@ -586,11 +686,17 @@ mod tests {
             Some(RecipeAuthorship::WritableShare { .. })
         ));
         assert!(authorship(root.path().join("outside.yaml"), RecipeCarrier::File).is_none());
-        std::fs::write(writer.get_dir().join(state::RECIPE_FILE), [0xff]).unwrap();
-        assert!(matches!(
-            authorship(target.join("evil.yaml"), RecipeCarrier::File),
-            Some(RecipeAuthorship::UnreadableAppliedRecipe)
-        ));
+        for unsupported in [
+            &[0xff][..],
+            b"mounts: [{host: ../target, guest: /work}]",
+            b"mounts: [{<<: {host: ../target, guest: /work}}]",
+        ] {
+            std::fs::write(writer.get_dir().join(state::RECIPE_FILE), unsupported).unwrap();
+            assert!(matches!(
+                authorship(target.join("evil.yaml"), RecipeCarrier::File),
+                Some(RecipeAuthorship::UnreadableAppliedRecipe)
+            ));
+        }
     }
 
     /// Re-applying an *already applied* box still consults every sibling's
@@ -614,7 +720,7 @@ mod tests {
         std::fs::write(
             b.get_dir().join(state::RECIPE_FILE),
             format!(
-                "mounts:\n  - host: {}\n    guest: /work\n",
+                "workload:\n  mounts:\n    - host: {}\n      guest: /work\n",
                 project.display()
             ),
         )
@@ -667,33 +773,36 @@ mod tests {
         let bx = BoxRef::resolve(&project, "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
 
-        let recipe_path = project.join("recipe.yaml");
-        let recipe_text = format!(
-            "mounts:\n  - host: {}\n    guest: /ssh\n    readonly: false\n",
-            ssh_dir.display()
-        );
-        std::fs::write(&recipe_path, &recipe_text).unwrap();
+        for phase in ["setup", "workload"] {
+            let recipe_path = project.join("recipe.yaml");
+            let recipe_text = format!(
+                "{phase}:\n  mounts:\n    - host: {}\n      guest: /ssh\n",
+                ssh_dir.display()
+            );
+            std::fs::write(&recipe_path, &recipe_text).unwrap();
 
-        let target = || ResolvedRecipe {
-            bx: bx.clone(),
-            source: resolve::Source::File(resolve::RecipeFile {
-                from: recipe_path.clone(),
-                text: recipe_text.clone(),
-            }),
-            manifest: None,
-        };
+            let target = || ResolvedRecipe {
+                bx: bx.clone(),
+                source: resolve::Source::File(resolve::RecipeFile {
+                    from: recipe_path.clone(),
+                    text: recipe_text.clone(),
+                }),
+                manifest: None,
+            };
 
-        let err = approve_by_hand(target(), false, false)
-            .expect_err("read-write sensitive mount must be suspect")
-            .to_string();
+            let err = approve_by_hand(target(), false, false)
+                .expect_err("read-write sensitive mount must be suspect")
+                .to_string();
 
-        assert!(err.contains("shares sensitive host SSH keys"), "{err}");
-        assert!(err.contains("(read-write)"), "{err}");
-        assert!(err.contains("--trust-recipe"), "{err}");
+            assert!(err.contains("shares sensitive host SSH keys"), "{err}");
+            assert!(err.contains(&format!("WARNING: {phase} mount '")), "{err}");
+            assert!(err.contains("(read-write)"), "{err}");
+            assert!(err.contains("--trust-recipe"), "{err}");
 
-        let approved = approve_by_hand(target(), true, false)
-            .expect("--trust-recipe should apply with sensitive mount");
-        assert!(approved.changed_recipe.is_some());
+            let approved = approve_by_hand(target(), true, false)
+                .expect("--trust-recipe should apply with sensitive mount");
+            assert!(approved.changed_recipe.is_some());
+        }
     }
 
     /// The whole of what applying does about the person, off the three things
@@ -787,35 +896,42 @@ mod tests {
         let outside = dir.path().join("elsewhere.yaml");
         std::fs::write(&outside, "hw:\n  cpus: 2\n").unwrap();
 
-        // What the box previously ran: the project shared read-write.
-        let ran = format!(
-            "mounts:\n  - host: {}\n    guest: /work\n",
-            project.display()
-        );
+        for phase in ["setup", "workload"] {
+            // What the box previously ran: the project shared read-write.
+            let ran = format!(
+                "{phase}:\n  mounts:\n    - host: {}\n      guest: /work\n",
+                project.display()
+            );
 
-        assert_eq!(
-            find_writable_mount_containing(&inside, &ran, dir.path()).unwrap(),
-            Some(std::fs::canonicalize(&project).unwrap()),
-            "a source inside a writable share must be reported"
-        );
-        assert_eq!(
-            find_writable_mount_containing(&outside, &ran, dir.path()).unwrap(),
-            None,
-            "a source outside every share is nobody's to have written"
-        );
+            assert_eq!(
+                find_writable_mount_containing(&inside, &ran, dir.path()).unwrap(),
+                Some(std::fs::canonicalize(&project).unwrap()),
+                "a source inside a writable share must be reported"
+            );
+            assert_eq!(
+                find_writable_mount_containing(&outside, &ran, dir.path()).unwrap(),
+                None,
+                "a source outside every share is nobody's to have written"
+            );
 
-        // Read-only shares cannot have been written by the guest.
-        let ro = format!(
-            "mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
-            project.display()
-        );
-        assert_eq!(
-            find_writable_mount_containing(&inside, &ro, dir.path()).unwrap(),
-            None
-        );
+            // Read-only shares cannot have been written by the guest.
+            let ro = format!(
+                "{phase}:\n  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
+                project.display()
+            );
+            assert_eq!(
+                find_writable_mount_containing(&inside, &ro, dir.path()).unwrap(),
+                None
+            );
+        }
 
         assert!(
-            find_writable_mount_containing(&inside, "mounts: [{host: /nope-", dir.path()).is_err()
+            find_writable_mount_containing(
+                &inside,
+                "workload: {mounts: [{host: /nope-",
+                dir.path()
+            )
+            .is_err()
         );
     }
 
@@ -834,7 +950,7 @@ mod tests {
         // What the box ran: the project read-write, plus a second share the
         // guest can remove through the first one.
         let ran = format!(
-            "mounts:\n  - host: {}\n    guest: /work\n  - host: {}/data\n    guest: /data\n",
+            "workload:\n  mounts:\n    - host: {}\n      guest: /work\n    - host: {}/data\n      guest: /data\n",
             project.display(),
             project.display()
         );
@@ -868,7 +984,7 @@ mod tests {
         // What the box ran: the project read-write, plus a dotenv the guest can
         // delete through that very share.
         let ran = format!(
-            "mounts:\n  - host: {}\n    guest: /work\nenv_file: ./secrets.env\n",
+            "workload:\n  mounts:\n    - host: {}\n      guest: /work\nenv_file: ./secrets.env\n",
             project.display()
         );
         assert!(
@@ -900,7 +1016,7 @@ mod tests {
         // What an older terra applied: the project shared read-write, plus
         // hardware this one refuses.
         let ran = format!(
-            "hw:\n  mem_mib: 64\nmounts:\n  - host: {}\n    guest: /work\n",
+            "hw:\n  mem_mib: 64\nworkload:\n  mounts:\n    - host: {}\n      guest: /work\n",
             project.display()
         );
         assert!(
@@ -930,7 +1046,7 @@ mod tests {
         // What a newer terra applied: an unknown top-level section, and an
         // unknown per-mount field.
         let ran = format!(
-            "quotas:\n  io_mib: 64\nmounts:\n  - host: {}\n    guest: /work\n    idmap: false\n",
+            "quotas:\n  io_mib: 64\nworkload:\n  mounts:\n    - host: {}\n      guest: /work\n      idmap: false\n",
             project.display()
         );
         assert!(
@@ -953,7 +1069,7 @@ mod tests {
         assert_eq!(
             find_writable_mount_containing(
                 &smuggled_old,
-                "mounts:\n  - host: ~alice/data\n    guest: /work\n",
+                "workload:\n  mounts:\n    - host: ~alice/data\n      guest: /work\n",
                 &project
             )
             .unwrap(),
@@ -978,7 +1094,7 @@ mod tests {
 
         for odd in ["- \"./src:/work\"", "- {guest: /work}"] {
             let ran = format!(
-                "mounts:\n  {odd}\n  - host: {}\n    guest: /w\n",
+                "workload:\n  mounts:\n    {odd}\n    - host: {}\n      guest: /w\n",
                 project.display()
             );
             assert!(
@@ -992,6 +1108,9 @@ mod tests {
             );
         }
 
-        assert!(find_writable_mount_containing(&smuggled, "mounts: nope\n", dir.path()).is_err());
+        assert!(
+            find_writable_mount_containing(&smuggled, "workload: {mounts: nope}\n", dir.path())
+                .is_err()
+        );
     }
 }

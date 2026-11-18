@@ -210,44 +210,84 @@ fn parse_superblock_span(superblock: &[u8], device_bytes: u64, page_size: u64) -
     Some(device_blocks == blocks)
 }
 
-/// Remounts the volumes and the root read-only so the next boot mounts them without a
-/// journal replay. A run boot leaves a busy filesystem as it is; a Create boot kills leftover
-/// processes first and fails if the root stays writable.
+/// Leaves setup's filesystems clean, failing if a volume or root stays writable.
+/// A run boot remounts filesystems read-only when they are not busy.
 pub(crate) fn leave_filesystems_clean(plan: &Plan) -> Result<()> {
-    let is_create = plan.mode == PlanMode::Create;
-    if is_create {
-        // Linux skips the caller and init, so only leftover guest processes die.
-        // SAFETY: kill(2) with pid -1 touches no memory.
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(-1, libc::SIGKILL);
+    match plan.mode {
+        PlanMode::Setup => {
+            // Linux skips the caller and init, so only leftover guest processes die.
+            // SAFETY: kill(2) with pid -1 touches no memory.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(-1, libc::SIGKILL);
+            }
+            let workdir = std::env::set_current_dir("/").context("leaving setup workdir");
+            let volumes = unmount_setup_volumes(plan);
+            let shares = crate::mounts::unmount_shares(plan);
+            // Root-image writes could reach a shared directory if detachment failed.
+            let root_paths = volumes.and(shares).and_then(|()| finalize_setup_root(plan));
+            let root =
+                retry_busy_mount(|| rustix::mount::mount_remount("/", MountFlags::RDONLY, ""))
+                    .context("remounting the guest root read-only after setup");
+            workdir.and(root_paths).and(root)
         }
-    }
-    for volume in &plan.volumes {
-        let _ = rustix::mount::mount_remount(
-            volume.guest.as_str(),
-            DATA_MOUNT_FLAGS | MountFlags::RDONLY,
-            "",
-        );
-    }
-    // A killed process releases its files while exiting, so EBUSY clears within moments.
-    let mut attempts = if is_create { REMOUNT_ATTEMPTS } else { 1 };
-    loop {
-        match rustix::mount::mount_remount("/", MountFlags::RDONLY, "") {
-            Err(rustix::io::Errno::BUSY) if attempts > 1 => {
-                attempts -= 1;
-                std::thread::sleep(REMOUNT_RETRY_DELAY);
+        PlanMode::Run => {
+            for volume in &plan.volumes {
+                let _ = rustix::mount::mount_remount(
+                    volume.guest.as_str(),
+                    DATA_MOUNT_FLAGS | MountFlags::RDONLY,
+                    "",
+                );
             }
-            Err(error) if is_create => {
-                return Err(error).context("remounting the guest root read-only after setup");
-            }
-            Ok(()) | Err(_) => return Ok(()),
+            let _ = rustix::mount::mount_remount("/", MountFlags::RDONLY, "");
+            Ok(())
         }
     }
 }
 
-const REMOUNT_ATTEMPTS: u32 = 20;
-const REMOUNT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+fn unmount_setup_volumes(plan: &Plan) -> Result<()> {
+    let mut cleanup = Ok(());
+    for volume in plan.volumes.iter().rev() {
+        match retry_busy_mount(|| {
+            rustix::mount::unmount(volume.guest.as_str(), rustix::mount::UnmountFlags::empty())
+        }) {
+            Ok(()) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::INVAL) => {}
+            Err(error) => {
+                cleanup = cleanup.and(
+                    Err(error).with_context(|| format!("unmounting setup volume {}", volume.guest)),
+                );
+            }
+        }
+    }
+    cleanup
+}
+
+fn finalize_setup_root(plan: &Plan) -> Result<()> {
+    let links = terra_protocol::guest_root::link_per_boot_files(Path::new("/"))
+        .context("restoring the per-boot links setup replaced");
+    let mount_points = crate::mounts::prepare_mount_points(plan);
+    let workdir = plan.workload_workdir.as_ref().map_or(Ok(()), |workdir| {
+        crate::sync::ensure_directory(Path::new(workdir), GuestUser::Workload)
+            .with_context(|| format!("creating workdir {workdir}"))
+    });
+    links.and(mount_points).and(workdir)
+}
+
+fn retry_busy_mount(
+    mut operation: impl FnMut() -> rustix::io::Result<()>,
+) -> rustix::io::Result<()> {
+    for _ in 1..MOUNT_CLEANUP_ATTEMPTS {
+        match operation() {
+            // A killed process releases its files while exiting, so EBUSY clears within moments.
+            Err(rustix::io::Errno::BUSY) => std::thread::sleep(MOUNT_CLEANUP_RETRY_DELAY),
+            result => return result,
+        }
+    }
+    operation()
+}
+
+const MOUNT_CLEANUP_ATTEMPTS: u32 = 20;
+const MOUNT_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn grow_filesystem(device: &str) {
     if filesystem_already_spans_device(device) {
@@ -280,8 +320,9 @@ fn grow_filesystem(device: &str) {
 
 fn render_doas_policy(sudo: &[String]) -> String {
     use std::fmt::Write as _;
-    let mut policy =
-        String::from("# Generated by terra from the recipe's `sudo:` - edits are overwritten.\n");
+    let mut policy = String::from(
+        "# Generated by terra from the recipe's `workload.sudo` - edits are overwritten.\n",
+    );
     for command in sudo {
         if command.contains(['\n', '#']) {
             eprintln!("terra-agent: warning: skipping invalid sudo `{command}`");

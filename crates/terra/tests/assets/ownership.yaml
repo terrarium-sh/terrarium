@@ -3,8 +3,9 @@
 # once as the default (terri) and once with --root - the filesystem must look
 # identical either way; only EXEC changes.
 #
-# There is no implicit project mount any more, so the runner appends a `mounts:`
-# entry pointing /work at a temp directory it owns before booting this.
+# There is no implicit project mount any more, so the runner adds a
+# `workload.mounts` entry pointing /work at a temp directory it owns before
+# booting this.
 volumes:
   - {name: data, guest: /data, size_mib: 64}
 workload:

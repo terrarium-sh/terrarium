@@ -136,9 +136,11 @@ def main():
                                 recipe.write_text(json.dumps({
                                     "hw": {"cpus": 2, "mem_mib": 512},
                                     "network": {"allow": ["HOST_LOOPBACK:" + port]},
-                                    "mounts": [{"host": str(probe.parent), "guest": "/probe", "readonly": True},
-                                               {"host": str(fixture), "guest": "/fixture", "readonly": True}],
-                                    "workload": {"run": "while :; do sleep 60; done"},
+                                    "workload": {
+                                        "run": "while :; do sleep 60; done",
+                                        "mounts": [{"host": str(probe.parent), "guest": "/probe", "readonly": True},
+                                                   {"host": str(fixture), "guest": "/fixture", "readonly": True}],
+                                    },
                                 }))
                                 cell["recipe"] = json.loads(recipe.read_text())
                                 run([binary, recipe, "setup", "--project", project], env)

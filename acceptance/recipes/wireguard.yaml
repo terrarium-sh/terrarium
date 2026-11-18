@@ -3,9 +3,9 @@ network:
   allow: [dl-cdn.alpinelinux.org:443, 'gate.test:{wireguard_port}']
   hosts: [{name: gate.test, addr: HOST_LOOPBACK}]
   ports: ['{wireguard_port}:51821/udp', '{wireguard_denied_port}:51821/udp']
-mounts:
-  - {host: ./suite, guest: /suite, readonly: true}
-hooks:
-  on_create: [apk add --no-cache wireguard-tools wireguard-go iproute2]
+setup:
+  run: [apk add --no-cache wireguard-tools wireguard-go iproute2]
 workload:
+  mounts:
+    - {host: ./suite, guest: /suite, readonly: true}
   run: while true; do sleep 60; done

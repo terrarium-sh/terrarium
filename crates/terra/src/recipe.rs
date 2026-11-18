@@ -19,23 +19,16 @@ use validate::{validate, validate_env};
 pub struct Recipe {
     pub hw: Hw,
     pub components: Components,
-    pub mounts: Vec<Mount>,
     pub volumes: Vec<Volume>,
     pub network: Network,
-    pub hooks: Hooks,
-    /// Background shell lines, restarted on failure for the box's lifetime.
-    /// Exit 0 ends the daemon; anything else respawns after 1s.
-    pub daemons: Vec<String>,
-    pub workload: Workload,
-    /// Commands the workload user may run as root through `doas` (aliased to
-    /// `sudo`). Empty grants nothing.
-    pub sudo: Vec<String>,
-    /// Exported for the workload and hooks, `env_file:` merged on top (last
-    /// wins). `BTreeMap` so the export order is deterministic.
+    /// Exported for both phases, `env_file:` merged on top (last wins).
+    /// `BTreeMap` so the export order is deterministic.
     pub env: BTreeMap<String, String>,
     /// A dotenv-style file merged over `env:` - the file wins. `KEY=VAL`
     /// lines only, no space around the `=`.
     pub env_file: Option<PathBuf>,
+    pub setup: Setup,
+    pub workload: Workload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -131,6 +124,10 @@ pub struct Mount {
     pub readonly: bool,
 }
 
+pub(crate) fn mount_host_paths(mounts: &[Mount]) -> impl Iterator<Item = &PathBuf> {
+    mounts.iter().map(|mount| &mount.host)
+}
+
 pub use terra_policy::config::{NetworkMode, StaticDnsRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,26 +176,35 @@ impl Default for Network {
     }
 }
 
+/// What the isolated setup VM runs while preparing a fresh root filesystem.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct Hooks {
-    /// One-time setup baked into the box's filesystem, before any share is
-    /// mounted.
-    pub on_create: Vec<String>,
-    /// Every boot, before the workload.
-    pub on_start: Vec<String>,
-    pub pre_stop: Vec<String>,
+pub struct Setup {
+    pub run: Vec<String>,
+    /// Where setup commands start, as an absolute guest path. Unset, `/`.
+    pub workdir: Option<PathBuf>,
+    pub mounts: Vec<Mount>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Workload {
+    /// Where the workload and its lifecycle commands start, as an absolute
+    /// guest path. Unset, the workload user's home (`/home/terri`).
+    pub workdir: Option<PathBuf>,
+    pub mounts: Vec<Mount>,
+    /// Every boot, before the workload.
+    pub on_start: Vec<String>,
+    pub pre_stop: Vec<String>,
+    /// Background shell lines, restarted on failure for the box's lifetime.
+    /// Exit 0 ends the daemon; anything else respawns after 1s.
+    pub daemons: Vec<String>,
+    /// Commands the workload user may run as root through `doas` (aliased to
+    /// `sudo`). Empty grants nothing.
+    pub sudo: Vec<String>,
     /// A shell command, like a daemon's. Unset, the workload is an interactive
     /// `/bin/sh`.
     pub run: Option<String>,
-    /// Where the workload starts, as an absolute guest path. Unset, the
-    /// workload starts in the workload user's home (`/home/terri`).
-    pub workdir: Option<PathBuf>,
 }
 
 /// The project manifest: the project's boxes by name (`ci: ./ci.yaml`),
@@ -390,25 +396,44 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Rec
                 crate::render::escape_printable_path(source)
             )
         })?;
-    for mount in &mut recipe.mounts {
+    for mount in recipe
+        .setup
+        .mounts
+        .iter_mut()
+        .chain(&mut recipe.workload.mounts)
+    {
         mount.host = resolve_recipe_path(&mount.host, project_dir)?;
     }
     if let Some(file) = &recipe.env_file {
         recipe.env_file = Some(resolve_recipe_path(file, project_dir)?);
+    }
+    if let Some(workdir) = recipe.setup.workdir.as_mut() {
+        *workdir = normalize_guest_path(workdir).context("invalid setup.workdir")?;
+    }
+    if let Some(workdir) = recipe.workload.workdir.as_mut() {
+        *workdir = normalize_guest_path(workdir).context("invalid workload.workdir")?;
     }
     let volume_paths = recipe
         .volumes
         .iter_mut()
         .filter_map(|volume| volume.guest.as_mut());
     for path in recipe
+        .setup
         .mounts
         .iter_mut()
         .map(|mount| &mut mount.guest)
+        .chain(
+            recipe
+                .workload
+                .mounts
+                .iter_mut()
+                .map(|mount| &mut mount.guest),
+        )
         .chain(volume_paths)
     {
         *path = normalize_guest_path(path)?;
     }
-    for command in &mut recipe.sudo {
+    for command in &mut recipe.workload.sudo {
         *command = command.trim().to_string();
     }
     validate(&recipe)?;
@@ -420,6 +445,12 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf> {
     if !path.starts_with('/') {
         bail!(
             "guest path must be absolute: '{}'",
+            crate::render::escape_printable(&path)
+        );
+    }
+    if path.contains('\0') {
+        bail!(
+            "guest path '{}' cannot contain a NUL",
             crate::render::escape_printable(&path)
         );
     }
@@ -448,23 +479,29 @@ pub(crate) fn list_declared_writable_shares(
     text: &str,
     project_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
-    #[derive(Deserialize, Default)]
+    #[derive(Deserialize)]
     struct RecipeMounts {
+        #[serde(default)]
+        setup: PhaseMounts,
+        #[serde(default)]
+        workload: PhaseMounts,
+    }
+
+    #[derive(Deserialize, Default)]
+    struct PhaseMounts {
         #[serde(default)]
         mounts: Vec<yaml_serde::Value>,
     }
 
     let recipe: RecipeMounts = yaml_serde::from_str(text)?;
+    let mounts = recipe.setup.mounts.iter().chain(&recipe.workload.mounts);
     anyhow::ensure!(
-        !recipe
-            .mounts
-            .iter()
+        !mounts
+            .clone()
             .any(|mount| mount.as_mapping().is_some_and(|map| map.contains_key("<<"))),
         "cannot determine writable shares from YAML merge keys"
     );
-    Ok(recipe
-        .mounts
-        .iter()
+    Ok(mounts
         .filter_map(|mount| {
             let yaml_serde::Value::Mapping(mount) = mount else {
                 return None;
@@ -555,7 +592,7 @@ pub(crate) fn resolve_env_file(recipe: &mut Recipe) -> Result<()> {
 /// Where a path written in a recipe or a `terra.yaml` lands: `~` expanded, then
 /// made absolute against `source_dir` - the directory that file belongs to,
 /// never the shell's (see [`resolve`]). The one spelling of the
-/// rule, so a `mounts[].host`, an `env_file:` and a manifest reference cannot
+/// rule, so a `workload.mounts[].host`, an `env_file:` and a manifest reference cannot
 /// resolve three different ways.
 pub(crate) fn resolve_recipe_path(p: &Path, source_dir: &Path) -> Result<PathBuf> {
     crate::sys::resolve_absolute_path(&expand_tilde(p)?, source_dir)

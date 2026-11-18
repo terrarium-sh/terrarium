@@ -3,7 +3,7 @@
 use super::{
     BoxRef, ORIGIN_FILE, get_box_home_path, get_project_state_dir, list_boxes_in, read_origin,
 };
-use crate::recipe::{Recipe, read_recipe_text};
+use crate::recipe::{Recipe, mount_host_paths, read_recipe_text};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
@@ -16,24 +16,54 @@ pub const PINNED_PATHS_FILE: &str = "pinned-paths.yaml";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PinnedPaths {
+    #[serde(default)]
+    pub(crate) setup_mounts: Vec<PathBuf>,
     mounts: Vec<PathBuf>,
     env_file: Option<PathBuf>,
 }
 
 impl PinnedPaths {
-    pub(crate) fn from_recipe(recipe: &Recipe) -> Self {
+    pub(crate) fn new(recipe: &Recipe, setup_mounts: Vec<PathBuf>) -> Self {
         Self {
-            mounts: recipe
-                .mounts
-                .iter()
-                .map(|mount| mount.host.clone())
-                .collect(),
+            setup_mounts,
+            mounts: mount_host_paths(&recipe.workload.mounts).cloned().collect(),
             env_file: recipe.env_file.clone(),
         }
+    }
+
+    pub(crate) fn for_setup(recipe: &Recipe) -> Self {
+        Self::new(
+            recipe,
+            mount_host_paths(&recipe.setup.mounts).cloned().collect(),
+        )
+    }
+
+    pub(crate) fn for_kept_root(recipe: &Recipe, existing: Option<&Self>) -> Self {
+        let setup_mounts = existing.map_or_else(Vec::new, |pins| pins.setup_mounts.clone());
+        Self::new(recipe, setup_mounts)
+    }
+
+    pub(crate) fn matches_workload(&self, recipe: &Recipe) -> bool {
+        self.env_file == recipe.env_file
+            && mount_host_paths(&recipe.workload.mounts).eq(&self.mounts)
     }
 }
 
 impl BoxRef {
+    pub(crate) fn has_applied_recipe(&self) -> bool {
+        self.get_dir().join(RECIPE_FILE).exists()
+    }
+
+    pub(crate) fn load_applied_recipe(&self) -> Result<Recipe> {
+        crate::recipe::load_path(&self.get_dir().join(RECIPE_FILE), self.get_project_dir())
+            .with_context(|| {
+                format!(
+                    "reading {self}'s applied recipe; update the source recipe and apply it with \
+                     `terra <recipe-path> setup` or a terra.yaml alias"
+                )
+            })
+    }
+
     pub(crate) fn load_pinned_paths(&self) -> Result<Option<PinnedPaths>> {
         let path = self.get_dir().join(PINNED_PATHS_FILE);
         match read_recipe_text(&path) {
@@ -45,9 +75,15 @@ impl BoxRef {
         }
     }
 
-    pub(crate) fn verify_pinned_paths(&self, current: &PinnedPaths) -> Result<()> {
+    pub(crate) fn verify_workload_pins(&self, recipe: &Recipe) -> Result<()> {
+        let pinned = self.load_pinned_paths()?.with_context(|| {
+            format!(
+                "{PINNED_PATHS_FILE} is missing - run `terra {} setup` to approve the host paths",
+                self.get_name()
+            )
+        })?;
         anyhow::ensure!(
-            self.load_pinned_paths()?.as_ref() == Some(current),
+            pinned.matches_workload(recipe),
             "a share or env_file moved since the last setup - run `terra {} setup` again",
             self.get_name()
         );

@@ -18,8 +18,6 @@ use std::time::{Duration, Instant};
 /// command line and takes its boot off stdin.
 pub const VM_PROCESS_FLAG_ARG: &str = "__vm";
 
-pub const SETUP_VM_STOPPED_BEFORE_CONSOLE: &str = "the setup VM stopped before opening its console";
-
 const DETACH_READY_DEADLINE: Duration =
     Duration::from_secs(terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs() + 30);
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
@@ -47,6 +45,13 @@ pub struct BrokerMetadata {
 }
 
 impl BootSpec {
+    pub(super) fn active_mounts(&self) -> &[Mount] {
+        match self.mode {
+            terra_protocol::PlanMode::Setup => &self.recipe.setup.mounts,
+            terra_protocol::PlanMode::Run => &self.recipe.workload.mounts,
+        }
+    }
+
     pub fn resolve(recipe: Recipe, args: &BootArgs, project_dir: PathBuf, boot: BootMode) -> Self {
         Self {
             root: args.root,
@@ -81,7 +86,7 @@ pub async fn start(
                 "terra: starting {bx} in the foreground; `terra {} stop` stops it",
                 bx.get_name()
             );
-            print_mount_summary(&spec.recipe.mounts);
+            print_mount_summary(spec.active_mounts());
             spawn_foreground(bx, spec, run_lock, agent_timeout).await
         }
         BootMode::DetachedWithJoin => spawn_and_attach(bx, spec, run_lock, agent_timeout).await,
@@ -101,12 +106,12 @@ pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<(
         recipe: recipe.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
-        mode: terra_protocol::PlanMode::Create,
+        mode: terra_protocol::PlanMode::Setup,
         foreground: false,
         host_publishes_pid: false,
         network_broker: None,
     };
-    eprintln!("terra: preparing {bx} in an isolated VM (no shares)");
+    eprintln!("terra: preparing {bx} in an isolated VM");
     let setting_up = BoxRef::mark_setting_up(lock).context("marking the setup VM")?;
     let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &setup_spec, lock)?;
     let deadline = Instant::now() + DETACH_READY_DEADLINE;
@@ -115,7 +120,7 @@ pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<(
             session::connect_to_agent(bx, terra_protocol::AgentService::Session, "setup", || {
                 anyhow::ensure!(
                     child.try_wait()?.is_none(),
-                    "{SETUP_VM_STOPPED_BEFORE_CONSOLE}"
+                    "the setup VM stopped before opening its console"
                 );
                 anyhow::ensure!(
                     Instant::now() < deadline,
@@ -134,12 +139,6 @@ pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<(
     if !status.success() || output.is_err() {
         let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
     }
-    output.with_context(|| {
-        format!(
-            "streaming the setup VM (box process {status}; launcher diagnostics: {})",
-            bx.get_dir().join("launcher.log").display()
-        )
-    })?;
     if !status.success() {
         if let Some(signal) = sys::find_terminating_signal(status) {
             anyhow::bail!(
@@ -148,13 +147,21 @@ pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<(
                  both land as a plain signal"
             );
         }
-        anyhow::bail!(
+        let message = format!(
             "setup failed - fix the recipe, then `terra {0} setup` re-runs \
              it (`--rebuild` for a clean slate); `terra {0} logs --diagnostics` shows the \
              agent diagnostics",
             bx.get_name()
         );
+        output.context(message.clone())?;
+        anyhow::bail!("{message}");
     }
+    output.with_context(|| {
+        format!(
+            "streaming the setup VM (box process {status}; launcher diagnostics: {})",
+            bx.get_dir().join("launcher.log").display()
+        )
+    })?;
     setting_up.clear().context("clearing setup mark")?;
     bx.write_setup_stamp()?;
     Ok(())
@@ -238,7 +245,7 @@ async fn spawn_and_attach(
         "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
         bx.get_name()
     );
-    print_mount_summary(&spec.recipe.mounts);
+    print_mount_summary(spec.active_mounts());
     let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     // The child owns the lock from here on; a copy held by this client would
     // keep the box reading as running, VM or no VM.

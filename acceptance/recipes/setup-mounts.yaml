@@ -1,0 +1,36 @@
+hw: {cpus: 1, mem_mib: 256}
+network: {enabled: false}
+setup:
+  workdir: /work
+  mounts:
+    - {host: ./suite, guest: /work, readonly: true}
+    - {host: ./setup-work, guest: /setup-only}
+  run:
+    - test "$(pwd)" = /work
+    - test -f /work/guest/namespaces.sh
+    - if touch /work/forbidden 2>/dev/null; then exit 1; fi
+    - printf SETUP_WROTE > /setup-only/setup-result
+    - test ! -e /work/runtime-only-seed
+    - printf SETUP_COPY > /setup-output
+    - echo SETUP_MOUNTS_OK
+workload:
+  workdir: /work/nested/deep
+  mounts:
+    - {host: ./work, guest: /work}
+  on_start:
+    - test "$(pwd)" = /work/nested/deep && printf ON_START > /work/on-start
+  pre_stop:
+    - test "$(pwd)" = /work/nested/deep && printf PRE_STOP > /work/pre-stop
+  daemons:
+    - test "$(pwd)" = /work/nested/deep && printf DAEMON > /work/daemon && sleep 60
+  run: |
+    set -e
+    test "$(pwd)" = /work/nested/deep
+    test "$(cat /work/runtime-only-seed)" = RUNTIME_ONLY
+    test ! -e /work/guest/namespaces.sh
+    test ! -e /setup-only/setup-result
+    test "$(cat /setup-output)" = SETUP_COPY
+    test "$(cat /work/on-start)" = ON_START
+    until grep -qx DAEMON /work/daemon 2>/dev/null; do sleep 1; done
+    printf RUNTIME_WROTE > /work/runtime-result
+    while true; do sleep 60; done

@@ -11,7 +11,7 @@ use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 
-/// `terra [BOX] setup` - apply a recipe, build the filesystem, run `on_create`.
+/// `terra [BOX] setup` - apply a recipe, build the filesystem, run setup.
 pub async fn run(
     args: &cli::SetupArgs,
     name: Option<&str>,
@@ -36,7 +36,7 @@ pub async fn run(
             trust_recipe: args.trust_recipe,
         }
     };
-    let approved = review.approve(&approval, effect, is_at_a_terminal)?;
+    let mut approved = review.approve(&approval, effect, is_at_a_terminal)?;
     if args.dry_run {
         // The refusals have run; the rest is the disk work a dry run exists
         // not to do.
@@ -46,7 +46,7 @@ pub async fn run(
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let PreparedBox { lock, plan } = prepare_box(&approved, plan, rebuild, held)?;
+    let PreparedBox { lock, plan } = prepare_box(&mut approved, plan, rebuild, held)?;
     let ApprovedRecipe { bx, recipe, .. } = approved;
     if plan != RootPlan::Keep {
         boot::run_setup_vm(&recipe, &bx, &lock).await?;
@@ -61,8 +61,7 @@ enum Rebuild {
     No,
 }
 
-/// What setup does to the box's root image. The root always matches what the
-/// applied recipe gave the setup boot that baked it, so changing that rebuilds it.
+/// What setup does to the box's root image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootPlan {
     Keep,
@@ -145,10 +144,10 @@ fn describe_dry_run(approved: &ApprovedRecipe, plan: RootPlan) -> String {
             format!("setup would update {bx}'s share and env_file paths")
         }
         RootPlan::Keep => format!("{bx} is already set up for this recipe"),
-        RootPlan::Create if approved.recipe.hooks.on_create.is_empty() => {
+        RootPlan::Create if approved.recipe.setup.run.is_empty() => {
             format!("setup would create {bx}")
         }
-        RootPlan::Create => format!("setup would create {bx} and run on_create"),
+        RootPlan::Create => format!("setup would create {bx} and run setup"),
         RootPlan::Rebuild(reason) => {
             format!(
                 "setup would rebuild {bx} from scratch: {}",
@@ -166,17 +165,18 @@ struct PreparedBox {
 /// Carry out the approved plan under `held`, the lock taken before approval, or
 /// a new one for a box that had no state to lock then.
 fn prepare_box(
-    approved: &ApprovedRecipe,
+    approved: &mut ApprovedRecipe,
     approved_plan: RootPlan,
     rebuild: Rebuild,
     held: Option<File>,
 ) -> Result<PreparedBox> {
-    let ApprovedRecipe { bx, recipe, .. } = approved;
-    let lock = match held {
-        Some(lock) => lock,
-        None => bx.lock_and_repair()?,
+    let (lock, plan) = if let Some(lock) = held {
+        (lock, approved_plan)
+    } else {
+        let lock = approved.bx.lock_and_repair()?;
+        (lock, replan_under_lock(approved, approved_plan, rebuild)?)
     };
-    let plan = replan_under_lock(approved, approved_plan, rebuild)?;
+    let bx = &approved.bx;
     bx.prepare_state_dir()?;
     match plan {
         RootPlan::Keep if approved.changed_recipe.is_some() => {
@@ -186,22 +186,21 @@ fn prepare_box(
         RootPlan::Create => discard_root(bx)?,
         RootPlan::Rebuild(reason) => {
             eprintln!(
-                "terra: rebuilding {bx} from scratch: {} - on_create runs again; box volumes are kept",
+                "terra: rebuilding {bx} from scratch: {} - setup runs again; box volumes are kept",
                 reason.describe()
             );
             discard_root(bx)?;
         }
     }
     approved.write_applied_recipe(bx.get_dir())?;
-    install_or_grow_images(bx, recipe, rebuild)?;
+    install_or_grow_images(bx, &approved.recipe, rebuild)?;
     Ok(PreparedBox { lock, plan })
 }
 
-/// Plan again now that the box is locked: a box that had no state to lock
-/// while the question was open may have been set up since, and the plan
-/// approved for it must not discard that root unasked.
+/// A competing setup may have built the root while this one awaited approval.
+/// Keeping that root also keeps the setup grants recorded by its builder.
 fn replan_under_lock(
-    approved: &ApprovedRecipe,
+    approved: &mut ApprovedRecipe,
     approved_plan: RootPlan,
     rebuild: Rebuild,
 ) -> Result<RootPlan> {
@@ -216,6 +215,11 @@ fn replan_under_lock(
         "{bx} changed while setup was waiting for an answer - run `terra {} setup` again",
         bx.get_name()
     );
+    if plan == RootPlan::Keep && approved.pinned_paths.is_some() {
+        let existing = bx.load_pinned_paths()?;
+        let updated = state::PinnedPaths::for_kept_root(&approved.recipe, existing.as_ref());
+        approved.pinned_paths = (existing.as_ref() != Some(&updated)).then_some(updated);
+    }
     Ok(plan)
 }
 
@@ -281,15 +285,243 @@ mod tests {
     use crate::approval::approve_by_hand;
 
     /// Plan and carry out a setup's disk work, as `run` does.
-    fn prepare(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<File> {
+    fn prepare(mut approved: ApprovedRecipe, rebuild: Rebuild) -> Result<File> {
         let changed_text = approved
             .changed_recipe
             .as_ref()
             .map(|file| file.text.as_str());
         let plan = plan_root(&approved.bx, rebuild, changed_text)?;
-        Ok(prepare_box(approved, plan, rebuild, None)?.lock)
+        Ok(prepare_box(&mut approved, plan, rebuild, None)?.lock)
     }
     use crate::recipe::resolve::ResolvedRecipe;
+
+    #[tokio::test]
+    async fn oversized_phase_plans_are_refused_before_replacing_the_applied_recipe_or_root() {
+        let _home = crate::sys::TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let original = "setup: {run: ['true']}\n";
+        let original_pins = state::PinnedPaths::for_setup(&yaml_serde::from_str(original).unwrap());
+        let command = "x".repeat(terra_protocol::MAX_PLAN_BYTES);
+        let args = cli::SetupArgs {
+            trust_recipe: true,
+            rebuild: false,
+            dry_run: false,
+        };
+        for (name, recipe) in [
+            ("large-setup", format!("setup:\n  run:\n    - {command}\n")),
+            (
+                "large-workload",
+                format!("{original}workload:\n  run: {command}\n"),
+            ),
+        ] {
+            let bx = BoxRef::resolve(project, name).unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let applied_recipe = bx.get_dir().join(state::RECIPE_FILE);
+            let root = bx.get_dir().join(state::ROOTFS_FILE);
+            state::write_applied_recipe(bx.get_dir(), Some(original), Some(&original_pins))
+                .unwrap();
+            std::fs::write(&root, b"baked root").unwrap();
+            bx.write_setup_stamp().unwrap();
+            let recipe_arg = format!("./{name}.yaml");
+            std::fs::write(project.join(&recipe_arg), recipe).unwrap();
+
+            let error = run(&args, Some(&recipe_arg), project, project, false)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("boot plan exceeds its encoded size limit"),
+                "{name}: {error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(applied_recipe).unwrap(), original);
+            assert_eq!(std::fs::read(root).unwrap(), b"baked root");
+            assert_eq!(
+                bx.load_pinned_paths().unwrap().as_ref(),
+                Some(&original_pins)
+            );
+            assert!(bx.is_set_up());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_applied_box_with_missing_pins_needs_approval_to_recover() {
+        let _home = crate::sys::TestHome::new();
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path();
+        let setup_share = project.join("setup-share");
+        std::fs::create_dir(&setup_share).unwrap();
+        std::fs::create_dir(project.join("share")).unwrap();
+        std::fs::write(project.join("env"), "VAR=value\n").unwrap();
+        for (name, text) in [
+            (
+                "with-setup",
+                "setup: {mounts: [{host: ./setup-share, guest: /share}]}\n",
+            ),
+            (
+                "with-workload",
+                "workload: {mounts: [{host: ./share, guest: /share}]}\n",
+            ),
+            ("with-dotenv", "env_file: ./env\n"),
+            ("empty", "network: {enabled: false}\n"),
+        ] {
+            let bx = BoxRef::resolve(project, name).unwrap();
+            let recipe_arg = format!("./{name}.yaml");
+            let recipe_path = project.join(&recipe_arg);
+            let applied = || ResolvedRecipe {
+                bx: bx.clone(),
+                source: resolve::Source::Applied,
+                manifest: None,
+            };
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let root = bx.get_dir().join(state::ROOTFS_FILE);
+            let applied_recipe = bx.get_dir().join(state::RECIPE_FILE);
+            std::fs::write(&applied_recipe, text).unwrap();
+            std::fs::write(&root, b"baked root").unwrap();
+            bx.write_setup_stamp().unwrap();
+
+            let pins = bx.get_dir().join(state::PINNED_PATHS_FILE);
+            let error = applied().load_applied_recipe().unwrap_err();
+            assert!(
+                error.to_string().contains(state::PINNED_PATHS_FILE),
+                "{error:#}"
+            );
+
+            std::fs::write(recipe_path, format!("{text}env: {{REVIEW_TEST: new}}\n")).unwrap();
+            for name in [name, recipe_arg.as_str()] {
+                let error = run(
+                    &cli::SetupArgs {
+                        trust_recipe: false,
+                        rebuild: false,
+                        dry_run: false,
+                    },
+                    Some(name),
+                    project,
+                    project,
+                    false,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(state::PINNED_PATHS_FILE), "{error}");
+                assert!(error.contains("--trust-recipe"), "{error}");
+                assert!(!pins.exists());
+                assert_eq!(std::fs::read(&root).unwrap(), b"baked root");
+                assert_eq!(std::fs::read_to_string(&applied_recipe).unwrap(), text);
+            }
+
+            if name == "with-setup" {
+                std::fs::remove_dir(&setup_share).unwrap();
+            }
+            let result = run(
+                &cli::SetupArgs {
+                    trust_recipe: true,
+                    rebuild: false,
+                    dry_run: false,
+                },
+                Some(name),
+                project,
+                project,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, ExitCode::SUCCESS);
+            assert!(bx.is_set_up());
+            let mut root_prefix = [0; b"baked root".len()];
+            std::io::Read::read_exact(&mut File::open(root).unwrap(), &mut root_prefix).unwrap();
+            assert_eq!(&root_prefix, b"baked root");
+            assert_eq!(std::fs::read_to_string(applied_recipe).unwrap(), text);
+            let refreshed_pins = bx.load_pinned_paths().unwrap().unwrap();
+            assert_eq!(refreshed_pins.setup_mounts, [] as [std::path::PathBuf; 0]);
+            applied().load_applied_recipe().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn keeping_a_baked_root_ignores_missing_and_retargeted_setup_mounts() {
+        let _home = crate::sys::TestHome::new();
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        for path in [&project, &first, &second] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let source = project.join("sdk");
+        crate::sys::symlink_dir(&first, &source).unwrap();
+        let recipe_path = project.join("dev.yaml");
+        let text = "network: {enabled: false}\nsetup: {mounts: [{host: ./sdk, guest: /sdk}]}\n";
+        std::fs::write(&recipe_path, text).unwrap();
+        let target = resolve::resolve_recipe(
+            Some("./dev.yaml"),
+            &project,
+            resolve::Purpose::Apply { cwd: &project },
+        )
+        .unwrap();
+        let bx = target.bx.clone();
+        let original = approve_by_hand(target, false, false).unwrap();
+        drop(prepare(original, Rebuild::No).unwrap());
+        bx.write_setup_stamp().unwrap();
+        let original_pins = bx.load_pinned_paths().unwrap();
+
+        let keep = cli::SetupArgs {
+            trust_recipe: false,
+            rebuild: false,
+            dry_run: false,
+        };
+        let preview = cli::SetupArgs {
+            dry_run: true,
+            ..keep
+        };
+        let rebuild = cli::SetupArgs {
+            rebuild: true,
+            ..keep
+        };
+        let setup = async |args: &cli::SetupArgs| {
+            run(args, Some("./dev.yaml"), &project, &project, false).await
+        };
+        crate::sys::remove_directory_symlink(&source).unwrap();
+        setup(&keep).await.unwrap();
+        setup(&preview).await.unwrap();
+        let error = setup(&rebuild).await.unwrap_err().to_string();
+        assert!(error.contains("resolving mount host path"), "{error}");
+        assert!(error.contains("sdk"), "{error}");
+
+        let setup_edit =
+            "network: {enabled: false}\nsetup: {mounts: [{host: ./sdk, guest: /other}]}\n";
+        std::fs::write(&recipe_path, setup_edit).unwrap();
+        let error = setup(&preview).await.unwrap_err().to_string();
+        assert!(error.contains("resolving mount host path"), "{error}");
+
+        let runtime_edit = format!("{text}workload: {{run: 'true'}}\n");
+        std::fs::write(&recipe_path, &runtime_edit).unwrap();
+        setup(&keep).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap(),
+            runtime_edit
+        );
+        assert!(bx.is_set_up());
+
+        crate::sys::symlink_dir(&second, &source).unwrap();
+        setup(&keep).await.unwrap();
+        let error = setup(&rebuild).await.unwrap_err().to_string();
+        assert!(
+            error.contains("target changed since the last setup"),
+            "{error}"
+        );
+        assert!(error.contains("--trust-recipe"), "{error}");
+
+        crate::sys::remove_directory_symlink(&source).unwrap();
+        crate::sys::symlink_dir(bx.get_dir(), &source).unwrap();
+        setup(&preview).await.unwrap();
+        std::fs::write(&recipe_path, setup_edit).unwrap();
+        let error = setup(&preview).await.unwrap_err().to_string();
+        assert!(error.contains("this box's own state"), "{error}");
+        assert!(bx.is_set_up());
+        assert_eq!(bx.load_pinned_paths().unwrap(), original_pins);
+    }
 
     #[test]
     fn a_changed_target_needs_explicit_trust_before_any_source_can_boot_it() {
@@ -307,7 +539,8 @@ mod tests {
             crate::sys::symlink_dir(safe.join("share"), project.join("share")).unwrap();
             crate::sys::symlink_file(safe.join("env"), project.join("env")).unwrap();
             let recipe_text =
-                "mounts:\n  - {host: ./share, guest: /work}\nenv_file: ./env\n".to_string();
+                "workload:\n  mounts:\n    - {host: ./share, guest: /work}\nenv_file: ./env\n"
+                    .to_string();
             let bx = BoxRef::resolve(&project, "dev").unwrap();
             let recipe = || resolve::RecipeFile {
                 from: project.join("dev.yaml"),
@@ -320,7 +553,7 @@ mod tests {
             };
             let approved =
                 approve_by_hand(target(resolve::Source::File(recipe())), false, true).unwrap();
-            prepare(&approved, Rebuild::No).unwrap();
+            prepare(approved, Rebuild::No).unwrap();
 
             let path = if changed_env_file { "env" } else { "share" };
             if changed_env_file {
@@ -368,7 +601,7 @@ mod tests {
 
             let refreshed = approve_by_hand(target(resolve::Source::Applied), true, true)
                 .expect("explicit trust refreshes applied targets");
-            prepare(&refreshed, Rebuild::No).unwrap();
+            prepare(refreshed, Rebuild::No).unwrap();
             target(resolve::Source::Applied)
                 .load_applied_recipe()
                 .expect("the refreshed applied recipe boots");
@@ -428,7 +661,7 @@ mod tests {
                 changed_recipe: None,
                 pinned_paths: None,
             };
-            drop(prepare(&approved, Rebuild::No).unwrap());
+            drop(prepare(approved, Rebuild::No).unwrap());
         };
         let kept_mib = || {
             std::fs::metadata(bx.get_volume_image_path("kept"))
@@ -465,7 +698,7 @@ mod tests {
             changed_recipe: None,
             pinned_paths: None,
         };
-        drop(prepare(&approved, rebuild).unwrap());
+        drop(prepare(approved, rebuild).unwrap());
         (bx, dir, home)
     }
 
@@ -536,7 +769,7 @@ mod tests {
                 changed_recipe,
                 pinned_paths: None,
             };
-            drop(prepare(&approved, Rebuild::No).unwrap());
+            drop(prepare(approved, Rebuild::No).unwrap());
             assert_eq!(stamp.exists(), is_set_up);
             assert_eq!(bx.is_set_up(), is_set_up);
         }
@@ -555,7 +788,7 @@ mod tests {
         crate::vm::image::install_or_grow_rootfs_image(&rootfs, 512).unwrap();
         let recipe_path = bx.get_dir().join(state::RECIPE_FILE);
         for recipe in [
-            "mounts: [{host: ., guest: /new-share}]\n",
+            "workload: {mounts: [{host: ., guest: /new-share}]}\n",
             "volumes: [{name: scratch, guest: /new-volume, size_mib: 8, lifetime: boot}]\n",
             "workload: {workdir: /new-work}\n",
         ] {
@@ -572,7 +805,7 @@ mod tests {
                 changed_recipe: None,
                 pinned_paths: None,
             };
-            drop(prepare(&approved, Rebuild::No).unwrap());
+            drop(prepare(approved, Rebuild::No).unwrap());
             assert!(!bx.get_dir().join(state::SETUP_STAMP).exists(), "{recipe}");
             assert!(!bx.is_set_up(), "{recipe}");
             assert_eq!(std::fs::metadata(&rootfs).unwrap().len(), 512 << 20);
@@ -582,65 +815,122 @@ mod tests {
         }
     }
 
-    /// A setup that waited at its question for a box with no state does not
-    /// discard a root another setup finished meanwhile: the same recipe keeps
-    /// it, and a different one is refused rather than rebuilt unasked.
+    /// A setup racing creation keeps the other setup's baked root and its
+    /// approved setup mounts. A root baked for a different recipe needs a retry.
     #[test]
     fn a_setup_replans_under_the_lock_it_took_after_asking() {
-        for (other_recipe, keeps) in [("{}", true), ("hw: {cpus: 5}\n", false)] {
+        let recipe = "setup: {mounts: [{host: ./sdk, guest: /sdk}]}\nworkload: {mounts: [{host: ./src, guest: /src}]}\n";
+        let workload_edit = recipe.replace("./src", "./other");
+        for (other_recipe, keeps_root) in [
+            (recipe, true),
+            (workload_edit.as_str(), true),
+            ("hw: {cpus: 5}\n", false),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let _home = crate::sys::TestHome::new();
             let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-            let approved = ApprovedRecipe {
+            let pins = |text, source| {
+                state::PinnedPaths::new(
+                    &yaml_serde::from_str(text).unwrap(),
+                    vec![dir.path().join(source)],
+                )
+            };
+            let candidate_text = format!("# mine\n{recipe}");
+            let mut approved = ApprovedRecipe {
                 bx: bx.clone(),
-                recipe: Recipe::default(),
+                recipe: yaml_serde::from_str(recipe).unwrap(),
                 changed_recipe: Some(resolve::RecipeFile {
                     from: dir.path().join("dev.yaml"),
-                    text: "# mine\n{}\n".into(),
+                    text: candidate_text.clone(),
                 }),
-                pinned_paths: None,
+                pinned_paths: Some(pins(recipe, "mine")),
             };
-            let plan = plan_root(&bx, Rebuild::No, Some("# mine\n{}\n")).unwrap();
+            let plan = plan_root(&bx, Rebuild::No, Some(&candidate_text)).unwrap();
             assert_eq!(plan, RootPlan::Create);
 
             std::fs::create_dir_all(bx.get_dir()).unwrap();
-            std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"theirs").unwrap();
-            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), other_recipe).unwrap();
+            let root_path = bx.get_dir().join(state::ROOTFS_FILE);
+            std::fs::write(&root_path, b"theirs").unwrap();
+            let their_pins = pins(other_recipe, "theirs");
+            state::write_applied_recipe(bx.get_dir(), Some(other_recipe), Some(&their_pins))
+                .unwrap();
             bx.write_setup_stamp().unwrap();
 
-            let prepared = prepare_box(&approved, plan, Rebuild::No, None);
-            let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
-            assert!(root.starts_with(b"theirs"), "{other_recipe}");
-            if keeps {
+            let prepared = prepare_box(&mut approved, plan, Rebuild::No, None);
+            let mut root = [0; b"theirs".len()];
+            std::io::Read::read_exact(&mut File::open(root_path).unwrap(), &mut root).unwrap();
+            assert_eq!(&root, b"theirs");
+            if keeps_root {
                 assert_eq!(prepared.unwrap().plan, RootPlan::Keep);
+                assert_eq!(approved.pinned_paths.is_some(), other_recipe != recipe);
+                assert_eq!(
+                    bx.load_pinned_paths().unwrap(),
+                    Some(pins(recipe, "theirs"))
+                );
             } else {
                 let error = prepared.err().expect("a different recipe rebuilt unasked");
                 assert!(error.to_string().contains("changed while setup"), "{error}");
+                assert_eq!(bx.load_pinned_paths().unwrap(), Some(their_pins));
             }
         }
     }
 
-    /// Only what the setup boot sees decides a rebuild. A new `run`, daemon,
-    /// `on_start`/`pre_stop` hook, `sudo`, published port, component memory or
-    /// read-only flag is applied over the baked root, which stays bootable with
-    /// no setup VM; `workdir` is made on the root by the setup boot, and
-    /// `on_create` reads `hw.cpus`, so changing either rebuilds.
+    #[test]
+    fn an_approved_keep_plan_cannot_turn_into_a_setup_boot() {
+        let _home = crate::sys::TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        let root = bx.get_dir().join(state::ROOTFS_FILE);
+        std::fs::write(&root, b"baked root").unwrap();
+        let recipe_path = bx.get_dir().join(state::RECIPE_FILE);
+        std::fs::write(&recipe_path, "{}").unwrap();
+        bx.write_setup_stamp().unwrap();
+        let mut approved = ApprovedRecipe {
+            bx: bx.clone(),
+            recipe: Recipe::default(),
+            changed_recipe: None,
+            pinned_paths: None,
+        };
+        let plan = plan_root(&bx, Rebuild::No, None).unwrap();
+        assert_eq!(plan, RootPlan::Keep);
+        bx.remove_setup_stamp().unwrap();
+
+        let error = prepare_box(&mut approved, plan, Rebuild::No, None)
+            .err()
+            .expect("the keep plan no longer applies");
+        assert!(error.to_string().contains("changed while setup"), "{error}");
+        assert_eq!(std::fs::read(root).unwrap(), b"baked root");
+    }
+
+    /// Only what the setup boot sees decides a rebuild. A new runtime command,
+    /// daemon, lifecycle hook, `workload.sudo`, published port, component
+    /// memory or read-only flag is applied over the baked root, which stays
+    /// bootable with no setup VM. A new runtime mount's source and access are
+    /// equally runtime-only, but its destination is baked; setup commands,
+    /// their workdir and mounts shape the root, and setup reads `hw.cpus`.
     #[test]
     fn only_what_the_setup_boot_sees_rebuilds_the_root() {
         for (text, keeps) in [
             (
-                "workload: {run: exec bash -l}\ndaemons: [sleep 9]\n\
-                 hooks: {on_start: [true], pre_stop: [true]}\n",
+                "workload:\n  run: exec bash -l\n  daemons: [sleep 9]\n  \
+                 on_start: [true]\n  pre_stop: [true]\n  sudo: [apk]\n",
                 true,
             ),
             (
-                "hw: {rootfs_readonly: true}\ncomponents: {memory_mib: 96}\nsudo: [apk]\n\
+                "hw: {rootfs_readonly: true}\ncomponents: {memory_mib: 96}\n\
                  network: {ports: ['8080:80']}\n",
                 true,
             ),
+            (
+                "workload: {mounts: [{host: /elsewhere, guest: /work, readonly: true}]}\n",
+                false,
+            ),
             ("workload: {workdir: /srv}\n", false),
             ("hw: {cpus: 3}\n", false),
-            ("hooks: {on_create: [true]}\n", false),
+            ("setup: {run: [true]}\n", false),
+            ("setup: {workdir: /srv}\n", false),
+            ("setup: {mounts: [{host: ., guest: /setup}]}\n", false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let _home = crate::sys::TestHome::new();
@@ -658,7 +948,7 @@ mod tests {
                 }),
                 pinned_paths: None,
             };
-            drop(prepare(&approved, Rebuild::No).unwrap());
+            drop(prepare(approved, Rebuild::No).unwrap());
             let root = std::fs::read(bx.get_dir().join(state::ROOTFS_FILE)).unwrap();
             assert_eq!(root.starts_with(b"baked"), keeps, "{text}");
             assert_eq!(bx.is_set_up(), keeps, "{text}");
@@ -697,7 +987,7 @@ mod tests {
 
         let created = describe(true);
         assert!(
-            created.contains("would create") && !created.contains("on_create"),
+            created.contains("would create") && !created.contains("run setup"),
             "{created}"
         );
         std::fs::create_dir_all(bx.get_dir()).unwrap();
@@ -714,16 +1004,16 @@ mod tests {
             "{}",
             describe(true)
         );
-        let with_on_create = ApprovedRecipe {
+        let with_setup = ApprovedRecipe {
             bx: bx.clone(),
-            recipe: yaml_serde::from_str("hooks: {on_create: [true]}\n").unwrap(),
+            recipe: yaml_serde::from_str("setup: {run: [true]}\n").unwrap(),
             changed_recipe: None,
             pinned_paths: None,
         };
-        let created_with_on_create = describe_dry_run(&with_on_create, RootPlan::Create);
+        let created_with_setup = describe_dry_run(&with_setup, RootPlan::Create);
         assert!(
-            created_with_on_create.contains("and run on_create"),
-            "{created_with_on_create}"
+            created_with_setup.contains("and run setup"),
+            "{created_with_setup}"
         );
     }
 
@@ -766,7 +1056,7 @@ mod tests {
         std::fs::write(
             project.join("dev.yaml"),
             format!(
-                "mounts:\n  - host: {}\n    guest: /work\n",
+                "workload:\n  mounts:\n    - host: {}\n      guest: /work\n",
                 bx.get_dir().display()
             ),
         )

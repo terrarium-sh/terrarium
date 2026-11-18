@@ -1,0 +1,12 @@
+hw: {cpus: 1, mem_mib: 256}
+network: {enabled: false}
+setup:
+  workdir: /prepared/deep
+  run:
+    - test "$(pwd)" = /prepared/deep
+    - printf ROOT_WORKDIR > /prepared/value
+workload:
+  run: |
+    set -e
+    test "$(cat /prepared/value)" = ROOT_WORKDIR
+    echo SETUP_WORKDIR_OK

@@ -120,7 +120,7 @@ fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
     let recipe = fixture.directory.path().join("native.yaml");
     let recipe_json = serde_json::json!({
         "hw": {"cpus": 1, "mem_mib": 256},
-        "hooks": {"on_create": ["echo BAKE_STDOUT; echo BAKE_STDERR >&2"]}
+        "setup": {"run": ["echo BAKE_STDOUT; echo BAKE_STDERR >&2"]}
     });
     std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     let output = fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
@@ -193,8 +193,10 @@ fn native_boot_shares_host_changes_between_running_boxes() {
         let recipe = fixture.directory.path().join("native.yaml");
         let recipe_json = serde_json::json!({
             "hw": {"cpus": 2, "mem_mib": 256},
-            "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
-            "workload": {"run": "exec /bin/sleep 300"}
+            "workload": {
+                "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
+                "run": "exec /bin/sleep 300"
+            }
         });
         std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
@@ -301,7 +303,7 @@ chmod 755 /usr/bin/slirp4netns
     } else {
         String::new()
     };
-    let on_create = format!(
+    let setup_run = format!(
         r"set -e
 apk add --no-cache podman fuse-overlayfs{packages}
 {helper_wrapper}d=/home/terri/rootfs
@@ -400,10 +402,12 @@ echo ROOTLESS_PODMAN_OK"#
             ]
         },
         "env": {"XDG_DATA_HOME": "/podman"},
-        "hooks": {"on_create": [on_create]},
+        "setup": {"run": [setup_run]},
         "volumes": [{"name": "podman", "guest": "/podman", "size_mib": 256}],
-        "mounts": [{"host": readonly, "guest": "/readonly", "readonly": true}],
-        "workload": {"run": format!("set -ex\n{script}")}
+        "workload": {
+            "mounts": [{"host": readonly, "guest": "/readonly", "readonly": true}],
+            "run": format!("set -ex\n{script}")
+        }
     });
     std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
@@ -478,8 +482,10 @@ fn native_boot_forwards_shared_file_events() {
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
         let recipe = fixture.directory.path().join("native.yaml");
         let recipe_json = serde_json::json!({
-            "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
-            "workload": {"run": "exec /bin/sleep 300"}
+            "workload": {
+                "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
+                "run": "exec /bin/sleep 300"
+            }
         });
         std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
@@ -623,9 +629,11 @@ fn native_boot_reloads_node_server_from_host_events() {
     let recipe = fixture.directory.path().join("native.yaml");
     let recipe_json = serde_json::json!({
         "network": {"mode": "unrestricted-public"},
-        "hooks": {"on_create": ["apk add --no-cache nodejs"]},
-        "mounts": [{"host": shared, "guest": "/shared", "readonly": true}],
-        "workload": {"run": "exec /usr/bin/node --watch /shared/server.js"}
+        "setup": {"run": ["apk add --no-cache nodejs"]},
+        "workload": {
+            "mounts": [{"host": shared, "guest": "/shared", "readonly": true}],
+            "run": "exec /usr/bin/node --watch /shared/server.js"
+        }
     });
     std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     fixture.successful(&[recipe.to_str().unwrap(), "setup"]);

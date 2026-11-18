@@ -37,10 +37,28 @@ pub(crate) fn mount_shares_and_volumes(plan: &terra_protocol::Plan) -> Result<()
     mount_volumes(plan)
 }
 
-pub(crate) fn mount_volumes(plan: &terra_protocol::Plan) -> Result<()> {
+pub(crate) fn unmount_shares(plan: &terra_protocol::Plan) -> Result<()> {
+    let mut cleanup = Ok(());
+    for share in plan.shares.iter().rev() {
+        let guest_path = share.guest.as_str();
+        loop {
+            match rustix::mount::unmount(guest_path, rustix::mount::UnmountFlags::DETACH) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::INVAL) => break,
+                Err(error) => {
+                    let error =
+                        Err(error).with_context(|| format!("unmounting setup share {guest_path}"));
+                    cleanup = cleanup.and(error);
+                    break;
+                }
+            }
+        }
+    }
+    cleanup
+}
+
+fn mount_volumes(plan: &terra_protocol::Plan) -> Result<()> {
     for volume in &plan.volumes {
-        // Setup made the mount points in the root image; this creates the ones nested
-        // inside an already-mounted share (`/work/node_modules` under `/work`).
         prepare_mount_point(&volume.guest)?;
         mount(&volume.dev, &volume.guest, "ext4", DATA_MOUNT_FLAGS)?;
         if let Err(error) = std::fs::File::open(&volume.guest)
@@ -71,15 +89,11 @@ fn mount_share(share: &terra_protocol::Share) -> Result<()> {
 }
 
 pub(crate) fn prepare_mount_points(plan: &terra_protocol::Plan) -> Result<()> {
-    for path in plan
-        .shares
+    plan.mount_points
         .iter()
-        .map(|share| &share.guest)
         .chain(plan.volumes.iter().map(|volume| &volume.guest))
-    {
-        prepare_mount_point(path)?;
-    }
-    Ok(())
+        .map(|path| prepare_mount_point(path))
+        .fold(Ok(()), Result::and)
 }
 
 fn prepare_mount_point(path: &str) -> Result<()> {
@@ -91,6 +105,29 @@ fn prepare_mount_point(path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn mount_point_preparation_continues_after_an_error() {
+        let directory = crate::create_scratch_path("mounts", "prepare-all");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("file");
+        fs::write(&file, []).unwrap();
+        let valid = directory.join("valid");
+
+        let mut plan = terra_protocol::Plan::bare_run(None);
+        plan.mount_points = [&file, &valid]
+            .map(|path| path.to_str().unwrap().to_owned())
+            .into();
+        let result = prepare_mount_points(&plan);
+        assert!(valid.is_dir());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("creating mount point {}", file.display())
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn a_symlinked_mount_point_is_supported() {
         let real = crate::create_scratch_path("mounts", "mp-real");

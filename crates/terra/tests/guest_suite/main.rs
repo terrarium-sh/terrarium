@@ -291,8 +291,16 @@ fn run_exercises(suite: &mut Suite) -> Result<()> {
             .replace("{allowed_port}", &allowed_port.to_string())
             .replace("{published_port}", &published_port.to_string()),
     )?;
-    fill_share_path(&mut recipe["mounts"][0]["host"], "{writable}", &writable)?;
-    fill_share_path(&mut recipe["mounts"][1]["host"], "{readonly}", &readonly)?;
+    fill_share_path(
+        &mut recipe["workload"]["mounts"][0]["host"],
+        "{writable}",
+        &writable,
+    )?;
+    fill_share_path(
+        &mut recipe["workload"]["mounts"][1]["host"],
+        "{readonly}",
+        &readonly,
+    )?;
     require_output(&suite.setup("exercise", &recipe, Some(0))?, "BAKE_OK")?;
     suite.run(&["exercise", "setup"])?;
     let resolved = suite.read_json(&["exercise", "show", "--json", "--with-env-values"])?;
@@ -649,14 +657,22 @@ next: value",
         "/self test/{writable}/'quoted' \"double\"
 next: value",
     );
-    fill_share_path(&mut exercise["mounts"][0]["host"], "{writable}", writable)?;
-    fill_share_path(&mut exercise["mounts"][1]["host"], "{readonly}", readonly)?;
+    fill_share_path(
+        &mut exercise["workload"]["mounts"][0]["host"],
+        "{writable}",
+        writable,
+    )?;
+    fill_share_path(
+        &mut exercise["workload"]["mounts"][1]["host"],
+        "{readonly}",
+        readonly,
+    )?;
     let serialized = yaml_serde::to_string(&exercise)?;
     let reparsed: Value = yaml_serde::from_str(&serialized)?;
     assert_eq!(reparsed, exercise);
     let parsed: terra::recipe::Recipe = yaml_serde::from_str(&serialized)?;
-    assert_eq!(parsed.mounts[0].host, writable);
-    assert_eq!(parsed.mounts[1].host, readonly);
+    assert_eq!(parsed.workload.mounts[0].host, writable);
+    assert_eq!(parsed.workload.mounts[1].host, readonly);
     assert_eq!(parsed.hw.cpus, 2);
     assert_eq!(parsed.hw.mem_mib, 512);
     assert_eq!(parsed.hw.rootfs_mib, 128);
@@ -668,7 +684,7 @@ next: value",
         exercise["network"]["ports"],
         serde_json::json!(["54321:18080", "54321:18082/udp"])
     );
-    assert!(parsed.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
+    assert!(parsed.workload.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
     let hardware = serde_json::to_string(&exercise["hw"])?;
     for template in [
         include_str!("recipes/isolated.yaml"),

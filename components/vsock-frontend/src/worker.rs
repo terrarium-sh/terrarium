@@ -7,25 +7,19 @@ const MAX_DEVICE_STEPS: usize = 32;
 static RUN: futures_util::lock::Mutex<()> = futures_util::lock::Mutex::new(());
 
 fn retire_connections() -> bool {
+    let candidates: Vec<_> = {
+        let device = switch();
+        device
+            .retirements()
+            .filter(|connection| !device.has_pending_replies_for(*connection))
+            .collect()
+    };
     let mut progressed = false;
-    let mut offset = 0;
-    loop {
-        let connection = {
-            let device = switch();
-            device
-                .retirements()
-                .filter(|connection| !device.has_pending_replies_for(*connection))
-                .nth(offset)
-        };
-        let Some(connection) = connection else {
-            break;
-        };
+    for connection in candidates {
         if !transport::has_pending_reply_for(connection) && switch().retire_connection(connection) {
             network::notify_connection(connection);
             network::notify_admission();
             progressed = true;
-        } else {
-            offset += 1;
         }
     }
     progressed

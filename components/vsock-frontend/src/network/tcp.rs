@@ -71,10 +71,7 @@ pub(super) async fn relay(connection: ConnectionId, socket: &Tcp) {
     let (writer, input) = wit_stream::new();
     let sent = socket.send(input);
     let (output, received) = socket.receive();
-    let upstream = async {
-        try_join(pump_upstream(connection, writer), async { sent.await }).await?;
-        Ok::<_, broker::Error>(())
-    };
+    let upstream = try_join(pump_upstream(connection, writer), async { sent.await });
     let downstream = pump_downstream(connection, output, Some(received));
     if try_join(upstream, downstream).await.is_err() {
         reset_flow(connection);

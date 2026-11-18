@@ -499,8 +499,10 @@ def measure_box(binary, probe, run, args, fixtures):
         shutil.copy2(probe, mount / "probe")
         recipe = {
             "hw": {"cpus": 2, "mem_mib": 512},
-            "workload": {"run": "while :; do sleep 60; done"},
-            "mounts": [{"host": str(mount), "guest": "/bench", "readonly": True}],
+            "workload": {
+                "run": "while :; do sleep 60; done",
+                "mounts": [{"host": str(mount), "guest": "/bench", "readonly": True}],
+            },
             "network": {
                 "allow": [f"benchmark.test:{fixtures.tcp_port}", f"benchmark.test:{fixtures.udp_port}"],
                 "hosts": [{"name": "benchmark.test", "addr": "HOST_LOOPBACK"}],
@@ -650,7 +652,7 @@ def main():
         else:
             probe = args.guest_probe.resolve()
         report = {
-            "schema_version": 3,
+            "schema_version": 1,
             "generated_at_utc": datetime.now(UTC).isoformat(),
             "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "affinity_cpus": sorted(os.sched_getaffinity(0))},
             "probe_sha256": BENCH.digest(probe),

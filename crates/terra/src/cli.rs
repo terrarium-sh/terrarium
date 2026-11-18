@@ -20,7 +20,7 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
     after_long_help = "EXAMPLES:\n    \
                        terra dev                   Start this directory's box `dev`, or attach\n    \
                        terra dev exec -- ls        Run a command in the running box\n    \
-                       terra ./pi-dev.yaml setup   Set up a box from a recipe\n    \
+                       terra ./example.yaml setup  Set up a box from a recipe\n    \
                        terra dev logs -f           Follow the box's log"
 )]
 pub struct Cli {
@@ -144,24 +144,27 @@ pub fn parse_or_exit() -> Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Set up a box for this directory: read a recipe, apply it, build the guest
-    /// filesystem, and run `on_create`. Safe to run again.
+    /// filesystem, and run `setup.run`. Safe to run again.
     ///
-    /// A changed recipe rebuilds the root filesystem and reruns `on_create`,
+    /// A changed recipe rebuilds the root filesystem and reruns setup,
     /// keeping volumes. A change only to run-time fields, such as
-    /// `workload.run` or `daemons`, applies without a rebuild; comments,
+    /// `workload.run` or `workload.daemons`, applies without a rebuild; comments,
     /// formatting and a field written with its default value are not changes.
+    ///
+    /// Setup checks host targets in `setup.mounts` when it creates or rebuilds
+    /// the root filesystem. A dry run checks those targets when it would build.
     ///
     /// A recipe path wins over manifest aliases and names the box by its file
     /// stem. A box name uses its optional `terra.yaml` alias, or reuses its
     /// applied recipe; pass the path again to apply file edits without an alias.
     #[command(after_long_help = "EXAMPLES:\n    \
-                           terra ./pi-dev.yaml setup   Apply a recipe file")]
+                           terra ./example.yaml setup   Apply a recipe file")]
     Setup(SetupArgs),
     /// Run a command in a running box, on a terminal of its own - a second
     /// process beside the workload, not a second view of it.
     ///
     /// Runs as whoever the workload runs as; `--root` runs it as root instead.
-    /// That is the difference from a `sudo:` entry, which hands the same power
+    /// That is the difference from a `workload.sudo` entry, which hands the same power
     /// to the workload permanently.
     ///
     /// Its exit status is this command's.
@@ -190,13 +193,12 @@ pub enum Cmd {
     /// The client's connection is closed and its terminal restored, as if the
     /// detach key had been pressed.
     Detach(DetachArgs),
-    /// Print the fully-resolved recipe a boot would use: the box's applied
-    /// recipe, or - for a box not set up yet, or a recipe named by path - the
-    /// recipe that would be applied.
+    /// Print the box's applied recipe, or the recipe that would be applied to
+    /// a new box or when named by path.
     ///
-    /// For review only - `env:` values are printed as a placeholder unless
-    /// `--with-env-values`, and paths as the absolute ones they resolved to on
-    /// this machine, so it is not a recipe you can apply back.
+    /// For review only. Workload mount and `env_file` paths resolve on this
+    /// machine. Setup mount declarations are printed without checking their
+    /// host targets. `env:` values are hidden unless `--with-env-values` is set.
     Show(ShowArgs),
     /// List this directory's boxes and what state each is in - or, with
     /// `--all`, every box on this machine.
@@ -268,10 +270,13 @@ pub struct SetupArgs {
     pub trust_recipe: bool,
     /// Rebuild the guest filesystem even when the recipe is unchanged, and
     /// remove the volume images the recipe no longer names.
+    ///
+    /// Use after changing files setup consumes or retargeting a setup mount
+    /// source symlink.
     #[arg(long)]
     pub rebuild: bool,
     /// Run every refusal this setup would raise and stop before it changes
-    /// anything: nothing is applied, no filesystem is built, no hook runs.
+    /// anything: nothing is applied, no filesystem is built, no setup command runs.
     ///
     /// Exits 0 if the setup would go through, non-zero with the refusal if it
     /// would not - so a CI step is `terra <box> setup --dry-run`. The other two
@@ -510,8 +515,8 @@ pub struct BootArgs {
     #[arg(long)]
     pub root: bool,
 
-    /// Run headless after the guest agent becomes ready, before startup hooks
-    /// finish. Boot fails if the agent is not ready within 60 seconds.
+    /// Run headless after the guest agent becomes ready, before `workload.on_start`
+    /// commands finish. Boot fails if the agent is not ready within 60 seconds.
     #[arg(short = 'd', long)]
     pub detach: bool,
 
@@ -546,13 +551,13 @@ mod tests {
         assert!(bare.cmd.is_none());
         assert!(bare.name.is_none());
 
-        let named = Cli::parse_from(["terra", "pi-dev", "-d"]);
+        let named = Cli::parse_from(["terra", "example", "-d"]);
         assert!(named.cmd.is_none());
-        assert_eq!(named.name.as_deref(), Some("pi-dev"));
+        assert_eq!(named.name.as_deref(), Some("example"));
         assert!(named.boot.detach);
 
         assert_matches!(
-            Cli::parse_from(["terra", "pi-dev", "setup"]).cmd,
+            Cli::parse_from(["terra", "example", "setup"]).cmd,
             Some(Cmd::Setup(_))
         );
         let Some(Cmd::Rm(rm_args)) = Cli::parse_from(["terra", "rm", "--purge"]).cmd else {
@@ -588,8 +593,8 @@ mod tests {
             // …and its box may be a recipe path, which is why it looked like it
             // needed a positional of its own.
             (
-                vec!["terra", "./pi-dev.yaml", "setup"],
-                Some("./pi-dev.yaml"),
+                vec!["terra", "./example.yaml", "setup"],
+                Some("./example.yaml"),
             ),
         ] {
             let cli = Cli::parse_from(&argv);
@@ -605,7 +610,7 @@ mod tests {
             &["logs", "dev"],
             &["show", "dev"],
             &["setup", "dev"],
-            &["setup", "./pi-dev.yaml"],
+            &["setup", "./example.yaml"],
         ] {
             let argv: Vec<&str> = std::iter::once("terra")
                 .chain(reversed.iter().copied())
@@ -978,7 +983,7 @@ mod tests {
 
     /// `terra setup` sets up; booting is `terra <box>`'s job. The boot flags
     /// used to ride on setup too, and which of the two commands you typed
-    /// silently decided which sandbox `on_create` ran in.
+    /// silently decided which sandbox setup ran in.
     #[test]
     fn setup_takes_no_boot_flags() {
         for flag in ["-d", "--foreground", "--root"] {

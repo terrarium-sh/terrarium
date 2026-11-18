@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline podman wireguard readonly overlay bad-bake rebuild"
+boxes="probe setup-mounts setup-workdir setup-bad-workdir nested-mounts isolated offline podman wireguard readonly overlay bad-bake rebuild"
 
 terra=terra
 suite=
@@ -197,7 +197,8 @@ expect_contains() {
 }
 
 expect_listed() {
-  expect_contains "$(output ls --state "$2" --quiet)" "$1"
+  listed=$(output ls --state "$2" --quiet)
+  expect_contains "$listed" "$1"
 }
 
 # --- Steps.
@@ -206,7 +207,7 @@ begin "terra runs"
 version=$(terra_version 2>> "$log")
 passed
 
-mkdir -p "$project/work" "$project/readonly"
+mkdir -p "$project/work" "$project/readonly" "$project/setup-work"
 cp -R "$suite" "$project/suite"
 cd "$project"
 printf HOST_SEED > work/host
@@ -228,12 +229,67 @@ for recipe in $boxes; do
 done
 
 begin "setup bakes the recipe, and again is a no-op"
-expect_contains "$(output ./probe.yaml setup)" BAKE_OK
+setup_output=$(output ./probe.yaml setup)
+expect_contains "$setup_output" BAKE_OK
 run probe setup
 expect_contains "$(output probe show --json --with-env-values)" recipe-value
 passed
 
-begin "a detached box runs its hooks, daemons and workload"
+begin "setup mounts: writable default, explicit read-only, phase isolation"
+printf RUNTIME_ONLY > work/runtime-only-seed
+setup_output=$(output ./setup-mounts.yaml setup)
+expect_contains "$setup_output" SETUP_MOUNTS_OK
+test ! -e suite/forbidden
+expect "$(cat setup-work/setup-result)" SETUP_WROTE
+run setup-mounts -d
+run setup-mounts exec --no-tty -- sh -ec 'for i in $(seq 1 30); do [ -s /work/runtime-result ] && break; sleep 1; done; grep -qx RUNTIME_WROTE /work/runtime-result; test ! -e /work/guest/namespaces.sh; test ! -e /setup-only/setup-result; grep -qx SETUP_COPY /setup-output'
+expect "$(cat work/on-start)" ON_START
+expect "$(cat work/daemon)" DAEMON
+run setup-mounts stop
+expect "$(cat work/pre-stop)" PRE_STOP
+passed
+
+begin "storage import defers setup sources and local approval"
+run setup-mounts storage export "$work/setup-mounts.terra"
+mv setup-work "$work/previous-setup-work"
+run setup-mounts storage import --trust-recipe "$work/setup-mounts.terra"
+run setup-mounts setup --dry-run
+run setup-mounts -d
+run setup-mounts exec --no-tty -- sh -ec 'grep -qx SETUP_COPY /setup-output'
+run setup-mounts stop
+mkdir setup-work
+if refused=$(output setup-mounts setup --rebuild); then
+  note "rebuild after import succeeded without local approval"
+  false
+fi
+expect_contains "$refused" --trust-recipe
+setup_output=$(output setup-mounts setup --rebuild --trust-recipe)
+expect_contains "$setup_output" SETUP_MOUNTS_OK
+passed
+
+begin "setup workdirs: created in the root, and a file is refused"
+run ./setup-workdir.yaml setup
+workload_output=$(output setup-workdir --foreground)
+expect_contains "$workload_output" SETUP_WORKDIR_OK
+if failed=$(output ./setup-bad-workdir.yaml setup); then
+  note "setup with an unusable workdir succeeded"
+  false
+fi
+expect_contains "$failed" "terra-agent: setup failed: creating setup workdir /etc/passwd"
+expect_contains "$failed" "setup failed - fix the recipe"
+expect_listed setup-bad-workdir needs_setup
+passed
+
+begin "nested mount targets are refused before setup"
+if failed=$(output ./nested-mounts.yaml setup); then
+  note "setup with nested mount targets succeeded"
+  false
+fi
+expect_contains "$failed" "overlap in setup"
+expect_contains "$failed" "mount at separate paths"
+passed
+
+begin "a detached box runs on_start commands, daemons and its workload"
 run probe -d
 guest_check exercise-ready.sh
 expect "$(cat work/ready)" recipe-value
@@ -334,14 +390,18 @@ expect_contains "$(output wireguard exec --no-tty --root -- sh -e /suite/guest/w
 run wireguard stop
 passed
 
-begin "a read-only root refuses writes; boot-lifetime volumes start empty"
+begin "a read-only root prepares workdirs and refuses writes; boot-lifetime volumes start empty"
 run ./readonly.yaml setup
 run readonly -d
+workdir=$(output readonly exec --no-tty -- pwd)
+expect "$workdir" /prepared/deep
 expect_contains "$(output readonly exec --no-tty --root -- sh -c 'touch /etc/probe 2>&1; true')" \
   "Read-only file system"
 run readonly exec --no-tty -- sh -ec 'echo KEPT > /kept/value; echo GONE > /scratch/value'
 run readonly stop
 run readonly -d
+workdir=$(output readonly exec --no-tty -- pwd)
+expect "$workdir" /prepared/deep
 expect "$(output readonly exec --no-tty -- cat /kept/value)" KEPT
 run readonly exec --no-tty -- sh -ec 'test ! -e /scratch/value'
 run readonly stop
@@ -413,7 +473,8 @@ expect_listed bad-bake needs_setup
 passed
 
 begin "setup rebuilds from scratch only when the recipe says something new"
-expect_contains "$(output ./rebuild.yaml setup)" BAKED_ONE
+setup_output=$(output ./rebuild.yaml setup)
+expect_contains "$setup_output" BAKED_ONE
 expect_setup_untouched() {
   untouched=$(output ./rebuild.yaml setup) || { note "setup failed"; return 1; }
   case "$untouched" in

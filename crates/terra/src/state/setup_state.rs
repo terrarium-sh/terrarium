@@ -1,9 +1,10 @@
 //! How far a box's setup got, and the state `terra ls` reports for it.
 use super::{BoxRef, Holder, RECIPE_FILE, ROOTFS_FILE};
-use crate::recipe::{Components, Hooks, Hw, Mount, Network, Recipe, Workload};
+use crate::recipe::{Components, Hw, Mount, Network, Recipe, Workload};
 use anyhow::{Context, Result};
 use sha2::{Digest as _, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use terra_protocol::WORKLOAD_HOME;
 
 pub(crate) const SETUP_STAMP: &str = "setup-finished";
 
@@ -14,30 +15,27 @@ pub(crate) fn digest_parsed_recipe(text: &str) -> Vec<u8> {
     digest_recipe(text, |_| {})
 }
 
-/// [`digest_parsed_recipe`] of only what a setup boot reads: the digest a
-/// baked root is stamped with.
+/// Hash the recipe fields that determine whether setup can reuse the baked root.
 #[must_use]
 pub fn digest_setup_boot_inputs(text: &str) -> Vec<u8> {
     digest_recipe(text, clear_run_only_fields)
 }
 
 /// Reset what does not shape the root filesystem, so changing it keeps the baked root.
-/// `hw.cpus` and `hw.mem_mib` stay because `on_create` can read them, network
-/// rules stay because `on_create` runs under them, and volumes stay whole
-/// because `on_create` writes into them.
+/// `hw.cpus` and `hw.mem_mib` stay because setup can read them, network rules
+/// stay because setup runs under them, and volumes stay whole because setup
+/// writes into them. A runtime mount's guest path and `workload.workdir` stay
+/// because setup creates those directories in the image.
 fn clear_run_only_fields(recipe: &mut Recipe) {
     let Recipe {
         hw,
         components,
-        mounts,
         volumes: _,
         network,
-        hooks,
-        daemons,
-        workload,
-        sudo,
         env: _,
         env_file: _,
+        setup: _,
+        workload,
     } = recipe;
     let Hw {
         cpus: _,
@@ -52,8 +50,19 @@ fn clear_run_only_fields(recipe: &mut Recipe) {
         hosts: _,
         ports,
     } = network;
+    *rootfs_readonly = false;
+    *components = Components::default();
+    ports.clear();
+    let Workload {
+        workdir: _,
+        mounts,
+        on_start,
+        pre_stop,
+        daemons,
+        sudo,
+        run,
+    } = workload;
     for mount in mounts {
-        // The setup boot makes each share's mount point but mounts no share.
         let Mount {
             host,
             guest: _,
@@ -62,16 +71,7 @@ fn clear_run_only_fields(recipe: &mut Recipe) {
         *host = PathBuf::new();
         *readonly = false;
     }
-    *rootfs_readonly = false;
-    *components = Components::default();
-    ports.clear();
     sudo.clear();
-    let Hooks {
-        on_create: _,
-        on_start,
-        pre_stop,
-    } = hooks;
-    let Workload { run, workdir: _ } = workload;
     *run = None;
     on_start.clear();
     pre_stop.clear();
@@ -82,6 +82,12 @@ fn digest_recipe(text: &str, prepare: fn(&mut Recipe)) -> Vec<u8> {
     let canonical = yaml_serde::from_str::<Recipe>(text)
         .ok()
         .and_then(|mut recipe| {
+            if recipe.setup.workdir.as_deref() == Some(Path::new("/")) {
+                recipe.setup.workdir = None;
+            }
+            if recipe.workload.workdir.as_deref() == Some(Path::new(WORKLOAD_HOME)) {
+                recipe.workload.workdir = None;
+            }
             prepare(&mut recipe);
             let mut value = serde_json::to_value(recipe).ok()?;
             drop_default_fields(&mut value, &serde_json::to_value(Recipe::default()).ok()?);
@@ -297,31 +303,80 @@ mod tests {
         assert_eq!(serde_json::to_string(&BoxState::Gone).unwrap(), "\"gone\"");
     }
 
-    /// The setup boot makes a share's mount point and never mounts the share,
-    /// so only the guest path is a setup-boot input; a volume's lifetime is one,
-    /// since `on_create` writes into the volume.
     #[test]
-    fn only_a_mount_s_guest_path_is_a_setup_boot_input() {
-        let work = digest_setup_boot_inputs("mounts: [{host: ./a, guest: /work}]\n");
+    fn explicit_default_workdirs_keep_the_recipe_and_root() {
+        for digest in [digest_parsed_recipe, digest_setup_boot_inputs] {
+            for recipe in [
+                "setup: {workdir: /}",
+                "workload: {workdir: /home/terri}",
+                "setup: {workdir: /}\nworkload: {workdir: /home/terri}",
+            ] {
+                assert_eq!(digest("{}"), digest(recipe), "{recipe}");
+            }
+        }
+    }
+
+    /// Setup commands, their working directory and mounts are setup inputs; a
+    /// runtime mount's host and access are not, but its destination is because
+    /// setup creates it in the image. A volume's lifetime matters because setup
+    /// writes into the volume.
+    #[test]
+    fn setup_inputs_and_baked_destinations_shape_the_root() {
+        let base = "{}";
+        for changed in [
+            "setup: {run: [echo hi]}",
+            "setup: {workdir: /srv}",
+            "workload: {workdir: /work}",
+            "workload: {mounts: [{host: ./a, guest: /work}]}",
+            "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: boot}]",
+        ] {
+            assert_ne!(
+                digest_setup_boot_inputs(base),
+                digest_setup_boot_inputs(changed)
+            );
+        }
+
+        let setup = digest_setup_boot_inputs("setup: {mounts: [{host: ./a, guest: /setup}]}");
+        assert_ne!(
+            setup,
+            digest_setup_boot_inputs("setup: {mounts: [{host: ./b, guest: /setup}]}"),
+            "setup mount source shapes the root"
+        );
+        assert_ne!(
+            setup,
+            digest_setup_boot_inputs(
+                "setup: {mounts: [{host: ./a, guest: /setup, readonly: true}]}"
+            ),
+            "setup mount access shapes the root"
+        );
+        let work = digest_setup_boot_inputs("workload: {mounts: [{host: ./a, guest: /work}]}");
         assert_eq!(
             work,
-            digest_setup_boot_inputs("mounts: [{host: ./b, guest: /work, readonly: true}]\n")
+            digest_setup_boot_inputs(
+                "workload: {mounts: [{host: ./b, guest: /work, readonly: true}]}"
+            ),
+            "a runtime mount's source and access do not shape the root"
         );
         assert_ne!(
             work,
-            digest_setup_boot_inputs("mounts: [{host: ./a, guest: /data}]\n")
+            digest_setup_boot_inputs("workload: {mounts: [{host: ./a, guest: /data}]}")
         );
-        assert_ne!(
-            digest_setup_boot_inputs("volumes: [{name: v, guest: /v, size_mib: 8}]\n"),
-            digest_setup_boot_inputs(
-                "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: boot}]\n"
-            )
+
+        assert_eq!(
+            digest_setup_boot_inputs("{}"),
+            digest_setup_boot_inputs("setup: {}\nworkload: {}\n"),
+            "default-equivalent spellings are one recipe"
+        );
+        assert_eq!(
+            digest_setup_boot_inputs("setup: {run: [true]}"),
+            digest_setup_boot_inputs("# layout\nsetup:\n  run:\n    - 'true'\n"),
+            "formatting is not a change"
         );
     }
 
     /// An applied recipe this terra cannot parse never matches a stamp an older
     /// terra wrote as the SHA-256 of the raw text, so the box reports
-    /// `needs_setup` instead of `stopped` while every recipe-reading command fails.
+    /// `needs_setup` instead of `stopped` while recipe-dependent operations remain refused.
     #[test]
     fn an_unparseable_recipe_does_not_match_a_legacy_raw_text_stamp() {
         let text = "entrypoint: [sh]\n";

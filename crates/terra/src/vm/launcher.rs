@@ -22,14 +22,12 @@ pub(super) fn prepare_vm_launch(
     }
     #[cfg(windows)]
     {
-        if spec.mode == terra_protocol::PlanMode::Run {
-            for (index, mount) in spec.recipe.mounts.iter().enumerate() {
-                let identity = granted_directory_identity(&grants, &mount.host)?;
-                command.env(
-                    format!("TERRA_WINDOWS_MOUNT_ID_{index}"),
-                    identity.to_string(),
-                );
-            }
+        for (index, mount) in spec.active_mounts().iter().enumerate() {
+            let identity = granted_directory_identity(&grants, &mount.host)?;
+            command.env(
+                format!("TERRA_WINDOWS_MOUNT_ID_{index}"),
+                identity.to_string(),
+            );
         }
     }
     terra_sandbox::prepare_launch(Launch {
@@ -64,22 +62,20 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
         bx.get_dir().display()
     );
     let mut grants = Vec::new();
-    if spec.mode == terra_protocol::PlanMode::Run {
-        for share in &spec.recipe.mounts {
-            let mut grant = Grant::new(
-                &share.host,
-                if share.readonly {
-                    Access::ReadOnly
-                } else {
-                    Access::ReadWrite
-                },
-            );
-            grant.directory = Some(
-                terra_platform::filesystem::share::open_share_root(&share.host)
-                    .with_context(|| format!("opening approved share {}", share.host.display()))?,
-            );
-            grants.push(grant);
-        }
+    for share in spec.active_mounts() {
+        let mut grant = Grant::new(
+            &share.host,
+            if share.readonly {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            },
+        );
+        grant.directory = Some(
+            terra_platform::filesystem::share::open_share_root(&share.host)
+                .with_context(|| format!("opening approved share {}", share.host.display()))?,
+        );
+        grants.push(grant);
     }
     // The box directory itself stays ungranted: it holds stale volumes the recipe no longer names
     // and entries the host CLI trusts, such as an import journal.
@@ -129,7 +125,7 @@ mod tests {
     use terra_protocol::PlanMode;
 
     #[test]
-    fn sandbox_grants_keep_metadata_readonly_and_exclude_setup_shares() {
+    fn sandbox_grants_keep_metadata_readonly_and_exclude_workload_shares_during_setup() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
         let box_dir = base.join("box");
@@ -141,7 +137,7 @@ mod tests {
         let bx = BoxRef::from_state_dir(box_dir, &base);
         std::fs::write(bx.get_volume_image_path("stale"), "").unwrap();
         let mut spec = spec(&base, terra_protocol::PlanMode::Run);
-        spec.recipe.mounts.push(Mount {
+        spec.recipe.workload.mounts.push(Mount {
             host: share.clone(),
             guest: "/share".into(),
             readonly: true,
@@ -170,7 +166,7 @@ mod tests {
             grant.path == bx.get_dir().join(state::RUNTIME_LOG_DIR)
                 && grant.access == Access::ReadWrite
         }));
-        spec.mode = terra_protocol::PlanMode::Create;
+        spec.mode = terra_protocol::PlanMode::Setup;
         let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
         assert!(grants.iter().any(|grant| {
@@ -181,6 +177,41 @@ mod tests {
         crate::sys::symlink_dir(&moved, &share).unwrap();
         spec.mode = terra_protocol::PlanMode::Run;
         assert!(build_sandbox_grants(&spec, &bx).is_err());
+    }
+
+    /// Setup's host sandbox grants only its own mounts with configured access.
+    #[test]
+    fn setup_grants_honor_access_and_exclude_workload_shares() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let box_dir = base.join("box");
+        let setup_share = base.join("setup");
+        let workload_share = base.join("workload");
+        for directory in [&box_dir, &setup_share, &workload_share] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let bx = BoxRef::from_state_dir(box_dir, &base);
+        let mut spec = spec(&base, PlanMode::Setup);
+        spec.recipe.setup.mounts.push(Mount {
+            host: setup_share.clone(),
+            guest: "/setup".into(),
+            readonly: false,
+        });
+        spec.recipe.workload.mounts.push(Mount {
+            host: workload_share.clone(),
+            guest: "/work".into(),
+            readonly: false,
+        });
+        for (readonly, expected_access) in [(false, Access::ReadWrite), (true, Access::ReadOnly)] {
+            spec.recipe.setup.mounts[0].readonly = readonly;
+            let grants = build_sandbox_grants(&spec, &bx).unwrap();
+            assert!(grants.iter().any(|grant| {
+                grant.path == setup_share
+                    && grant.access == expected_access
+                    && grant.directory.is_some()
+            }));
+            assert!(!grants.iter().any(|grant| grant.path == workload_share));
+        }
     }
 
     /// The worker's sandbox grants the root image exactly the access the disk
@@ -204,7 +235,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(rootfs_grant(PlanMode::Run, true), [Access::ReadOnly]);
-        assert_eq!(rootfs_grant(PlanMode::Create, true), [Access::ReadWrite]);
+        assert_eq!(rootfs_grant(PlanMode::Setup, true), [Access::ReadWrite]);
         assert_eq!(rootfs_grant(PlanMode::Run, false), [Access::ReadWrite]);
     }
 

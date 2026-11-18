@@ -26,7 +26,7 @@ mod resources;
 
 use self::boot::BootSpec;
 use crate::policy::network;
-use crate::render::{format_workload_line, redact_recipe_env, render_recipe_yaml};
+use crate::render::{format_workload_line, redact_recipe_env};
 #[cfg(not(any(
     all(
         target_os = "linux",
@@ -41,6 +41,7 @@ use anyhow::{Context as _, Result};
 use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
+use std::path::Path;
 use terra_protocol::{
     Net, Plan, PlanMode, RootfsMount, Share, VolumeMount, WORKLOAD_ID, WORKLOAD_USER_NAME,
 };
@@ -93,20 +94,14 @@ pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8
 }
 
 pub(crate) fn rootfs_access(spec: &BootSpec) -> AccessMode {
-    if spec.mode == PlanMode::Run && spec.recipe.hw.rootfs_readonly {
-        AccessMode::ReadOnly
-    } else {
-        AccessMode::ReadWrite
+    match spec.mode {
+        PlanMode::Run if spec.recipe.hw.rootfs_readonly => AccessMode::ReadOnly,
+        PlanMode::Setup | PlanMode::Run => AccessMode::ReadWrite,
     }
 }
 
-/// The plan the agent runs as PID 1, resolved from the recipe.
-fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
-    let recipe = &spec.recipe;
-    let is_setup_boot = spec.mode == PlanMode::Create;
-    let is_root = spec.root || is_setup_boot;
-    let shares = recipe
-        .mounts
+fn build_shares(spec: &BootSpec) -> Vec<Share> {
+    spec.active_mounts()
         .iter()
         .enumerate()
         .map(|(index, mount)| Share {
@@ -114,19 +109,44 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             guest: mount.guest.to_string_lossy().into_owned(),
             readonly: mount.readonly,
         })
-        .collect();
-    let mut volumes = Vec::new();
-    for (index, volume) in recipe.volumes.iter().enumerate() {
-        if let Some(guest) = &volume.guest {
-            volumes.push(VolumeMount {
+        .collect()
+}
+
+fn build_volumes(recipe: &crate::recipe::Recipe) -> Vec<VolumeMount> {
+    recipe
+        .volumes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, volume)| {
+            Some(VolumeMount {
                 dev: terra_protocol::to_volume_device(index),
-                guest: guest.to_string_lossy().into_owned(),
-            });
+                guest: volume.guest.as_ref()?.to_string_lossy().into_owned(),
+            })
+        })
+        .collect()
+}
+
+fn collect_published_ports(ports: &[String]) -> Result<(Vec<u16>, Vec<u16>)> {
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for mapping in network::rules::parse_port_mappings(ports)? {
+        match mapping.transport {
+            terra_protocol::network::ResourceKind::Tcp => tcp.push(mapping.guest),
+            terra_protocol::network::ResourceKind::Udp => udp.push(mapping.guest),
         }
     }
-    let rootfs = match rootfs_access(spec) {
+    tcp.sort_unstable();
+    tcp.dedup();
+    udp.sort_unstable();
+    udp.dedup();
+    Ok((tcp, udp))
+}
+
+fn build_rootfs(spec: &BootSpec) -> RootfsMount {
+    match rootfs_access(spec) {
         AccessMode::ReadWrite => RootfsMount::Writable,
-        AccessMode::ReadOnly => match recipe
+        AccessMode::ReadOnly => match spec
+            .recipe
             .volumes
             .iter()
             .position(|volume| volume.rootfs_overlay)
@@ -136,53 +156,96 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             },
             None => RootfsMount::ReadOnly,
         },
-    };
-    let sandbox_info = generate_sandbox_info(spec, &rootfs);
-    let published_mappings = if is_setup_boot {
-        Vec::new()
-    } else {
-        network::rules::parse_port_mappings(&recipe.network.ports)?
-    };
-    let (mut published_ports, mut published_udp_ports) = (Vec::new(), Vec::new());
-    for mapping in published_mappings {
-        match mapping.transport {
-            terra_protocol::network::ResourceKind::Tcp => published_ports.push(mapping.guest),
-            terra_protocol::network::ResourceKind::Udp => published_udp_ports.push(mapping.guest),
-        }
     }
-    published_ports.sort_unstable();
-    published_ports.dedup();
-    published_udp_ports.sort_unstable();
-    published_udp_ports.dedup();
-    let plan = Plan {
-        mode: spec.mode,
-        hostname: crate::name::box_hostname(box_name),
-        workdir: recipe
-            .workload
-            .workdir
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        shares,
-        volumes,
-        net: if recipe.network.enabled {
-            Net::Brokered
-        } else {
-            Net::LocalOnly
+}
+
+/// The plan the agent runs as PID 1, resolved from the recipe.
+fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
+    let recipe = &spec.recipe;
+    let rootfs = build_rootfs(spec);
+    let sandbox_info = generate_sandbox_info(spec, &rootfs);
+    let hostname = crate::name::box_hostname(box_name);
+    let shares = build_shares(spec);
+    let volumes = build_volumes(recipe);
+    let net = if recipe.network.enabled {
+        Net::Brokered
+    } else {
+        Net::LocalOnly
+    };
+    let env = recipe.env.clone();
+    let host_tz = read_host_timezone();
+    let workload_workdir = recipe
+        .workload
+        .workdir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+
+    let plan = match spec.mode {
+        PlanMode::Setup => Plan {
+            mode: PlanMode::Setup,
+            hostname,
+            workdir: Some(
+                recipe
+                    .setup
+                    .workdir
+                    .as_deref()
+                    .unwrap_or(Path::new("/"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            shares,
+            mount_points: recipe
+                .workload
+                .mounts
+                .iter()
+                .map(|mount| mount.guest.to_string_lossy().into_owned())
+                .collect(),
+            volumes,
+            net,
+            published_ports: Vec::new(),
+            published_udp_ports: Vec::new(),
+            env,
+            as_root: true,
+            rootfs,
+            sudo: Vec::new(),
+            setup: recipe.setup.run.clone(),
+            on_start: Vec::new(),
+            pre_stop: Vec::new(),
+            daemons: Vec::new(),
+            await_initial_session: true,
+            workload: None,
+            workload_workdir,
+            sandbox_info,
+            host_tz,
         },
-        published_ports,
-        published_udp_ports,
-        env: recipe.env.clone(),
-        as_root: is_root,
-        rootfs,
-        sudo: recipe.sudo.clone(),
-        on_create: recipe.hooks.on_create.clone(),
-        on_start: recipe.hooks.on_start.clone(),
-        pre_stop: recipe.hooks.pre_stop.clone(),
-        daemons: recipe.daemons.clone(),
-        await_initial_session: spec.foreground || spec.mode == PlanMode::Create,
-        workload: recipe.workload.run.clone(),
-        sandbox_info,
-        host_tz: read_host_timezone(),
+        PlanMode::Run => {
+            let (published_ports, published_udp_ports) =
+                collect_published_ports(&recipe.network.ports)?;
+            Plan {
+                mode: PlanMode::Run,
+                hostname,
+                workdir: workload_workdir,
+                shares,
+                mount_points: Vec::new(),
+                volumes,
+                net,
+                published_ports,
+                published_udp_ports,
+                env,
+                as_root: spec.root,
+                rootfs,
+                sudo: recipe.workload.sudo.clone(),
+                setup: Vec::new(),
+                on_start: recipe.workload.on_start.clone(),
+                pre_stop: recipe.workload.pre_stop.clone(),
+                daemons: recipe.workload.daemons.clone(),
+                await_initial_session: spec.foreground,
+                workload: recipe.workload.run.clone(),
+                workload_workdir: None,
+                sandbox_info,
+                host_tz,
+            }
+        }
     };
     plan.validate_network()?;
     Ok(plan)
@@ -192,9 +255,21 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
 /// around the box finds an explanation instead of guessing.
 #[must_use]
 fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
+    match spec.mode {
+        PlanMode::Setup => return String::new(),
+        PlanMode::Run => {}
+    }
     let recipe = &spec.recipe;
-    let yaml = render_recipe_yaml(&redact_recipe_env(recipe)).unwrap_or_default();
-    let who = if spec.root || spec.mode == PlanMode::Create {
+    let yaml = yaml_serde::to_value(redact_recipe_env(recipe))
+        .and_then(|mut value| {
+            if let yaml_serde::Value::Mapping(fields) = &mut value {
+                fields.remove("setup");
+                fields.remove("env_file");
+            }
+            yaml_serde::to_string(&value)
+        })
+        .unwrap_or_default();
+    let who = if spec.root {
         "`root`".to_string()
     } else {
         format!("`{WORKLOAD_USER_NAME}` (uid {WORKLOAD_ID}, non-root)")
@@ -211,23 +286,12 @@ fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
             RootfsMount::ReadOnly => {
                 "The root filesystem is READ-ONLY: every write to it fails with EROFS, as \
                  root too. `/tmp`, `/var/tmp` and `/run` are in-memory and reset on every \
-                 boot; only the `mounts` and `lifetime: box` volumes below keep data."
+                 boot; only the `workload.mounts` and `lifetime: box` volumes below keep data."
             }
             RootfsMount::Overlay { .. } => {
                 "The root filesystem is writable for this boot only: writes go to the \
-                 `rootfs_overlay` volume and are gone after a restart; only the `mounts` and \
+                 `rootfs_overlay` volume and are gone after a restart; only the `workload.mounts` and \
                  `lifetime: box` volumes below keep data."
-            }
-        },
-        shares = match spec.mode {
-            PlanMode::Create => {
-                "This is setup's VM: the `mounts` below are not attached until the box \
-                 starts, but the `volumes` are mounted as they are then, so writes under \
-                 a volume's guest path land in that volume."
-            }
-            PlanMode::Run => {
-                "Only the `mounts` listed below are shared with the host. Everything \
-                 else you write stays inside the sandbox."
             }
         },
         cmd = format_workload_line(recipe),
@@ -272,14 +336,17 @@ mod tests {
         }
     }
 
-    /// An agent reading the README acts on it, so it describes the boot it is
-    /// in: setup's VM of a read-only box runs as root on a writable root with
-    /// its volumes but no mounts, and only the run boots after it are
-    /// read-only, the workload user's, and shared with the host.
+    /// The guest README exposes runtime configuration without provisioning details.
     #[test]
-    fn sandbox_info_describes_the_boot_not_just_the_recipe() {
-        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
-        recipe.hw.rootfs_readonly = true;
+    fn sandbox_info_contains_only_runtime_configuration() {
+        let recipe: Recipe = yaml_serde::from_str(
+            "hw: {rootfs_readonly: true}\n\
+             setup:\n  run: [PRIVATE_BUILD_COMMAND]\n  workdir: /PRIVATE_BUILD_DIR\n  mounts: [{host: /PRIVATE_BUILD_INPUT, guest: /PRIVATE_BUILD_DIR}]\n\
+             workload:\n  run: make setup\n  mounts: [{host: /project, guest: /work, readonly: true}]\n\
+             env_file: /PRIVATE_ENV_FILE\n\
+             env: {TOKEN: PRIVATE_ENV_VALUE}\n",
+        )
+        .unwrap();
         let info = |mode| {
             build_plan(
                 &BootSpec {
@@ -296,19 +363,31 @@ mod tests {
             .unwrap()
             .sandbox_info
         };
-        let setup = info(PlanMode::Create);
-        assert!(setup.contains("You run as `root`"), "{setup}");
-        assert!(setup.contains("It PERSISTS"), "{setup}");
-        assert!(
-            setup.contains("not attached until the box starts"),
-            "{setup}"
-        );
-        assert!(setup.contains("land in that volume"), "{setup}");
-        assert!(!setup.contains("shared with the host"), "{setup}");
+        assert_eq!(info(PlanMode::Setup), "");
         let run = info(PlanMode::Run);
+        assert!(!run.contains("PRIVATE_BUILD"), "{run}");
+        assert!(!run.contains("PRIVATE_ENV_FILE"), "{run}");
+        assert!(!run.contains("PRIVATE_ENV_VALUE"), "{run}");
+        let yaml = run
+            .split_once("```yaml\n")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0;
+        let config: yaml_serde::Value = yaml_serde::from_str(yaml).unwrap();
+        assert!(config.get("setup").is_none(), "{run}");
+        assert!(config.get("env_file").is_none(), "{run}");
+        assert_eq!(
+            config["workload"],
+            yaml_serde::to_value(&recipe.workload).unwrap()
+        );
         assert!(run.contains("You run as `terri`"), "{run}");
         assert!(run.contains("READ-ONLY"), "{run}");
-        assert!(run.contains("shared with the host"), "{run}");
+        assert!(
+            run.contains("`workload.mounts` listed below are shared"),
+            "{run}"
+        );
     }
 
     /// An agent reading the README acts on it, so the root filesystem line must
@@ -334,7 +413,7 @@ mod tests {
     #[test]
     fn sandbox_info_carries_the_resolved_recipe_as_yaml() {
         let mut recipe: Recipe = yaml_serde::from_str("workload:\n  run: make\n").unwrap();
-        recipe.mounts = vec![Mount {
+        recipe.workload.mounts = vec![Mount {
             host: PathBuf::from("/srv/models"),
             guest: PathBuf::from("/models"),
             readonly: true,
@@ -348,10 +427,10 @@ mod tests {
         assert!(info.contains("host: /srv/models"), "{info}");
         assert!(info.contains("readonly: true"), "{info}");
         assert!(
-            info.contains("`mounts` - host directories shared"),
+            info.contains("`workload` - `mounts` are host directories shared"),
             "{info}"
         );
-        assert!(info.contains("`sudo` - the commands"), "{info}");
+        assert!(info.contains("`workload.sudo` - the commands"), "{info}");
 
         // --root: no privilege drop, and the doc says so.
         spec.root = true;
@@ -365,7 +444,7 @@ mod tests {
     fn the_plan_carries_the_resolved_recipe() {
         let mut recipe: Recipe = yaml_serde::from_str("workload:\n  run: make\n").unwrap();
         recipe.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
-        recipe.daemons = vec!["ascend --serve".into()];
+        recipe.workload.daemons = vec!["ascend --serve".into()];
         let spec = BootSpec {
             recipe,
             project_dir: PathBuf::from("/proj"),
@@ -376,7 +455,7 @@ mod tests {
             network_broker: None,
         };
         let mut spec = spec;
-        spec.recipe.mounts = vec![Mount {
+        spec.recipe.workload.mounts = vec![Mount {
             host: "/host/work".into(),
             guest: "/work".into(),
             readonly: true,
@@ -411,29 +490,60 @@ mod tests {
         assert!(foreground_plan.await_initial_session);
     }
 
-    /// The setup boot attaches no filesystem device, but the agent creates the mount
-    /// points in the base from the plan's share list.
+    /// A setup plan attaches only setup shares with configured access, carries
+    /// the setup workdir and commands, and names the runtime directories to bake.
     #[test]
-    fn a_setup_plan_names_the_shares_and_publishes_no_ports() {
-        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
-        recipe.mounts = vec![Mount {
-            host: "/host/work".into(),
-            guest: "/work".into(),
-            readonly: false,
-        }];
+    fn a_setup_plan_is_phase_scoped_and_publishes_no_ports() {
+        let mut recipe: Recipe = yaml_serde::from_str(
+            "setup:\n  run: [echo setup]\n  workdir: /setup\n  mounts: [{host: /host/setup, guest: /setup}]\n\
+             workload:\n  workdir: /work\n  mounts: [{host: /host/work, guest: /work}]\n",
+        )
+        .unwrap();
         recipe.network.ports = vec!["8080:80".into()];
+        recipe.workload.run = Some("echo workload".into());
+        recipe.workload.sudo = vec!["apk".into()];
+        recipe.workload.on_start = vec!["echo start".into()];
+        recipe.workload.pre_stop = vec!["echo stop".into()];
+        recipe.workload.daemons = vec!["sleep 60".into()];
         let spec = BootSpec {
             recipe,
             project_dir: PathBuf::from("/proj"),
             root: false,
-            mode: PlanMode::Create,
+            mode: PlanMode::Setup,
             foreground: false,
             host_publishes_pid: false,
             network_broker: None,
         };
         let plan = build_plan(&spec, "dev").unwrap();
-        assert_eq!(plan.shares[0].guest, "/work");
+        assert_eq!(plan.shares.len(), 1);
+        assert_eq!(plan.shares[0].guest, "/setup");
+        assert!(!plan.shares[0].readonly);
+        assert_eq!(plan.workdir.as_deref(), Some("/setup"));
+        assert_eq!(plan.setup, ["echo setup"]);
+        assert_eq!(plan.mount_points, ["/work"]);
+        assert_eq!(plan.workload_workdir.as_deref(), Some("/work"));
         assert_eq!(plan.published_ports, [] as [u16; 0]);
+        assert!(plan.workload.is_none());
+        assert_eq!(plan.sudo, [] as [String; 0]);
+        assert_eq!(plan.on_start, [] as [String; 0]);
+        assert_eq!(plan.pre_stop, [] as [String; 0]);
+        assert_eq!(plan.daemons, [] as [String; 0]);
+
+        let mut run = spec;
+        run.mode = PlanMode::Run;
+        let plan = build_plan(&run, "dev").unwrap();
+        assert_eq!(plan.shares[0].guest, "/work");
+        assert!(!plan.shares[0].readonly);
+        assert_eq!(plan.workdir.as_deref(), Some("/work"));
+        assert_eq!(plan.setup, [] as [String; 0]);
+        assert_eq!(plan.mount_points, [] as [String; 0]);
+        assert!(plan.workload_workdir.is_none());
+        assert_eq!(plan.workload.as_deref(), Some("echo workload"));
+        assert_eq!(plan.sudo, ["apk"]);
+        assert_eq!(plan.on_start, ["echo start"]);
+        assert_eq!(plan.pre_stop, ["echo stop"]);
+        assert_eq!(plan.daemons, ["sleep 60"]);
+        assert_eq!(plan.published_ports, [80]);
     }
 
     /// The disk the host opens and the plan the agent reads come from one
@@ -455,7 +565,7 @@ mod tests {
         };
         for (mode, rootfs_readonly, expected) in [
             (PlanMode::Run, true, AccessMode::ReadOnly),
-            (PlanMode::Create, true, AccessMode::ReadWrite),
+            (PlanMode::Setup, true, AccessMode::ReadWrite),
             (PlanMode::Run, false, AccessMode::ReadWrite),
         ] {
             let spec = spec(mode, rootfs_readonly);
@@ -481,7 +591,7 @@ mod tests {
             recipe: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
             root: false,
-            mode: PlanMode::Create,
+            mode: PlanMode::Setup,
             foreground: false,
             host_publishes_pid: false,
             network_broker: None,
@@ -506,8 +616,8 @@ mod tests {
         };
         let plan = |root, mode| build_plan(&spec(root, mode), "dev").unwrap().as_root;
 
-        assert!(plan(false, PlanMode::Create), "a setup boot is root");
-        assert!(plan(true, PlanMode::Create));
+        assert!(plan(false, PlanMode::Setup), "a setup boot is root");
+        assert!(plan(true, PlanMode::Setup));
         // …and it does not leak into the boot that follows it.
         assert!(!plan(false, PlanMode::Run), "a workload boot is not");
         assert!(plan(true, PlanMode::Run), "--root still reaches the plan");
@@ -585,7 +695,7 @@ mod tests {
     /// their mount points and carries no overlay.
     #[test]
     fn setups_plan_has_a_writable_root_and_no_overlay() {
-        let plan = build_plan(&overlay_spec(PlanMode::Create), "dev").unwrap();
+        let plan = build_plan(&overlay_spec(PlanMode::Setup), "dev").unwrap();
         assert_eq!(plan.rootfs, RootfsMount::Writable);
         assert_eq!(plan.volumes.len(), 2);
         let info = &plan.sandbox_info;

@@ -655,6 +655,7 @@ fn function_exits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use terra_build::EMBEDDED_ARTIFACT_SECTION;
 
     const SYSCALL: [u8; 2] = [0x0f, 0x05];
     const RET: u8 = 0xc3;
@@ -789,6 +790,37 @@ mod tests {
         // mov qword ptr [rip + 0x100], 0x1000; ret
         let escaping = [0x48, 0xc7, 0x05, 0, 1, 0, 0, 0, 0x10, 0, 0, RET].to_vec();
         assert!(functions(escaping).is_err());
+    }
+
+    /// Opaque embedded AOT metadata may coincide with host code addresses without holding
+    /// host function pointers; ordinary data still makes a wrapper unsafe, even unaligned.
+    #[test]
+    fn embedded_artifacts_do_not_escape_host_function_addresses() -> Result<()> {
+        let wrapper = [vec![0x48, 0x89, 0xf8], SYSCALL.to_vec(), vec![RET]].concat();
+        let mut caller = vec![0xbf];
+        caller.extend(39_u32.to_le_bytes());
+        let caller = [caller, call(0x2005, 0x1000), vec![RET]].concat();
+        let functions = [
+            ("syscall", 0x1000, wrapper.as_slice()),
+            ("caller", 0x2000, caller.as_slice()),
+        ];
+        let address = 0x1000_u64.to_le_bytes();
+        let mut image = Image::from_code(Architecture::X86_64, &functions);
+        image.add_data_section(EMBEDDED_ARTIFACT_SECTION, 0x8001, &address);
+        image.add_data_section(EMBEDDED_ARTIFACT_SECTION, 0x8010, &0x1003_u64.to_le_bytes());
+        assert_eq!(image.read(0x8001, address.len()), Some(address.as_slice()));
+        assert!(image.interior_pointers().is_empty());
+        assert_eq!(scan_image(&image)?.syscalls, BTreeSet::from([39]));
+        for location in [0x9000, 0x9001] {
+            let mut image = Image::from_code(Architecture::X86_64, &functions);
+            image.add_data(location, &address);
+            let error = scan_image(&image).err().unwrap();
+            assert!(
+                error.to_string().contains("address is stored in data"),
+                "{error:#}"
+            );
+        }
+        Ok(())
     }
 
     /// Syscall bytes outside every function would be code the analysis never read.

@@ -32,13 +32,13 @@ fn kernel_boot_assets() -> (
     (kernel, boot_disk, stage_disk("rootfs.img.gz"))
 }
 
-/// Boot plan proving agent readiness end to end: Create mode with one
+/// Boot plan proving agent readiness end to end: Setup mode with one
 /// hook asserting every online CPU the machine was given. A hook
 /// failure is the agent's nonzero exit report, so SMP rides the same
 /// frame as the boot.
 fn boot_plan(
     mode: terra_protocol::PlanMode,
-    on_create: Vec<String>,
+    setup: Vec<String>,
     workload: Option<String>,
     await_initial_session: bool,
 ) -> Vec<u8> {
@@ -46,7 +46,7 @@ fn boot_plan(
     let plan = Plan {
         mode,
         as_root: true,
-        on_create,
+        setup,
         await_initial_session,
         ..Plan::bare_run(workload)
     };
@@ -55,7 +55,7 @@ fn boot_plan(
 
 fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     boot_plan(
-        terra_protocol::PlanMode::Create,
+        terra_protocol::PlanMode::Setup,
         vec![format!("test $(nproc) = {vcpus}")],
         None,
         false,

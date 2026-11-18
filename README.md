@@ -66,20 +66,20 @@ hw:
   cpus: 2
   mem_mib: 2048
   rootfs_mib: 4096
-mounts:
-  - host: .
-    guest: /work
-    readonly: false
 network:
   mode: allowlist
   allow:
     - dl-cdn.alpinelinux.org:443
     - registry.npmjs.org:443
-hooks:
-  on_create:
+setup:
+  run:
     - apk add --no-cache nodejs npm git
 workload:
   workdir: /work
+  mounts:
+    - host: .
+      guest: /work
+      readonly: false
   # run: exec npm start   # what the box runs; defaults to a shell
 ```
 
@@ -88,16 +88,16 @@ This recipe:
 - gives the box 2 CPUs, 2 GiB of memory and a 4 GiB disk;
 - shares your project folder at `/work`, so edits show up on both sides;
 - allows HTTPS only to the Alpine and npm package registries;
-- installs Node.js, npm and Git the first time the box is created.
+- installs Node.js, npm and Git on initial setup and whenever setup rebuilds the root filesystem.
 
 If your tools need other sites, add them to `network.allow`.
 For more ready-made recipes, see
 [terrarium_examples](https://github.com/terrarium-sh/terrarium_examples).
 
-**2. Create the box and go in:**
+**2. Set up the box and open a shell:**
 
 ```sh
-terra ./dev.yaml setup   # create the box and install the tools
+terra ./dev.yaml setup   # build the root filesystem and install the tools
 terra                    # open a shell in the box at /work
 ```
 

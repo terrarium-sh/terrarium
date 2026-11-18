@@ -554,7 +554,7 @@ fn tcp_endpoints_are_bounded_and_do_not_select_fixed_services() {
     for source in [0, AGENT_PORT, CONTROL_PORT] {
         switch.rx(&guest(1, source, TCP_PORT, 0, 0), &[]);
     }
-    assert_eq!(switch.flow_connections(), [] as [ConnectionId; 0]);
+    assert_eq!(switch.take_live_flows_if_changed(), None);
     assert!(
         switch
             .take_replies()
@@ -796,7 +796,7 @@ fn network_failure_and_physical_reset_have_distinct_scopes() {
     switch.reset_network_connections();
     assert_eq!(switch.connection(Role::Agent), Some(old_agent));
     assert!(switch.connection(Role::Control).is_none());
-    assert_eq!(switch.flow_connections(), [] as [ConnectionId; 0]);
+    assert_eq!(switch.take_live_flows_if_changed(), Some([].into()));
     assert_eq!(switch.retirements().count(), 3);
     assert_eq!(switch.network_socket_count(), 2);
     switch.reset_connections();
@@ -884,7 +884,7 @@ fn broker_loss_disables_network_admission_and_keeps_agent_live() {
     switch.disable_network();
     switch.rx(&guest(1, 12346, TCP_PORT, 0, 0), &[]);
     switch.rx(&guest(1, CONTROL_PORT, CONTROL_PORT, 0, 0), &[]);
-    assert_eq!(switch.flow_connections(), [] as [ConnectionId; 0]);
+    assert_eq!(switch.take_live_flows_if_changed(), Some([].into()));
     assert!(switch.connection(Role::Control).is_none());
     assert_eq!(switch.connection(Role::Agent), Some(agent));
     switch.deliver(agent, b"stop".to_vec()).unwrap();
@@ -895,7 +895,7 @@ fn broker_loss_disables_network_admission_and_keeps_agent_live() {
             .any(|reply| reply.payload == b"stop")
     );
     switch.rx(&guest(1, 12347, UDP_PORT, 0, 0), &[]);
-    assert_eq!(switch.flow_connections(), [] as [ConnectionId; 0]);
+    assert_eq!(switch.take_live_flows_if_changed(), None);
     assert_eq!(
         switch.connect_publication(PUBLICATION_HOST_PORTS.start),
         Err(VsockError::Backpressure)
@@ -907,6 +907,54 @@ fn connect_udp(switch: &mut VsockSwitch, guest_port: u32) -> ConnectionId {
     request.buf_alloc = u32::MAX;
     switch.rx(&request, &[]);
     switch.connection_for(guest_port, UDP_PORT).unwrap()
+}
+
+#[test]
+fn flow_changes_coalesce_until_service_and_ignore_established_traffic() {
+    let mut switch = VsockSwitch::new();
+    connect(&mut switch, AGENT_PORT);
+    assert_eq!(switch.take_live_flows_if_changed(), None);
+
+    let tcp = connect_tcp(&mut switch, 12345);
+    let udp = connect_udp(&mut switch, 12346);
+    let publication = switch
+        .connect_publication(PUBLICATION_HOST_PORTS.start)
+        .unwrap();
+    assert_eq!(
+        switch.take_live_flows_if_changed(),
+        Some([tcp, udp, publication].into())
+    );
+    switch.take_replies();
+    switch.rx(&guest_response(publication.host_port), &[]);
+    switch.rx(&guest(5, tcp.guest_port, TCP_PORT, 4, 0), b"data");
+    switch.consume_upstream(tcp, 4).unwrap();
+    switch.deliver(tcp, b"echo".to_vec()).unwrap();
+    switch.take_replies();
+    switch.rx(&guest(6, tcp.guest_port, TCP_PORT, 0, 4), &[]);
+    switch.shutdown(tcp).unwrap();
+    assert_eq!(switch.take_live_flows_if_changed(), None);
+
+    switch.rx(&guest(3, udp.guest_port, UDP_PORT, 0, 0), &[]);
+    assert_eq!(
+        switch.take_live_flows_if_changed(),
+        Some([tcp, publication].into())
+    );
+    assert!(switch.retire_connection(udp));
+    assert_eq!(switch.take_live_flows_if_changed(), None);
+
+    switch.reset_connection(tcp).unwrap();
+    switch.take_replies();
+    assert!(switch.retire_connection(tcp));
+    let reopened = connect_tcp(&mut switch, tcp.guest_port);
+    assert_ne!(reopened, tcp);
+    assert_eq!(
+        switch.take_live_flows_if_changed(),
+        Some([reopened, publication].into())
+    );
+
+    switch.reset_connections();
+    assert_eq!(switch.take_live_flows_if_changed(), Some([].into()));
+    assert_eq!(switch.take_live_flows_if_changed(), None);
 }
 
 /// UDP sockets are ordinary flows: each owns its own stream and credit, and retires alone.
@@ -1000,7 +1048,7 @@ fn publication_streams_are_host_initiated_and_refuse_guest_requests() {
     assert!(switch.is_reply_current(&request));
     switch.rx(&guest_response(host_port), &[]);
     assert!(switch.is_current(pending));
-    assert_eq!(switch.flow_connections(), [pending]);
+    assert_eq!(switch.take_live_flows_if_changed(), Some([pending].into()));
     switch.rx(&guest(5, PUBLICATION_PORT, host_port, 3, 0), b"get");
     assert_eq!(switch.peek_upstream(pending, 3), b"get");
     switch.deliver(pending, b"ok".to_vec()).unwrap();

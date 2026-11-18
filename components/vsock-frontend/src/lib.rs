@@ -37,6 +37,8 @@ mod worker;
 static SWITCH: LazyLock<Mutex<VsockSwitch>> = LazyLock::new(|| Mutex::new(VsockSwitch::new()));
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
 static WORK: terra_device_transport::Doorbell = terra_device_transport::Doorbell::new();
+#[cfg(test)]
+static SWITCH_TEST: Mutex<()> = Mutex::new(());
 
 fn switch() -> std::sync::MutexGuard<'static, VsockSwitch> {
     SWITCH

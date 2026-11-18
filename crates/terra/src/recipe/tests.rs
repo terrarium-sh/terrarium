@@ -32,7 +32,7 @@ fn a_relative_mount_resolves_against_the_project_directory() {
     std::fs::create_dir_all(elsewhere.join("src")).unwrap();
     std::fs::write(
         elsewhere.join("recipe.yaml"),
-        "mounts:\n  - host: src\n    guest: /work\n",
+        "workload:\n  mounts:\n    - host: src\n      guest: /work\n",
     )
     .unwrap();
 
@@ -40,7 +40,7 @@ fn a_relative_mount_resolves_against_the_project_directory() {
     // box's: standing in `elsewhere`, `./recipe.yaml` is found there - and its
     // `src` is still the *project's*.
     let recipe = load_from("./recipe.yaml", &elsewhere, &project).unwrap();
-    assert_eq!(recipe.mounts[0].host, project.join("src"));
+    assert_eq!(recipe.workload.mounts[0].host, project.join("src"));
 }
 
 /// Reading a recipe must not depend on its shares being there: a guest with
@@ -51,25 +51,25 @@ fn a_relative_mount_resolves_against_the_project_directory() {
 fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path();
-    let yaml = "mounts:\n  - host: ./gone\n    guest: /work\n";
+    let yaml = "workload:\n  mounts:\n    - host: ./gone\n      guest: /work\n";
 
     let mut recipe = parse_recipe(yaml, project, Path::new("r.yaml")).unwrap();
     assert_eq!(
-        recipe.mounts[0].host,
+        recipe.workload.mounts[0].host,
         project.join("gone"),
         "a relative host is still made absolute against the project"
     );
 
     let bx = crate::state::BoxRef::from_state_dir(project.join("box-state"), project);
-    let err = crate::policy::mount::resolve_mounts(&recipe, &bx)
+    let err = crate::policy::mount::resolve_workload_mounts(&mut recipe, &bx)
         .unwrap_err()
         .to_string();
     assert!(err.contains("resolving mount host path"), "{err}");
 
     std::fs::create_dir(project.join("gone")).unwrap();
-    recipe.mounts = crate::policy::mount::resolve_mounts(&recipe, &bx).unwrap();
+    crate::policy::mount::resolve_workload_mounts(&mut recipe, &bx).unwrap();
     assert_eq!(
-        recipe.mounts[0].host,
+        recipe.workload.mounts[0].host,
         std::fs::canonicalize(project.join("gone")).unwrap()
     );
 }
@@ -78,11 +78,27 @@ fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
 fn duplicate_unrelated_yaml_keys_do_not_hide_writable_shares() {
     let dir = tempfile::tempdir().unwrap();
     let shares = list_declared_writable_shares(
-        "env: {A: one, A: two}\nmounts:\n  - host: .\n    guest: /work\n",
+        "env: {A: one, A: two}\nworkload:\n  mounts:\n    - host: .\n      guest: /work\n",
         dir.path(),
     )
     .unwrap();
     assert_eq!(shares, vec![dir.path().to_path_buf()]);
+}
+
+/// Either phase can author a recipe through a writable share.
+#[test]
+fn the_authorship_gate_reads_writable_shares_from_both_phases() {
+    let dir = tempfile::tempdir().unwrap();
+    let shares = list_declared_writable_shares(
+        "setup:\n  mounts:\n    - {host: ./setup, guest: /setup}\n    - {host: ./input, guest: /input, readonly: true}\n\
+         workload:\n  mounts:\n    - {host: ./ro, guest: /ro, readonly: true}\n    - {host: ./rw, guest: /rw}\n",
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        shares,
+        vec![dir.path().join("setup"), dir.path().join("rw")]
+    );
 }
 
 #[test]
@@ -91,25 +107,25 @@ fn relative_mount_resolved_against_cwd() {
     let cwd = dir.path().to_path_buf();
     std::fs::create_dir(cwd.join("src")).unwrap();
 
-    let yaml = "hw:\n  cpus: 1\n  mem_mib: 512\nmounts:\n  - host: src\n    guest: /work\nnetwork:\n  mode: allowlist\n  allow:\n    - example.com:443\nhooks:\n  on_start:\n    - echo hi\n";
+    let yaml = "hw:\n  cpus: 1\n  mem_mib: 512\nworkload:\n  mounts:\n    - host: src\n      guest: /work\n  on_start:\n    - echo hi\nnetwork:\n  mode: allowlist\n  allow:\n    - example.com:443\n";
     std::fs::write(cwd.join("recipe.yaml"), yaml).unwrap();
     let recipe = load("./recipe.yaml", &cwd).unwrap();
-    assert_eq!(recipe.mounts[0].host, cwd.join("src"));
+    assert_eq!(recipe.workload.mounts[0].host, cwd.join("src"));
     assert_eq!(recipe.hw.cpus, 1);
     assert_eq!(recipe.hw.mem_mib, 512);
     assert_eq!(recipe.hw.rootfs_mib, 512); // untouched fields still get their default
     assert_eq!(recipe.network.mode, NetworkMode::Allowlist);
     assert_eq!(recipe.network.allow, vec!["example.com:443".to_string()]);
-    assert_eq!(recipe.hooks.on_start, vec!["echo hi"]);
+    assert_eq!(recipe.workload.on_start, vec!["echo hi"]);
 }
 
 /// A recipe's daemons are shell lines, taken as written.
 #[test]
 fn daemons_parse_and_default_empty() {
-    let recipe: Recipe = yaml_serde::from_str("daemons: [ascend]\n").unwrap();
-    assert_eq!(recipe.daemons, vec!["ascend"]);
+    let recipe: Recipe = yaml_serde::from_str("workload: {daemons: [ascend]}\n").unwrap();
+    assert_eq!(recipe.workload.daemons, vec!["ascend"]);
     let none: Recipe = yaml_serde::from_str("{}").unwrap();
-    assert_eq!(none.daemons, Vec::<String>::new());
+    assert_eq!(none.workload.daemons, Vec::<String>::new());
 }
 
 /// The recipe's own spellings, refused variants included.
@@ -245,12 +261,12 @@ fn an_env_file_past_the_size_limit_is_refused() {
 #[test]
 fn a_deleted_env_file_does_not_stop_the_recipe_parsing() {
     let dir = tempfile::tempdir().unwrap();
-    let recipe = "mounts:\n  - {host: ., guest: /work}\nenv_file: ./gone.env\n";
+    let recipe = "workload:\n  mounts:\n    - {host: ., guest: /work}\nenv_file: ./gone.env\n";
 
     let mut recipe = parse_recipe(recipe, dir.path(), Path::new("r.yaml"))
         .expect("a missing env_file is not a parse failure");
     assert_eq!(
-        recipe.mounts[0].host,
+        recipe.workload.mounts[0].host,
         dir.path(),
         "the shares are still there"
     );
@@ -319,7 +335,7 @@ fn another_users_home_is_refused_not_silently_made_relative() {
 
     // …and it reaches the recipe, which is where anyone would meet it.
     let err = parse_recipe(
-        "mounts:\n  - {host: \"~alice/data\", guest: /work}\n",
+        "workload:\n  mounts:\n    - {host: \"~alice/data\", guest: /work}\n",
         Path::new("/proj"),
         Path::new("r.yaml"),
     )
@@ -368,11 +384,11 @@ fn env_the_guest_cannot_export_is_refused() {
 #[test]
 fn a_manifest_reference_must_be_a_recipe_path() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(MANIFEST_FILE), "boxes:\n  dev: pi-dev\n").unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILE), "boxes:\n  dev: example\n").unwrap();
     let err = load_manifest(dir.path()).unwrap_err().to_string();
     assert!(err.contains("not a recipe path"), "{err}");
     assert!(
-        err.contains("./pi-dev.yaml"),
+        err.contains("./example.yaml"),
         "the fix is spelled out: {err}"
     );
 
@@ -409,6 +425,88 @@ fn unknown_keys_and_missing_required_fields_are_refused() {
     assert!(yaml_serde::from_str::<Recipe>("nope: 1\n").is_err());
     assert!(yaml_serde::from_str::<Mount>("guest: /work\n").is_err());
     assert!(yaml_serde::from_str::<StaticDnsRecord>("name: db\n").is_err());
+}
+
+/// The phase redesign is breaking: none of the removed spellings parses, so an
+/// old recipe fails setup instead of silently losing its mounts or hooks.
+#[test]
+fn removed_recipe_fields_are_refused() {
+    let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
+    for (yaml, field) in [
+        ("mounts: [{host: ., guest: /work}]\n", "mounts"),
+        ("hooks: {on_create: [echo setup]}\n", "hooks"),
+        ("daemons: [echo ready]\n", "daemons"),
+        ("sudo: [apk]\n", "sudo"),
+        ("workload: {on_create: [echo setup]}\n", "on_create"),
+        (
+            "workload: {mounts: [{host: ., guest: /work, on_create: true}]}\n",
+            "on_create",
+        ),
+    ] {
+        let error = format!("{:#}", try_parse(yaml).unwrap_err());
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{yaml}: {error}"
+        );
+    }
+}
+
+/// The new sections parse with the documented defaults and keep their scope.
+#[test]
+fn setup_and_workload_parse_with_their_own_fields() {
+    let recipe = try_parse_recipe(
+        "setup:
+  run: [apk add git]
+  workdir: /setup
+  mounts: [{host: ./setup, guest: /setup}]
+workload:
+  run: make
+  workdir: /work
+  mounts: [{host: ., guest: /work}]
+  on_start: [echo start]
+  pre_stop: [echo stop]
+  daemons: [watch]
+  sudo: [apk]
+",
+    )
+    .unwrap();
+    assert_eq!(recipe.setup.run, ["apk add git"]);
+    assert_eq!(recipe.setup.workdir.as_deref(), Some(Path::new("/setup")));
+    assert_eq!(recipe.setup.mounts[0].guest, Path::new("/setup"));
+    assert_eq!(recipe.workload.run.as_deref(), Some("make"));
+    assert_eq!(recipe.workload.workdir.as_deref(), Some(Path::new("/work")));
+    assert_eq!(recipe.workload.mounts[0].guest, Path::new("/work"));
+    assert_eq!(recipe.workload.on_start, ["echo start"]);
+    assert_eq!(recipe.workload.pre_stop, ["echo stop"]);
+    assert_eq!(recipe.workload.daemons, ["watch"]);
+    assert_eq!(recipe.workload.sudo, ["apk"]);
+
+    let empty = try_parse_recipe("{}").unwrap();
+    assert_eq!(empty.setup.run, [] as [String; 0]);
+    assert_eq!(empty.setup.workdir, None);
+    assert_eq!(empty.setup.mounts, [] as [Mount; 0]);
+    assert_eq!(empty.workload.mounts, [] as [Mount; 0]);
+    assert_eq!(empty.workload.on_start, [] as [String; 0]);
+    assert_eq!(empty.workload.pre_stop, [] as [String; 0]);
+    assert_eq!(empty.workload.daemons, [] as [String; 0]);
+    assert_eq!(empty.workload.sudo, [] as [String; 0]);
+}
+
+#[test]
+fn both_phases_default_to_writable_mounts_and_accept_readonly() {
+    for (access, readonly) in [
+        ("", false),
+        (", readonly: false", false),
+        (", readonly: true", true),
+    ] {
+        let recipe = try_parse_recipe(&format!(
+            "setup: {{mounts: [{{host: ./setup, guest: /setup{access}}}]}}\n\
+             workload: {{mounts: [{{host: ./work, guest: /work{access}}}]}}"
+        ))
+        .unwrap();
+        assert_eq!(recipe.setup.mounts[0].readonly, readonly);
+        assert_eq!(recipe.workload.mounts[0].readonly, readonly);
+    }
 }
 
 #[test]
@@ -458,19 +556,32 @@ fn validate_volume_names() {
 #[test]
 fn sudo_entries_are_normalized_to_bare_commands() {
     let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
-    assert_eq!(try_parse("sudo:\n  - apk\n").unwrap().sudo, vec!["apk"]);
+    assert_eq!(
+        try_parse("workload: {sudo: [apk]}\n")
+            .unwrap()
+            .workload
+            .sudo,
+        vec!["apk"]
+    );
 
     // Trimmed so whitespace cannot ride into the rule - `"\napk"` is one
     // token, which passed the old check.
-    for yaml in ["sudo:\n  - \"  apk  \"\n", "sudo:\n  - \"\\napk\"\n"] {
-        assert_eq!(try_parse(yaml).unwrap().sudo, vec!["apk"], "{yaml:?}");
+    for yaml in [
+        "workload: {sudo: [\"  apk  \"]}\n",
+        "workload: {sudo: [\"\\napk\"]}\n",
+    ] {
+        assert_eq!(
+            try_parse(yaml).unwrap().workload.sudo,
+            vec!["apk"],
+            "{yaml:?}"
+        );
     }
 
     for bad in [
-        "sudo:\n  - apk add git\n",    // arguments never match
-        "sudo:\n  - \"   \"\n",        // empty once trimmed
-        "sudo:\n  - \"a\\u0007pk\"\n", // an interior control byte
-        "sudo:\n  - \"apk\\ndoas\"\n", // two rules smuggled into one entry
+        "workload: {sudo: [\"apk add git\"]}\n", // arguments never match
+        "workload: {sudo: [\"   \"]}\n",         // empty once trimmed
+        "workload: {sudo: [\"a\\u0007pk\"]}\n",  // an interior control byte
+        "workload: {sudo: [\"apk\\ndoas\"]}\n",  // two rules smuggled into one entry
     ] {
         let err = try_parse(bad).unwrap_err().to_string();
         assert!(
@@ -556,24 +667,64 @@ fn hardware_a_vm_cannot_be_built_from_is_refused() {
 fn one_guest_path_carries_one_thing() {
     let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
     for clash in [
-        "mounts:\n  - {host: ./a, guest: /work}\n  - {host: ./b, guest: /work}\n",
+        "workload:\n  mounts:\n    - {host: ./a, guest: /work}\n    - {host: ./b, guest: /work}\n",
+        "setup:\n  mounts:\n    - {host: ./a, guest: /setup}\n    - {host: ./b, guest: /setup}\n",
         "volumes:\n  - {name: a, guest: /data, size_mib: 8}\n  - {name: b, guest: /data, size_mib: 8}\n",
-        "mounts:\n  - {host: ./a, guest: /data}\nvolumes:\n  - {name: v, guest: /data, size_mib: 8}\n",
+        "workload:\n  mounts:\n    - {host: ./a, guest: /data}\nvolumes:\n  - {name: v, guest: /data, size_mib: 8}\n",
+        "setup:\n  mounts:\n    - {host: ./a, guest: /data}\nvolumes:\n  - {name: v, guest: /data, size_mib: 8}\n",
         // A trailing slash is the same path, and used to slip past.
-        "mounts:\n  - {host: ./a, guest: /work}\n  - {host: ./b, guest: /work/}\n",
+        "workload:\n  mounts:\n    - {host: ./a, guest: /work}\n    - {host: ./b, guest: /work/}\n",
     ] {
         let err = try_parse(clash).unwrap_err().to_string();
-        assert!(err.contains("claimed twice"), "{clash}: {err}");
+        assert!(err.contains("overlap"), "{clash}: {err}");
     }
 
-    // Distinct paths are untouched, nesting included: a volume inside a
-    // share is a real arrangement, not a collision.
+    // Setup and workload shares never attach together, so one guest path may
+    // be used by both phases.
     assert!(
         try_parse(
-            "mounts:\n  - {host: ./a, guest: /work}\nvolumes:\n  - {name: v, guest: /work/target, size_mib: 8}\n"
+            "setup:\n  mounts:\n    - {host: ./a, guest: /same}\nworkload:\n  mounts:\n    - {host: ./b, guest: /same}\n"
         )
         .is_ok()
     );
+}
+
+/// Mount nesting is refused in either order within a phase, across shares and
+/// volumes; component prefixes and different phases remain independent.
+#[test]
+fn guest_mount_paths_do_not_overlap_within_a_phase() {
+    let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
+    for (first, second) in [("/work", "/work/cache"), ("/work/cache", "/work")] {
+        for phase in ["setup", "workload"] {
+            for recipe in [
+                format!(
+                    "{phase}: {{mounts: [{{host: ./a, guest: {first}}}, {{host: ./b, guest: {second}}}]}}"
+                ),
+                format!(
+                    "{phase}: {{mounts: [{{host: ./a, guest: {first}}}]}}\nvolumes: [{{name: cache, guest: {second}, size_mib: 8}}]"
+                ),
+            ] {
+                let error = try_parse(&recipe).unwrap_err().to_string();
+                assert!(error.contains(&format!("overlap in {phase}")), "{error}");
+                assert!(error.contains("mount at separate paths"), "{error}");
+            }
+        }
+        let recipe = format!(
+            "volumes: [{{name: a, guest: {first}, size_mib: 8}}, {{name: b, guest: {second}, size_mib: 8}}]"
+        );
+        assert!(
+            try_parse(&recipe)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+    }
+    for recipe in [
+        "workload: {mounts: [{host: ./a, guest: /work}, {host: ./b, guest: /worker}]}\nvolumes: [{name: cache, guest: /cache, size_mib: 8}]",
+        "setup: {mounts: [{host: ./a, guest: /work}]}\nworkload: {mounts: [{host: ./b, guest: /work/cache}]}",
+    ] {
+        try_parse(recipe).unwrap();
+    }
 }
 
 #[test]
@@ -582,7 +733,7 @@ fn relative_guest_mount_path_is_rejected() {
     let cwd = dir.path();
     std::fs::write(
         cwd.join("recipe.yaml"),
-        "mounts:\n  - host: .\n    guest: work\n",
+        "workload:\n  mounts:\n    - host: .\n      guest: work\n",
     )
     .unwrap();
     let err = load("./recipe.yaml", cwd).unwrap_err().to_string();
@@ -619,10 +770,16 @@ fn recipes_and_manifests_have_a_bounded_read() {
 fn a_shell_line_with_a_nul_is_refused() {
     let cwd = std::env::temp_dir();
     for (recipe, field) in [
-        ("hooks:\n  on_create: [\"a\\0b\"]\n", "hooks.on_create[0]"),
-        ("hooks:\n  on_start: [ok, \"a\\0b\"]\n", "hooks.on_start[1]"),
-        ("hooks:\n  pre_stop: [\"a\\0b\"]\n", "hooks.pre_stop[0]"),
-        ("daemons: [\"a\\0b\"]\n", "daemons[0]"),
+        ("setup: {run: [\"a\\0b\"]}\n", "setup.run[0]"),
+        (
+            "workload:\n  on_start: [ok, \"a\\0b\"]\n",
+            "workload.on_start[1]",
+        ),
+        (
+            "workload:\n  pre_stop: [\"a\\0b\"]\n",
+            "workload.pre_stop[0]",
+        ),
+        ("workload: {daemons: [\"a\\0b\"]}\n", "workload.daemons[0]"),
         ("workload:\n  run: \"a\\0b\"\n", "workload.run"),
     ] {
         let err = format!(
@@ -643,13 +800,36 @@ fn a_shell_line_with_a_nul_is_refused() {
 #[test]
 fn a_relative_workdir_is_refused() {
     let cwd = std::env::temp_dir();
-    let err = parse_recipe("workload:\n  workdir: work\n", &cwd, Path::new("t.yaml"))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("workdir must be absolute"), "{err}");
+    let err = parse_recipe("workload:\n  workdir: work\n", &cwd, Path::new("t.yaml")).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("workload.workdir"), "{err}");
+    assert!(err.contains("guest path must be absolute"), "{err}");
 
     let ok = parse_recipe("workload:\n  workdir: /work\n", &cwd, Path::new("t.yaml")).unwrap();
     assert_eq!(ok.workload.workdir.unwrap(), Path::new("/work"));
+
+    let err = parse_recipe("setup:\n  workdir: work\n", &cwd, Path::new("t.yaml")).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("setup.workdir"), "{err}");
+    assert!(err.contains("guest path must be absolute"), "{err}");
+    let ok = parse_recipe("setup:\n  workdir: /setup\n", &cwd, Path::new("t.yaml")).unwrap();
+    assert_eq!(ok.setup.workdir.unwrap(), Path::new("/setup"));
+}
+
+#[test]
+fn invalid_workdirs_report_the_field_and_cause() {
+    for phase in ["setup", "workload"] {
+        for (path, cause) in [
+            (r"/work\0data", "cannot contain a NUL"),
+            (r"/work\\data", "contains a backslash"),
+        ] {
+            let yaml = format!("{phase}: {{workdir: \"{path}\"}}");
+            let error = format!("{:#}", try_parse_recipe(&yaml).unwrap_err());
+            assert!(error.contains(&format!("{phase}.workdir")), "{error}");
+            assert!(error.contains(cause), "{error}");
+            assert!(!error.contains("must be absolute"), "{error}");
+        }
+    }
 }
 
 #[test]
@@ -664,6 +844,24 @@ fn guest_paths_use_posix_separators_on_every_host() {
     );
     assert!(normalize_guest_path(Path::new(r"\work")).is_err());
     assert!(normalize_guest_path(Path::new("/work\\data")).is_err());
+}
+
+#[test]
+fn guest_paths_with_a_nul_are_refused_before_normalization() {
+    for path in [r"/work\0data", r"/work\0data/../safe"] {
+        for yaml in [
+            format!("setup: {{workdir: \"{path}\"}}"),
+            format!("workload: {{workdir: \"{path}\"}}"),
+            format!("setup: {{mounts: [{{host: ., guest: \"{path}\"}}]}}"),
+            format!("workload: {{mounts: [{{host: ., guest: \"{path}\"}}]}}"),
+            format!("volumes: [{{name: data, guest: \"{path}\", size_mib: 8}}]"),
+        ] {
+            let error = format!("{:#}", try_parse_recipe(&yaml).unwrap_err());
+            assert!(error.contains("cannot contain a NUL"), "{yaml}: {error}");
+            assert!(error.contains("guest path"), "{yaml}: {error}");
+            assert!(!error.contains('\0'), "{yaml}: {error}");
+        }
+    }
 }
 
 #[test]
@@ -742,9 +940,10 @@ fn validation_errors_escape_terminal_controls() {
     let dir = tempfile::tempdir().unwrap();
     for yaml in [
         "workload:\n  workdir: \"bad\\e\\a\"\n",
-        "sudo: [\"apk\\e\\a add\"]\n",
-        "mounts: [{host: ., guest: \"bad\\e\\a\"}]\n",
-        "mounts: [{host: ., guest: \"/work\\e\\a\"}]\nvolumes: [{name: data, guest: \"/work\\e\\a\", size_mib: 1}]\n",
+        "setup:\n  workdir: \"bad\\e\\a\"\n",
+        "workload: {sudo: [\"apk\\e\\a add\"]}\n",
+        "workload: {mounts: [{host: ., guest: \"bad\\e\\a\"}]}\n",
+        "workload: {mounts: [{host: ., guest: \"/work\\e\\a\"}]}\nvolumes: [{name: data, guest: \"/work\\e\\a\", size_mib: 1}]\n",
     ] {
         let error = format!(
             "{:#}",
@@ -756,13 +955,15 @@ fn validation_errors_escape_terminal_controls() {
 
 #[test]
 fn mount_merge_keys_cannot_hide_writable_shares() {
-    assert!(
-        list_declared_writable_shares(
-            "mounts:\n  - <<: {host: ., guest: /work}\n",
-            Path::new("/project"),
-        )
-        .is_err()
-    );
+    for phase in ["setup", "workload"] {
+        assert!(
+            list_declared_writable_shares(
+                &format!("{phase}:\n  mounts:\n    - <<: {{host: ., guest: /work}}\n"),
+                Path::new("/project"),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -932,7 +1133,8 @@ fn a_volume_target_mistake_is_refused_with_the_fix() {
 #[test]
 fn guest_root_is_refused_for_a_mount_and_a_volume() {
     for recipe in [
-        "mounts: [{host: ., guest: /x/..}]",
+        "workload: {mounts: [{host: ., guest: /x/..}]}",
+        "setup: {mounts: [{host: ., guest: /x/..}]}",
         "volumes: [{name: v, guest: /., size_mib: 8}]",
     ] {
         let error = try_parse_recipe(recipe).unwrap_err().to_string();
@@ -966,35 +1168,44 @@ fn manifest_box_names_normalize_to_lowercase() {
 fn combined_volumes_and_mounts_fit_the_vmm() {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     assert_eq!(crate::vm::MAX_GUEST_STORAGE_DEVICES, 32);
-    let recipe = Recipe {
-        mounts: (0..crate::vm::MAX_GUEST_STORAGE_DEVICES)
-            .map(|index| Mount {
-                host: format!("/host/{index}").into(),
-                guest: format!("/guest/{index}").into(),
-                readonly: false,
-            })
-            .collect(),
+    let mut recipe = Recipe {
+        workload: Workload {
+            mounts: (0..crate::vm::MAX_GUEST_STORAGE_DEVICES)
+                .map(|index| Mount {
+                    host: format!("/host/{index}").into(),
+                    guest: format!("/guest/{index}").into(),
+                    readonly: false,
+                })
+                .collect(),
+            ..Workload::default()
+        },
         ..Recipe::default()
     };
     assert!(validate::validate_storage_devices(&recipe).is_ok());
+    let workload_only = recipe.clone();
+    recipe.setup.mounts = recipe.workload.mounts.clone();
+    assert!(validate::validate_storage_devices(&recipe).is_ok());
+    recipe.workload.mounts.clear();
+    assert!(validate::validate_storage_devices(&recipe).is_ok());
 
-    let mut over = recipe;
-    over.volumes.push(Volume {
-        name: "over".into(),
-        guest: Some("/data".into()),
-        rootfs_overlay: false,
-        size_mib: 1,
-        lifetime: VolumeLifetime::Box,
-    });
-    let err = validate::validate_storage_devices(&over)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("combined volumes and host-directory mounts"),
-        "{err}"
-    );
-    assert!(
-        err.contains(&crate::vm::MAX_GUEST_STORAGE_DEVICES.to_string()),
-        "{err}"
-    );
+    for mut over in [workload_only, recipe] {
+        over.volumes.push(Volume {
+            name: "over".into(),
+            guest: Some("/data".into()),
+            rootfs_overlay: false,
+            size_mib: 1,
+            lifetime: VolumeLifetime::Box,
+        });
+        let err = validate::validate_storage_devices(&over)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("combined volumes and host-directory mounts"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&crate::vm::MAX_GUEST_STORAGE_DEVICES.to_string()),
+            "{err}"
+        );
+    }
 }

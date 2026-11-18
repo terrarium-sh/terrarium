@@ -34,7 +34,10 @@ fn setup_without_vm(dir: &std::path::Path, home: &std::path::Path, args: &[&str]
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(terra::SETUP_VM_STOPPED_BEFORE_CONSOLE),
+        stderr
+            .trim_end()
+            .ends_with("the setup VM stopped before opening its console")
+            && stderr.contains("no guest diagnostics were received"),
         "setup failed other than by its VM not launching: {stderr}"
     );
     // Only the box this setup prepared lacks the stamp for its applied recipe that its VM writes on success;
@@ -273,7 +276,11 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let recipe = dir.path().join("sandbox.yaml");
-    std::fs::write(&recipe, "mounts:\n  - host: .\n    guest: /work\n").unwrap();
+    std::fs::write(
+        &recipe,
+        "workload:\n  mounts:\n    - host: .\n      guest: /work\n",
+    )
+    .unwrap();
 
     let out = setup_without_vm(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
     assert!(
@@ -300,7 +307,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     // apply: the name of a recipe file is exactly what nobody can judge it by.
     std::fs::write(
         &recipe,
-        "mounts:\n  - host: .\n    guest: /work\nhw:\n  cpus: 4\nnetwork:\n  mode: unrestricted-public\n",
+        "workload:\n  mounts:\n    - host: .\n      guest: /work\nhw:\n  cpus: 4\nnetwork:\n  mode: unrestricted-public\n",
     )
     .unwrap();
     let refused = run_terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
@@ -366,7 +373,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_applied_silently() {
     // starter recipe recommends arriving at.
     std::fs::write(
         dir.path().join("dev.yaml"),
-        "mounts:\n  - host: .\n    guest: /work\n",
+        "workload:\n  mounts:\n    - host: .\n      guest: /work\n",
     )
     .unwrap();
     let dev = setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"]);
@@ -387,7 +394,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_applied_silently() {
     std::fs::write(
         dir.path().join("test.yaml"),
         format!(
-            "mounts:\n  - host: {}\n    guest: /keys\nnetwork:\n  mode: unrestricted-public\n",
+            "workload:\n  mounts:\n    - host: {}\n      guest: /keys\nnetwork:\n  mode: unrestricted-public\n",
             home.path().join(".ssh").display()
         ),
     )
@@ -1321,19 +1328,225 @@ fn invalid_yaml_reports_parse_error_and_exits_one() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed to parse YAML"));
 }
 
-/// The example recipe shipped at the repo root must be accepted. `terra setup`
-/// checks it before its VM starts, so this needs no KVM.
+/// The Quickstart's copy-paste recipe passes the CLI's setup preflight.
 #[test]
-fn the_shipped_example_recipe_is_accepted() {
+fn the_readme_quickstart_recipe_passes_preflight() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let recipe = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pi-dev.yaml");
-    let out = setup_without_vm(dir.path(), home.path(), &[recipe, "setup"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    let readme = include_str!("../../../README.md").replace("\r\n", "\n");
+    let (_, quickstart) = readme.split_once("\n## Quickstart\n").unwrap();
+    let quickstart = quickstart.split("\n## ").next().unwrap();
+    let (_, yaml) = quickstart.split_once("```yaml\n").unwrap();
+    let (recipe, _) = yaml.split_once("\n```").unwrap();
+    std::fs::write(dir.path().join("dev.yaml"), recipe).unwrap();
+    let out = run_terra_in(
+        dir.path(),
+        home.path(),
+        &["./dev.yaml", "setup", "--dry-run"],
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("and run setup"), "{stderr}");
+}
+
+/// Old stored spellings remain inspectable, and errors direct migration to the
+/// rewritten source file rather than retrying the unreadable applied recipe.
+#[test]
+fn old_applied_recipes_report_needs_setup_and_name_the_migration_path() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("dev.yaml"),
+        "network: {enabled: false}\n",
+    )
+    .unwrap();
+    setup_without_vm(project.path(), home.path(), &["./dev.yaml", "setup"]);
+    let box_dir = find_only_box(home.path());
+    let old_recipe = "mounts: []\nhooks: {on_create: [echo old]}\n";
+    std::fs::write(box_dir.join("recipe.yaml"), old_recipe).unwrap();
+    std::fs::write(box_dir.join("rootfs.img"), b"LEGACY_ROOT").unwrap();
+    let volume = box_dir.join("vol-data.img");
+    std::fs::write(&volume, b"PRESERVE_VOLUME").unwrap();
+
+    for args in [vec!["ls"], vec!["dev", "storage", "show"]] {
+        let output = run_terra_in(project.path(), home.path(), &args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("needs_setup"), "{text}");
+        if args.contains(&"storage") {
+            assert!(text.contains("usage unknown"), "{text}");
+            assert!(!text.contains("storage prune"), "{text}");
+        }
+    }
+    let output = run_terra_in(
+        project.path(),
+        home.path(),
+        &["dev", "storage", "show", "--json"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let storage: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(storage["state"], "needs_setup");
+    assert_eq!(storage["images"][0]["is_unused"], false);
+    assert_eq!(storage["images"][1]["is_unused"], serde_json::Value::Null);
+    for args in [
+        vec!["dev", "setup", "--dry-run"],
+        vec!["dev", "show"],
+        vec!["dev", "storage", "prune"],
+        vec!["dev", "storage", "export", "export.terra"],
+    ] {
+        let output = run_terra_in(project.path(), home.path(), &args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("terra <recipe-path> setup"), "{error}");
+        assert!(error.contains("unknown field"), "{error}");
+    }
+    assert_eq!(std::fs::read(&volume).unwrap(), b"PRESERVE_VOLUME");
+    assert_eq!(
+        std::fs::read(box_dir.join("rootfs.img")).unwrap(),
+        b"LEGACY_ROOT"
+    );
+    assert!(!project.path().join("export.terra").exists());
+    let refused = run_terra_in(
+        project.path(),
+        home.path(),
+        &["./dev.yaml", "setup", "--dry-run"],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--trust-recipe"));
+    assert_eq!(
+        std::fs::read_to_string(box_dir.join("recipe.yaml")).unwrap(),
+        old_recipe
+    );
+    setup_without_vm(
+        project.path(),
+        home.path(),
+        &["./dev.yaml", "setup", "--trust-recipe"],
+    );
+    let output = run_terra_in(project.path(), home.path(), &["ls"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("stopped"));
+    assert_eq!(std::fs::read(volume).unwrap(), b"PRESERVE_VOLUME");
+}
+
+/// Show reads setup mount declarations and resolves workload mount targets.
+#[cfg(unix)]
+#[test]
+fn show_prints_setup_mounts_as_declarations() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    for directory in ["source", "replacement", "workload-target"] {
+        std::fs::create_dir_all(project.path().join(directory)).unwrap();
+    }
+    std::os::unix::fs::symlink("workload-target", project.path().join("workload")).unwrap();
+    std::fs::write(
+        project.path().join("dev.yaml"),
+        "setup: {mounts: [{host: ./source, guest: /setup}]}\n\
+         workload: {mounts: [{host: ./workload, guest: /work}]}\n",
+    )
+    .unwrap();
+    setup_without_vm(project.path(), home.path(), &["./dev.yaml", "setup"]);
+    let show = || {
+        let project_dir = project_path(project.path());
+        for name in ["dev", "./dev.yaml"] {
+            let output = run_terra_in(project.path(), home.path(), &[name, "show", "--json"]);
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                shown["setup"]["mounts"][0]["host"],
+                project_dir.join("source").to_str().unwrap()
+            );
+            assert_eq!(
+                shown["workload"]["mounts"][0]["host"],
+                project_dir.join("workload-target").to_str().unwrap()
+            );
+        }
+    };
+    show();
+
+    let source = project.path().join("source");
+    std::fs::remove_dir(&source).unwrap();
+    show();
+    std::fs::write(&source, b"file").unwrap();
+    show();
+    std::fs::remove_file(&source).unwrap();
+    std::fs::create_dir(home.path().join(".ssh")).unwrap();
+    for target in [
+        project.path().join("replacement"),
+        home.path().join(".terra"),
+        home.path().join(".ssh"),
+    ] {
+        std::os::unix::fs::symlink(target, &source).unwrap();
+        show();
+        std::fs::remove_file(&source).unwrap();
+    }
+}
+
+/// A failed workload source review keeps every mount's original spelling.
+#[cfg(unix)]
+#[test]
+fn show_keeps_original_mount_spellings_when_resolution_fails() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("actual")).unwrap();
+    std::os::unix::fs::symlink("actual", project.path().join("source")).unwrap();
+    for (first_phase, second_phase, warns) in [
+        ("setup", "setup", false),
+        ("workload", "workload", true),
+        ("setup", "workload", true),
+    ] {
+        let first = "    - {host: ./source, guest: /first}\n";
+        let second = "    - {host: ./missing, guest: /second}\n";
+        let recipe = if first_phase == second_phase {
+            format!("{first_phase}:\n  mounts:\n{first}{second}")
+        } else {
+            format!("{first_phase}:\n  mounts:\n{first}{second_phase}:\n  mounts:\n{second}")
+        };
+        std::fs::write(project.path().join("dev.yaml"), recipe).unwrap();
+        let output = run_terra_in(
+            project.path(),
+            home.path(),
+            &["./dev.yaml", "show", "--json"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("would refuse"),
+            warns,
+            "{output:?}"
+        );
+        let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let original_host = project_path(project.path()).join("source");
+        assert_eq!(
+            shown[first_phase]["mounts"][0]["host"],
+            original_host.to_str().unwrap()
+        );
+    }
+}
+
+#[test]
+fn setup_refuses_a_file_mount_before_replacing_the_baked_root() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let recipe = project.path().join("dev.yaml");
+    std::fs::write(&recipe, "network: {enabled: false}\n").unwrap();
+    setup_without_vm(project.path(), home.path(), &["./dev.yaml", "setup"]);
+    let root = find_only_box(home.path()).join("rootfs.img");
+    std::fs::write(&root, b"BAKED_ROOT").unwrap();
+    for phase in ["setup", "workload"] {
+        std::fs::write(
+            &recipe,
+            format!("{phase}: {{mounts: [{{host: ./dev.yaml, guest: /work}}]}}\n"),
+        )
+        .unwrap();
+        for flag in ["--dry-run", "--trust-recipe"] {
+            let out = run_terra_in(project.path(), home.path(), &["./dev.yaml", "setup", flag]);
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{error}");
+            assert!(error.contains("must be a directory"), "{error}");
+            assert!(error.contains("dev.yaml"), "{error}");
+            assert_eq!(std::fs::read(&root).unwrap(), b"BAKED_ROOT");
+        }
+    }
 }
 
 #[test]
@@ -1341,18 +1554,22 @@ fn missing_mount_host_path_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let recipe = dir.path().join("recipe.yaml");
-    std::fs::write(
-        &recipe,
-        "mounts:\n  - host: ./nonexistent-e2e-path\n    guest: /work\n",
-    )
-    .unwrap();
-    let out = run_terra_in(
-        dir.path(),
-        home.path(),
-        &[recipe.to_str().unwrap(), "setup"],
-    );
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("resolving mount host path"), "{stderr}");
-    assert!(stderr.contains("nonexistent-e2e-path"), "{stderr}");
+    for phase in ["setup", "workload"] {
+        std::fs::write(
+            &recipe,
+            format!(
+                "{phase}:\n  mounts:\n    - host: ./nonexistent-e2e-path\n      guest: /work\n"
+            ),
+        )
+        .unwrap();
+        let out = run_terra_in(
+            dir.path(),
+            home.path(),
+            &[recipe.to_str().unwrap(), "setup"],
+        );
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("resolving mount host path"), "{stderr}");
+        assert!(stderr.contains("nonexistent-e2e-path"), "{stderr}");
+    }
 }

@@ -3,9 +3,9 @@
 use crate::approval::{ApplyEffect, Approval, review_recipe};
 use crate::cli::{StorageArgs, StorageCmd, StorageFileArgs, StorageImportArgs};
 use crate::recipe::resolve;
-use crate::recipe::{MAX_RECIPE_BYTES, Recipe, Volume, VolumeLifetime, load_path};
+use crate::recipe::{MAX_RECIPE_BYTES, Recipe, Volume, VolumeLifetime};
 use crate::render::{escape_printable, escape_printable_path, finish_stdout_write};
-use crate::state::{BoxRef, RECIPE_FILE, ROOTFS_FILE, StagedImportFile};
+use crate::state::{BoxRef, BoxState, RECIPE_FILE, ROOTFS_FILE, StagedImportFile};
 use crate::vm::image::{self, BYTES_PER_MIB};
 use anyhow::{Context, Result};
 use flate2::Compression;
@@ -45,9 +45,7 @@ pub fn run(
 }
 
 fn list_recipe_volumes(bx: &BoxRef) -> Result<Vec<Volume>> {
-    let recipe = load_path(&bx.get_dir().join(RECIPE_FILE), bx.get_project_dir())
-        .context("reading the applied recipe")?;
-    Ok(recipe.volumes)
+    Ok(bx.load_applied_recipe()?.volumes)
 }
 
 fn list_recipe_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
@@ -59,6 +57,7 @@ fn list_recipe_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
 
 #[derive(Serialize)]
 struct StorageShowOutput {
+    state: BoxState,
     images: Vec<StorageImageEntry>,
     total_disk_bytes: u64,
 }
@@ -69,15 +68,17 @@ struct StorageImageEntry {
     path: PathBuf,
     virtual_bytes: u64,
     disk_bytes: u64,
-    is_unused: bool,
+    is_unused: Option<bool>,
 }
 
 fn show(bx: &BoxRef, json: bool) -> Result<()> {
+    let box_state = bx.get_state()?;
     let images = list_image_entries(bx)?;
     let total_disk_bytes = images.iter().map(|image| image.disk_bytes).sum();
     let mut out = std::io::stdout().lock();
     if json {
         let rendered = serde_json::to_string_pretty(&StorageShowOutput {
+            state: box_state,
             images,
             total_disk_bytes,
         })
@@ -96,15 +97,15 @@ fn show(bx: &BoxRef, json: bool) -> Result<()> {
         .map(|image| escape_printable_path(Path::new(&image.name)))
         .collect();
     let width = names.iter().map(String::len).max().unwrap_or(0);
-    finish_stdout_write(writeln!(out, "{:<12} {}", bx.get_state()?, bx.get_name()))?;
+    finish_stdout_write(writeln!(out, "{:<12} {}", box_state, bx.get_name()))?;
     for (name, image) in names.iter().zip(&images) {
-        let note = if image.is_unused {
-            format!(
+        let note = match image.is_unused {
+            Some(true) => format!(
                 "  (unused - `terra {} storage prune` removes it)",
                 bx.get_name()
-            )
-        } else {
-            String::new()
+            ),
+            Some(false) => String::new(),
+            None => "  (usage unknown - applied recipe could not be read)".to_string(),
         };
         finish_stdout_write(writeln!(
             out,
@@ -128,7 +129,13 @@ fn list_image_entries(bx: &BoxRef) -> Result<Vec<StorageImageEntry>> {
         // A box with no images may have no applied recipe to name its volumes by.
         return Ok(Vec::new());
     }
-    let unused = bx.list_unused_volume_images(&list_recipe_volume_names(bx)?)?;
+    let unused = match list_recipe_volume_names(bx) {
+        Ok(names) => Some(bx.list_unused_volume_images(&names)?),
+        Err(error) => {
+            eprintln!("terra: warning: {error:#}");
+            None
+        }
+    };
     images
         .into_iter()
         .map(|path| {
@@ -142,7 +149,11 @@ fn list_image_entries(bx: &BoxRef) -> Result<Vec<StorageImageEntry>> {
                     .into_owned(),
                 virtual_bytes: meta.len(),
                 disk_bytes: crate::sys::allocated_size(&path, &meta),
-                is_unused: unused.contains(&path),
+                is_unused: if path == bx.get_dir().join(ROOTFS_FILE) {
+                    Some(false)
+                } else {
+                    unused.as_ref().map(|unused| unused.contains(&path))
+                },
                 path,
             })
         })
@@ -164,6 +175,7 @@ fn export(bx: &BoxRef, to: &Path) -> Result<()> {
     refuse_a_destination_inside_box_state(bx, to)?;
     let _lock = bx.lock_run()?;
     bx.recover_import()?;
+    let images = list_exportable_images(bx)?;
     anyhow::ensure!(
         bx.is_set_up(),
         "{bx} is not set up - `terra {} setup` finishes it; an artifact carries the \
@@ -173,7 +185,6 @@ fn export(bx: &BoxRef, to: &Path) -> Result<()> {
     let recipe_path = bx.get_dir().join(RECIPE_FILE);
     let recipe = std::fs::read(&recipe_path)
         .with_context(|| format!("reading {}", recipe_path.display()))?;
-    let images = list_exportable_images(bx)?;
     image::staged_write(to, |out| write_artifact(&recipe, &images, out))
         .with_context(|| format!("writing {}", escape_printable_path(to)))?;
     for img in &images {
@@ -631,6 +642,151 @@ mod tests {
         assert!(!into.get_volume_image_path("old").exists());
     }
 
+    /// Setup sources may be missing, unusable, or protected on the host that
+    /// imports the baked root. Workload mounts still need approved targets.
+    #[test]
+    fn an_import_defers_setup_sources_and_pins_workload_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let text = concat!(
+            "network: {enabled: false}\n",
+            "setup:\n",
+            "  mounts:\n",
+            "    - {host: ./missing, guest: /missing}\n",
+            "    - {host: ./file, guest: /file}\n",
+            "    - {host: ./protected, guest: /protected}\n",
+            "workload: {mounts: [{host: ./workload, guest: /work}]}\n",
+        );
+        let artifact = dir.path().join("dev.terra");
+        write_crafted_artifact(&artifact, Some(text), &[(ROOTFS_FILE, 16)]);
+
+        let into = new_project(dir.path());
+        let project = into.get_project_dir();
+        std::fs::write(project.join("file"), b"file").unwrap();
+        let terra_home = crate::state::get_terra_home_path().unwrap();
+        std::fs::create_dir_all(&terra_home).unwrap();
+        crate::sys::symlink_dir(terra_home, project.join("protected")).unwrap();
+        let workload_source = dir.path().join("workload-source");
+        std::fs::create_dir(&workload_source).unwrap();
+        let workload_link = project.join("workload");
+        crate::sys::symlink_dir(&workload_source, &workload_link).unwrap();
+
+        import(&into, &artifact).unwrap();
+        assert!(into.is_set_up());
+        assert_eq!(
+            std::fs::read_to_string(into.get_dir().join(RECIPE_FILE)).unwrap(),
+            text
+        );
+        assert_eq!(
+            into.load_pinned_paths().unwrap().unwrap().setup_mounts,
+            Vec::<std::path::PathBuf>::new()
+        );
+
+        let target = || resolve::ResolvedRecipe {
+            bx: into.clone(),
+            source: resolve::Source::Applied,
+            manifest: None,
+        };
+        let (_, recipe) = target().load_applied_recipe().unwrap();
+        assert_eq!(
+            recipe.workload.mounts[0].host,
+            std::fs::canonicalize(&workload_source).unwrap()
+        );
+
+        let replacement = dir.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        crate::sys::remove_directory_symlink(&workload_link).unwrap();
+        crate::sys::symlink_dir(&replacement, &workload_link).unwrap();
+        let error = target().load_applied_recipe().unwrap_err().to_string();
+        assert!(error.contains("moved since the last setup"), "{error}");
+    }
+
+    /// Even a byte-identical artifact replaces the root and clears local setup
+    /// approvals. An unchanged root stays usable, and a rebuild needs its own approval.
+    #[tokio::test]
+    async fn an_import_clears_local_setup_approvals_and_the_next_setup_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let into = new_project(dir.path());
+        let project = into.get_project_dir();
+        let setup = project.join("setup");
+        std::fs::create_dir(&setup).unwrap();
+        let text = "network: {enabled: false}\n\
+                    setup: {mounts: [{host: ./setup, guest: /setup, readonly: true}]}\n";
+        let artifact = dir.path().join("dev.terra");
+        write_crafted_artifact(&artifact, Some(text), &[(ROOTFS_FILE, 16)]);
+        std::fs::write(
+            project.join("dev.yaml"),
+            text.replace("setup: {", "setup: {workdir: /tmp, "),
+        )
+        .unwrap();
+        let dry_run = crate::cli::SetupArgs {
+            trust_recipe: false,
+            rebuild: false,
+            dry_run: true,
+        };
+        let run_setup =
+            |name| crate::cmd::setup::run(&dry_run, Some(name), project, project, false);
+
+        for has_local_approval in [false, true] {
+            if has_local_approval {
+                let target = resolve::ResolvedRecipe {
+                    bx: into.clone(),
+                    source: resolve::Source::Applied,
+                    manifest: None,
+                };
+                let approved = crate::approval::approve_by_hand(target, true, false).unwrap();
+                approved.write_applied_recipe(into.get_dir()).unwrap();
+                assert_eq!(
+                    into.load_pinned_paths().unwrap().unwrap().setup_mounts,
+                    [std::fs::canonicalize(&setup).unwrap()]
+                );
+            }
+
+            import(&into, &artifact).unwrap();
+            assert!(into.is_set_up());
+            run_setup("dev").await.unwrap();
+            assert_eq!(
+                into.load_pinned_paths().unwrap().unwrap().setup_mounts,
+                Vec::<std::path::PathBuf>::new()
+            );
+            let error = run_setup("./dev.yaml").await.unwrap_err().to_string();
+            assert!(
+                error.contains("setup mount targets have not been approved"),
+                "{error}"
+            );
+            assert!(error.contains("--trust-recipe"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_import_refuses_unusable_workload_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = TestHome::new();
+        let into = new_project(dir.path());
+        let artifact = dir.path().join("dev.terra");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"file").unwrap();
+        for (host, expected) in [
+            (dir.path().join("missing"), "resolving mount host path"),
+            (file, "must be a directory"),
+            (
+                home.get_path().to_path_buf(),
+                "would share this box's own state",
+            ),
+        ] {
+            let text = format!(
+                "setup: {{mounts: [{{host: ./missing-setup, guest: /setup}}]}}\n\
+                 workload: {{mounts: [{{host: {}, guest: /work}}]}}\n",
+                host.display()
+            );
+            write_crafted_artifact(&artifact, Some(&text), &[(ROOTFS_FILE, 16)]);
+            let error = import(&into, &artifact).unwrap_err();
+            assert!(error.to_string().contains(expected), "{host:?}: {error:#}");
+            assert!(!into.get_dir().exists());
+        }
+    }
+
     /// A boot-lifetime image can outlive a crashed VM, but the artifact carries
     /// only what a restart would have kept.
     #[test]
@@ -1054,12 +1210,13 @@ mod tests {
         let bx = build_box_ref(dir.path(), &["data"]);
 
         let output = StorageShowOutput {
+            state: BoxState::Stopped,
             images: vec![StorageImageEntry {
                 name: "rootfs.ext4".to_string(),
                 path: PathBuf::from("/tmp/rootfs.ext4"),
                 virtual_bytes: 1024,
                 disk_bytes: 512,
-                is_unused: false,
+                is_unused: Some(false),
             }],
             total_disk_bytes: 512,
         };

@@ -84,7 +84,7 @@ A new user-facing feature gets a step in both `run.sh` and `run.ps1`.
 | Path | Responsibility |
 | --- | --- |
 | `crates/terra` | CLI, recipes and manifests, box storage, VM launch and clients |
-| `crates/terra-agent` | Linux guest initialization, hooks, workload and interactive services |
+| `crates/terra-agent` | Linux guest initialization, setup, workload lifecycle and interactive services |
 | `crates/terra-protocol` | Shared guest wire protocol |
 | `crates/terra-policy` | Shared network policy rules and address decisions |
 | `crates/terra-network` | Host network broker and its IPC client |
@@ -151,7 +151,7 @@ Shutdown responsibilities stay with their resource owners:
 
 ## Guest boot
 
-`crates/terra/src/vm.rs` builds each VM's boot plan: `PlanMode::Create` for
+`crates/terra/src/vm.rs` builds each VM's boot plan: `PlanMode::Setup` for
 setup's VM, `PlanMode::Run` for a start. The plan, environment values included,
 travels over vsock; no plan file is written on the host.
 
@@ -160,14 +160,20 @@ memory-backed boot disk. `bootstrap.rs` reads the plan from the fixed agent
 vsock stream, grows the root and volume filesystems to fill their images and
 enters the Alpine root with `pivot_root`. `agent.rs` then runs the plan's mode:
 
-- **Create** mounts the volumes but not the shares and runs `on_create`.
-  Setup boots it only to create or rebuild a root.
-- **Run** mounts shares and volumes, runs `on_start`, the daemons and the
-  workload, and `pre_stop` on an orderly stop.
+- **Setup** mounts `setup.mounts` and the volumes, enters
+  `setup.workdir`, and runs `setup.run`. Setup boots it only to create or
+  rebuild a root; it also creates the directories normal runs need.
+- **Run** mounts `workload.mounts` and the volumes, enters
+  `workload.workdir`, runs `workload.on_start`, starts the daemons and workload,
+  and runs `workload.pre_stop` on an orderly stop.
 
-Both remount their filesystems read-only on the way out, so the next boot needs
-no journal replay. Create retries a busy root and fails if it stays writable;
-Run makes one best-effort attempt and ignores a busy filesystem.
+Both mount lists default to read-write and accept `readonly: true`.
+
+Setup unmounts its volumes and host shares, prepares the root's runtime paths,
+then remounts the root read-only so the next boot needs no journal replay.
+Setup retries busy mounts and fails if cleanup cannot finish. Run makes one
+best-effort attempt to remount its volumes and root read-only and ignores busy
+filesystems.
 
 ## Network transport
 
@@ -253,9 +259,9 @@ not resident-memory measurements.
 
 The guest boot deadline is 60 seconds (`terra_runtime::orchestration::GUEST_BOOT_TIMEOUT`),
 starting when guest execution starts. The agent sends `AgentReady` after
-initialization and before hooks. Readiness permanently cancels this deadline;
-long hooks keep their existing limits. `--agent-timeout` separately bounds a
-client's connection wait.
+initialization and before `setup.run` or `workload.on_start`. Readiness
+permanently cancels this deadline. Each setup and startup command has a
+five-minute limit. `--agent-timeout` bounds a client's connection wait.
 
 Detached startup waits for the VM child's readiness notification. Its parent
 wait is bounded to 90 seconds: the guest deadline plus 30 seconds for preparation
@@ -557,8 +563,9 @@ The native file-events test can use `TERRA_FILE_EVENTS_PROBE` instead of Zig:
 point it to a static Linux binary built from `crates/terra/tests/assets/file_events_probe.c`
 for the guest architecture.
 
-Those gates cover guest CPUs, hooks, writable/read-only mounts, granted networking,
-volume persistence, and rootless Podman image import/run/stop on a private disk.
+Those gates cover guest CPUs, setup and workload lifecycle commands, writable
+and read-only mounts, granted networking, volume persistence, and rootless
+Podman image import/run/stop on a private disk.
 The Podman gate downloads Alpine packages during setup and needs public egress. Native adapter code and a cross-target check alone do
 not establish guest acceptance; outstanding host validation is in [todo.md](docs/todo.md).
 

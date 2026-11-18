@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "podman", "wireguard", "readonly", "overlay", "bad-bake", "rebuild"
+$boxes = "probe", "setup-mounts", "setup-workdir", "setup-bad-workdir", "nested-mounts", "isolated", "offline", "podman", "wireguard", "readonly", "overlay", "bad-bake", "rebuild"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -208,7 +208,7 @@ try {
     $version = Get-TerraVersion
     Complete-Step
 
-    New-Item -ItemType Directory -Path $project, (Join-Path $project "work"), (Join-Path $project "readonly") | Out-Null
+    New-Item -ItemType Directory -Path $project, (Join-Path $project "work"), (Join-Path $project "readonly"), (Join-Path $project "setup-work") | Out-Null
     Copy-Item -Recurse -LiteralPath $Suite -Destination (Join-Path $project "suite")
     Set-Location -LiteralPath $project
     Write-Text "work/host" "HOST_SEED"
@@ -236,7 +236,51 @@ try {
     Assert-Contains (Get-TerraOutput @("probe", "show", "--json", "--with-env-values")) "recipe-value"
     Complete-Step
 
-    Start-Step "a detached box runs its hooks, daemons and workload"
+    Start-Step "setup mounts: writable default, explicit read-only, phase isolation"
+    Write-Text "work/runtime-only-seed" "RUNTIME_ONLY"
+    Assert-Contains (Get-TerraOutput @("./setup-mounts.yaml", "setup")) "SETUP_MOUNTS_OK"
+    if (Test-Path -LiteralPath (Join-Path $project "suite/forbidden")) { throw "a read-only setup mount accepted a write" }
+    Assert-Equal (Read-Text "setup-work/setup-result") "SETUP_WROTE"
+    Invoke-Terra @("setup-mounts", "-d")
+    Invoke-Terra @("setup-mounts", "exec", "--no-tty", "--", "sh", "-ec",
+        'for i in $(seq 1 30); do [ -s /work/runtime-result ] && break; sleep 1; done; grep -qx RUNTIME_WROTE /work/runtime-result; test ! -e /work/guest/namespaces.sh; test ! -e /setup-only/setup-result; grep -qx SETUP_COPY /setup-output')
+    Assert-Equal (Read-Text "work/on-start") "ON_START"
+    Assert-Equal (Read-Text "work/daemon") "DAEMON"
+    Invoke-Terra @("setup-mounts", "stop")
+    Assert-Equal (Read-Text "work/pre-stop") "PRE_STOP"
+    Complete-Step
+
+    Start-Step "storage import defers setup sources and local approval"
+    $setupArtifact = Join-Path $work "setup-mounts.terra"
+    Invoke-Terra @("setup-mounts", "storage", "export", $setupArtifact)
+    Move-Item -LiteralPath (Join-Path $project "setup-work") -Destination (Join-Path $work "previous-setup-work")
+    Invoke-Terra @("setup-mounts", "storage", "import", "--trust-recipe", $setupArtifact)
+    Invoke-Terra @("setup-mounts", "setup", "--dry-run")
+    Invoke-Terra @("setup-mounts", "-d")
+    Invoke-Terra @("setup-mounts", "exec", "--no-tty", "--", "sh", "-ec", 'grep -qx SETUP_COPY /setup-output')
+    Invoke-Terra @("setup-mounts", "stop")
+    New-Item -ItemType Directory -Path (Join-Path $project "setup-work") | Out-Null
+    $refused = Get-TerraOutput @("setup-mounts", "setup", "--rebuild") -Fails
+    Assert-Contains $refused "--trust-recipe"
+    Assert-Contains (Get-TerraOutput @("setup-mounts", "setup", "--rebuild", "--trust-recipe")) "SETUP_MOUNTS_OK"
+    Complete-Step
+
+    Start-Step "setup workdirs: created in the root, and a file is refused"
+    Invoke-Terra @("./setup-workdir.yaml", "setup")
+    Assert-Contains (Get-TerraOutput @("setup-workdir", "--foreground")) "SETUP_WORKDIR_OK"
+    $failed = Get-TerraOutput @("./setup-bad-workdir.yaml", "setup") -Fails
+    Assert-Contains $failed "terra-agent: setup failed: creating setup workdir /etc/passwd"
+    Assert-Contains $failed "setup failed - fix the recipe"
+    Assert-Listed "setup-bad-workdir" "needs_setup"
+    Complete-Step
+
+    Start-Step "nested mount targets are refused before setup"
+    $failed = Get-TerraOutput @("./nested-mounts.yaml", "setup") -Fails
+    Assert-Contains $failed "overlap in setup"
+    Assert-Contains $failed "mount at separate paths"
+    Complete-Step
+
+    Start-Step "a detached box runs on_start commands, daemons and its workload"
     Invoke-Terra @("probe", "-d")
     Invoke-GuestCheck "exercise-ready.sh"
     Assert-Equal (Read-Text "work/ready") "recipe-value"
@@ -343,15 +387,17 @@ try {
     Invoke-Terra @("wireguard", "stop")
     Complete-Step
 
-    Start-Step "a read-only root refuses writes; boot-lifetime volumes start empty"
+    Start-Step "a read-only root prepares workdirs and refuses writes; boot-lifetime volumes start empty"
     Invoke-Terra @("./readonly.yaml", "setup")
     Invoke-Terra @("readonly", "-d")
+    Assert-Equal (Get-TerraOutput @("readonly", "exec", "--no-tty", "--", "pwd")) "/prepared/deep"
     Assert-Contains (Get-TerraOutput @("readonly", "exec", "--no-tty", "--root", "--",
         "sh", "-c", "touch /etc/probe 2>&1; true")) "Read-only file system"
     Invoke-Terra @("readonly", "exec", "--no-tty", "--",
         "sh", "-ec", "echo KEPT > /kept/value; echo GONE > /scratch/value")
     Invoke-Terra @("readonly", "stop")
     Invoke-Terra @("readonly", "-d")
+    Assert-Equal (Get-TerraOutput @("readonly", "exec", "--no-tty", "--", "pwd")) "/prepared/deep"
     Assert-Equal (Get-TerraOutput @("readonly", "exec", "--no-tty", "--", "cat", "/kept/value")) "KEPT"
     Invoke-Terra @("readonly", "exec", "--no-tty", "--", "sh", "-ec", "test ! -e /scratch/value")
     Invoke-Terra @("readonly", "stop")

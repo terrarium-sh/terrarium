@@ -1,4 +1,8 @@
 fn main() {
+    println!(
+        "cargo:rustc-env=TERRA_ARTIFACT_SECTION={}",
+        terra_build::EMBEDDED_ARTIFACT_SECTION
+    );
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/heads");
     println!("cargo:rerun-if-changed=../../.git/refs/tags");

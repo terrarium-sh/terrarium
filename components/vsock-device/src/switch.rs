@@ -1,7 +1,7 @@
 //! Bounded virtio-vsock carrier validation and stream state.
 
 use crate::VsockHeader;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use terra_protocol::vsock::{
     self, AGENT_PORT, AGENT_REPLY_BYTES, AGENT_UPSTREAM_BYTES, CONTROL_PORT, CONTROL_REPLY_BYTES,
@@ -654,6 +654,7 @@ pub struct VsockSwitch {
     next_connection_number: u64,
     network_enabled: bool,
     network_socket_capacity: usize,
+    has_live_flow_changes: bool,
     next_reply: usize,
     next_flow_reply: usize,
     rejected: VecDeque<Reply>,
@@ -688,6 +689,7 @@ impl VsockSwitch {
             next_connection_number: 3,
             network_enabled,
             network_socket_capacity: network_socket_capacity.min(MAX_NETWORK_SOCKETS),
+            has_live_flow_changes: false,
             next_reply: 0,
             next_flow_reply: 0,
             rejected: VecDeque::new(),
@@ -800,11 +802,14 @@ impl VsockSwitch {
         self.endpoints[index].stream.rx(header, bytes);
         if was_live && !self.endpoints[index].is_live() {
             self.retire_endpoint(index);
+        } else if !was_live && self.endpoints[index].is_live() && index >= FIXED_ENDPOINTS {
+            self.has_live_flow_changes = true;
         }
         Some(touched)
     }
 
     fn retire_endpoint(&mut self, index: usize) {
+        self.has_live_flow_changes |= index >= FIXED_ENDPOINTS;
         let connection_number = self.allocate_connection_number();
         self.endpoints[index].retire(connection_number);
     }
@@ -832,6 +837,7 @@ impl VsockSwitch {
         }
         let connection = endpoint.identity(connection_number);
         self.endpoints.push(endpoint);
+        self.has_live_flow_changes = true;
         Ok(connection)
     }
 
@@ -873,13 +879,15 @@ impl VsockSwitch {
             .collect()
     }
 
-    #[must_use]
-    pub fn flow_connections(&self) -> Vec<ConnectionId> {
-        self.endpoints
-            .iter()
-            .skip(FIXED_ENDPOINTS)
-            .filter_map(Endpoint::connected)
-            .collect()
+    /// The current non-fixed endpoints since the last change, including connecting publications.
+    pub fn take_live_flows_if_changed(&mut self) -> Option<BTreeSet<ConnectionId>> {
+        std::mem::take(&mut self.has_live_flow_changes).then(|| {
+            self.endpoints[FIXED_ENDPOINTS..]
+                .iter()
+                .filter(|endpoint| endpoint.is_live())
+                .map(|endpoint| endpoint.identity(endpoint.connection_number))
+                .collect()
+        })
     }
 
     fn connected_stream(&self, connection: ConnectionId) -> Option<&StreamConnection> {

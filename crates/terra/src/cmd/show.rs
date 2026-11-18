@@ -1,4 +1,4 @@
-//! `terra show` - print the fully-resolved recipe a boot would use.
+//! `terra show` - print a recipe for review.
 
 use crate::policy::mount;
 use crate::recipe::resolve;
@@ -29,21 +29,13 @@ pub fn run(
 
     let is_applied = matches!(target.source, resolve::Source::Applied);
     let mut recipe = target.parse_recipe_without_env_file()?;
-    match mount::resolve_mounts(&recipe, &target.bx) {
-        Ok(mounts) => {
-            for s in mount::find_sensitive_mounts(&mounts) {
-                let access = if s.mount.readonly {
-                    "read-only"
-                } else {
-                    "read-write"
-                };
-                eprintln!(
-                    "terra: warning: mount '{}' shares sensitive host {} ({access}) with the sandbox",
-                    render::escape_printable_path(&s.mount.host),
-                    s.category
-                );
+    let mut resolved_recipe = recipe.clone();
+    match mount::resolve_workload_mounts(&mut resolved_recipe, &target.bx) {
+        Ok(()) => {
+            recipe = resolved_recipe;
+            for s in mount::find_sensitive_mounts(&recipe, mount::GrantPhases::Workload) {
+                eprintln!("terra: warning: {}", s.warning());
             }
-            recipe.mounts = mounts;
         }
         Err(e) if is_applied => return Err(e),
         Err(e) => eprintln!(
@@ -53,9 +45,7 @@ pub fn run(
     }
     let env_values = resolve_env_file(&mut recipe).and_then(|()| {
         if is_applied {
-            target
-                .bx
-                .verify_pinned_paths(&crate::state::PinnedPaths::from_recipe(&recipe))?;
+            target.bx.verify_workload_pins(&recipe)?;
         }
         merge_env_file(&mut recipe)
     });
@@ -90,11 +80,8 @@ mod tests {
     use crate::recipe::parse_recipe;
     use crate::state::{self, BoxRef};
 
-    /// `show` is what a recipe is reviewed with before it is trusted, so it
-    /// runs the checks that decide whether `terra setup` would take it - and
-    /// reports rather than returns them, because a recipe whose mounts are not
-    /// there yet is still worth reading. A recipe mounting terra's own state
-    /// used to print clean and then be refused at the setup nobody had run yet.
+    /// Reviewing a workload share should reveal the directory a boot would
+    /// grant and flag a share that overlaps Terra's state.
     #[test]
     fn show_resolves_and_judges_the_mounts_a_boot_would_get() {
         let dir = tempfile::tempdir().unwrap();
@@ -105,9 +92,9 @@ mod tests {
         let bx = BoxRef::resolve(&project, "dev").unwrap();
 
         // A mount of the box's own state is what `terra setup` refuses.
-        let refused = parse_recipe(
+        let mut refused = parse_recipe(
             &format!(
-                "mounts:\n  - host: {}\n    guest: /work\n",
+                "workload:\n  mounts:\n    - host: {}\n      guest: /work\n",
                 bx.get_dir().display()
             ),
             &project,
@@ -115,20 +102,20 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
-        let err = mount::resolve_mounts(&refused, &bx)
+        let err = mount::resolve_workload_mounts(&mut refused, &bx)
             .expect_err("a mount of the box's own state must be reported")
             .to_string();
         assert!(err.contains("this box's own state"), "{err}");
 
         let mut ok = parse_recipe(
-            "mounts:\n  - host: ./sub/../src\n    guest: /work\n",
+            "workload:\n  mounts:\n    - host: ./sub/../src\n      guest: /work\n",
             &project,
             Path::new("r.yaml"),
         )
         .unwrap();
-        ok.mounts = mount::resolve_mounts(&ok, &bx).unwrap();
+        mount::resolve_workload_mounts(&mut ok, &bx).unwrap();
         assert_eq!(
-            ok.mounts[0].host,
+            ok.workload.mounts[0].host,
             std::fs::canonicalize(project.join("src")).unwrap()
         );
     }
@@ -199,7 +186,7 @@ mod tests {
     fn show_refuses_an_applied_recipe_whose_paths_moved() {
         let _home = crate::sys::TestHome::new();
         for recipe in [
-            "mounts:\n  - host: ./share\n    guest: /work\n",
+            "workload:\n  mounts:\n    - host: ./share\n      guest: /work\n",
             "env_file: ./share/values.env\n",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -217,11 +204,11 @@ mod tests {
             std::fs::create_dir_all(bx.get_dir()).unwrap();
             std::fs::write(bx.get_dir().join(state::RECIPE_FILE), recipe).unwrap();
             let mut recipe = parse_recipe(recipe, &project, Path::new("dev.yaml")).unwrap();
-            recipe.mounts = mount::resolve_mounts(&recipe, &bx).unwrap();
+            mount::resolve_workload_mounts(&mut recipe, &bx).unwrap();
             resolve_env_file(&mut recipe).unwrap();
             std::fs::write(
                 bx.get_dir().join(state::PINNED_PATHS_FILE),
-                yaml_serde::to_string(&crate::state::PinnedPaths::from_recipe(&recipe)).unwrap(),
+                yaml_serde::to_string(&state::PinnedPaths::new(&recipe, Vec::new())).unwrap(),
             )
             .unwrap();
 
@@ -252,7 +239,7 @@ mod tests {
         std::fs::write(
             project.join("dev.yaml"),
             format!(
-                "mounts:\n  - host: {}\n    guest: /ssh\n    readonly: true\n",
+                "workload:\n  mounts:\n    - host: {}\n      guest: /ssh\n      readonly: true\n",
                 ssh_dir.display()
             ),
         )

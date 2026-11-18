@@ -5,7 +5,7 @@ use futures_util::{
     future::{AbortHandle, Abortable, Either, poll_fn, select},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
     sync::{
@@ -85,7 +85,8 @@ struct State {
     config: Option<NetworkConfig>,
     control: Option<(ConnectionId, Task)>,
     is_control_ready: bool,
-    flows: Vec<Flow>,
+    flow_tasks: BTreeMap<ConnectionId, Task>,
+    draining: BTreeSet<ConnectionId>,
     listeners: Vec<Task>,
     broker_watcher: Option<Task>,
     waiters: BTreeMap<ConnectionId, Vec<Waker>>,
@@ -133,10 +134,17 @@ pub(crate) fn notify_admission() {
 
 pub(crate) fn spawn_task(future: impl std::future::Future<Output = ()> + 'static) -> Task {
     let (abort, registration) = AbortHandle::new_pair();
+    spawn_abortable(future, registration);
+    Task(abort)
+}
+
+fn spawn_abortable(
+    future: impl std::future::Future<Output = ()> + 'static,
+    registration: futures_util::future::AbortRegistration,
+) {
     wit_bindgen::spawn_local(async move {
         let _ = Abortable::new(future, registration).await;
     });
-    Task(abort)
 }
 
 pub fn configure(
@@ -241,14 +249,11 @@ pub(crate) fn reset_flow(connection: ConnectionId) {
 }
 
 fn finish_flow(connection: ConnectionId) {
-    if let Some(flow) = lock_network()
-        .flows
-        .iter_mut()
-        .find(|flow| flow.connection == connection)
-    {
-        flow.finished.store(true, Ordering::Release);
+    let mut state = lock_network();
+    if state.flow_tasks.contains_key(&connection) && state.draining.insert(connection) {
+        drop(state);
+        wake_worker();
     }
-    wake_worker();
 }
 
 pub(crate) fn shutdown_flow(connection: ConnectionId) {
@@ -332,6 +337,14 @@ pub(crate) async fn wait_receive_closed(connection: ConnectionId) {
     .await;
 }
 
+fn deliver_chunk(connection: ConnectionId, bytes: Vec<u8>) -> Result<(), SocketError> {
+    switch()
+        .deliver(connection, bytes)
+        .map_err(|_| SocketError::Cancelled)?;
+    transport::schedule_receive_queue();
+    Ok(())
+}
+
 pub(crate) async fn deliver_bytes(
     connection: ConnectionId,
     mut bytes: Vec<u8>,
@@ -345,10 +358,7 @@ pub(crate) async fn deliver_bytes(
         }
         let remainder = bytes.split_off(capacity.min(bytes.len()));
         let chunk = std::mem::replace(&mut bytes, remainder);
-        switch()
-            .deliver(connection, chunk)
-            .map_err(|_| SocketError::Cancelled)?;
-        transport::schedule_receive_queue();
+        deliver_chunk(connection, chunk)?;
     }
     Ok(())
 }
@@ -365,11 +375,7 @@ async fn deliver_opening(connection: ConnectionId, bytes: Vec<u8>) -> Result<(),
     {
         return Err(SocketError::Closed);
     }
-    switch()
-        .deliver(connection, bytes)
-        .map_err(|_| SocketError::Cancelled)?;
-    transport::schedule_receive_queue();
-    Ok(())
+    deliver_chunk(connection, bytes)
 }
 
 /// Open the flow's socket before the opening deadline and reply with the outcome; `None` means the
@@ -517,14 +523,6 @@ fn host_service_peer(port: u16, ipv6: bool) -> Result<SocketAddr, SocketError> {
     ))
 }
 
-fn register_flow(connection: ConnectionId, task: Task) {
-    lock_network().flows.push(Flow {
-        connection,
-        task: Some(task),
-        finished: Arc::new(AtomicBool::new(false)),
-    });
-}
-
 fn synchronize_control() -> bool {
     let current = switch().connection(Role::Control);
     let previous = lock_network()
@@ -572,56 +570,63 @@ pub fn service() -> bool {
         }
     }
     let mut progressed = synchronize_control();
-    let mut connections = switch().flow_connections();
-    let (has_config, removed) = {
-        let mut state = lock_network();
-        let removed = state
-            .flows
-            .extract_if(.., |flow| {
-                !connections.contains(&flow.connection) && !switch().is_connecting(flow.connection)
-            })
-            .collect::<Vec<_>>();
-        connections.retain(|connection| {
-            !state
-                .flows
-                .iter()
-                .any(|flow| flow.connection == *connection)
-        });
-        (state.config.is_some(), removed)
+    progressed |= synchronize_flow_tasks();
+    progressed |= drain_flow_tasks();
+    progressed
+}
+
+fn synchronize_flow_tasks() -> bool {
+    let mut state = lock_network();
+    let Some(mut connections) = switch().take_live_flows_if_changed() else {
+        return false;
     };
-    drop(removed);
+    let retired: Vec<_> = state
+        .flow_tasks
+        .extract_if(.., |connection, _| !connections.remove(connection))
+        .collect();
+    for (connection, _) in &retired {
+        state.draining.remove(connection);
+    }
+    let mut refused = Vec::new();
+    let mut progressed = !retired.is_empty();
     for connection in connections {
         let task = match connection.role {
-            Role::Tcp if has_config => spawn_task(tcp::serve(connection)),
-            Role::Udp if has_config => spawn_task(udp::serve(connection)),
-            Role::Tcp | Role::Udp | Role::Publication | Role::Agent | Role::Control => {
-                reset_flow(connection);
-                progressed = true;
+            Role::Tcp if state.config.is_some() => spawn_task(tcp::serve(connection)),
+            Role::Udp if state.config.is_some() => spawn_task(udp::serve(connection)),
+            Role::Tcp | Role::Udp => {
+                refused.push(connection);
                 continue;
             }
+            Role::Publication | Role::Agent | Role::Control => continue,
         };
-        register_flow(connection, task);
+        state.flow_tasks.insert(connection, task);
         progressed = true;
     }
-    let finished = lock_network()
-        .flows
-        .iter()
-        .filter(|flow| is_flow_drained(flow))
-        .map(|flow| flow.connection)
-        .collect::<Vec<_>>();
-    for connection in finished {
-        if !switch().has_pending_replies_for(connection)
-            && !transport::has_pending_reply_for(connection)
-        {
+    drop(state);
+    drop(retired);
+    for connection in refused {
+        reset_flow(connection);
+        progressed = true;
+    }
+    progressed
+}
+
+fn drain_flow_tasks() -> bool {
+    // The transport locks its state before notifying network waiters.
+    let draining: Vec<_> = lock_network().draining.iter().copied().collect();
+    let mut progressed = false;
+    for connection in draining {
+        let has_queued_reply = switch().has_pending_replies_for(connection);
+        if has_queued_reply || transport::has_pending_reply_for(connection) {
+            continue;
+        }
+        let task = {
+            let mut state = lock_network();
+            state.draining.remove(&connection);
+            state.flow_tasks.remove(&connection)
+        };
+        if task.is_some() {
             reset_flow(connection);
-            let removed = {
-                let mut state = lock_network();
-                state
-                    .flows
-                    .extract_if(.., |flow| flow.connection == connection)
-                    .collect::<Vec<_>>()
-            };
-            drop(removed);
             progressed = true;
         }
     }
@@ -707,6 +712,7 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let _guard = crate::SWITCH_TEST.lock().unwrap();
         let first = ConnectionId {
             role: Role::Tcp,
             guest_port: u32::MAX - 1,

@@ -29,9 +29,9 @@ volumes survive restarts, so its tools and state stay put.
 2. Share only the directories it should touch, or none, and hand files over
    with `terra <box> sync`.
 3. [Allow](recipe.md#network) only the destinations it needs.
-4. Point the agent at `/terra/README.md`. Every boot rewrites it with what
+4. Point the agent at `/terra/README.md`. Every workload boot rewrites it with what
    the agent may do there: its user, whether the root filesystem keeps
-   writes, the shared directories, the workload, the box's recipe with
+   writes, the shared directories, the workload, the runtime configuration with
    environment values hidden, and the egress policy.
 
 `terra <box> logs` shows network denials as `egress: blocked` lines. To keep
@@ -49,15 +49,15 @@ reads `readonly`, and allow the registries and APIs it calls. Detach with
 ### Air-gapped machines
 
 A set-up box boots without the network, so you can prepare it online and use it
-offline. On a connected machine, run `setup` so `on_create` installs the harness
+offline. On a connected machine, run `setup` so `setup.run` installs the harness
 and its tools, then `terra dev storage export dev.terra`. Copy `dev.terra` and
 the `terra` release archive for the offline host's platform. The offline host
 needs the same CPU architecture. There, install `terra` from the archive (see
 [Install from an archive](#install-from-an-archive)) and run
-`terra dev storage import dev.terra`. The import skips setup, so
-`on_create` never runs offline. Keep downloads out of `on_start`, which runs on
-every boot. See [Stop, storage and removal](#stop-storage-and-removal) for what
-the file carries.
+`terra dev storage import dev.terra`. The import skips setup, so the box can
+boot offline without rerunning setup. Keep downloads out of `on_start`, which
+runs on every boot. See [Stop, storage and removal](#stop-storage-and-removal)
+for what the file carries.
 
 ### Let an agent build the box
 
@@ -111,15 +111,20 @@ powershell -ExecutionPolicy Bypass -File terra\install.ps1
 
 ## Set up and start
 
-`terra <box> setup` reads the recipe, asks for approval when needed, applies it,
-creates storage, prepares the root image in an isolated VM with the box's
-volumes but no shares, and runs `on_create`. Run it again after changing the
-recipe: a changed recipe rebuilds the root filesystem and reruns `on_create`,
-keeping volumes. A change only to run-time fields, such as `workload.run` or
-`daemons`, applies without a rebuild; see
-[applying changes](recipe.md#applying-changes).
+`terra <box> setup` reads the recipe selected by a `terra.yaml` alias, or the
+box's applied recipe when there is no alias. It asks for approval when needed,
+applies the recipe, and creates storage. When it needs to build the root image,
+it checks `setup.mounts`, then starts an isolated VM with those mounts and the
+box's volumes and runs `setup.run`. After editing a source recipe, pass its path
+(`terra ./dev.yaml setup`) or use its `terra.yaml` alias. Edits that affect the
+root filesystem rebuild it and rerun setup, keeping volumes. See
+[applying changes](recipe.md#applying-changes) for changes that need `--rebuild`.
 `--dry-run` checks the recipe without changing anything. Without a terminal, a
 recipe a guest might have written needs `--trust-recipe` after you review it.
+
+If the setup VM cannot mount a share or volume or enter `setup.workdir`, the
+setup console shows the failing path and reason. You can read the same error
+later with `terra <box> logs --diagnostics`.
 
 `terra <box>` starts a box that `setup` finished, or attaches if it is already
 running. It never builds or re-applies: after editing a recipe, run `setup` again.
@@ -154,8 +159,8 @@ terra dev logs -f
   only.
 - `logs` shows Terra's host diagnostics, and `--diagnostics` the guest's. Both
   are replayed after a failed boot. Workload output goes to the session.
-- `show` prints the applied recipe. Environment values stay hidden unless you
-  pass `--with-env-values`.
+- `show` prints the applied recipe, including the setup mount declarations.
+  Environment values stay hidden unless you pass `--with-env-values`.
 
 ### Sync files
 
@@ -213,8 +218,15 @@ terra ls --all --state running --json
 
 - States are `running`, `setting_up`, `stopped`, `needs_setup`, `not_created`
   and `gone`. `needs_setup` means the last setup did not finish, or the root
-  image was not baked for the applied recipe's setup inputs: `terra <box> setup`
-  makes it bootable.
+  image was not baked for the applied recipe's setup inputs, or the applied
+  recipe cannot be read. Run setup to make it bootable. If the applied recipe
+  uses an old schema, rewrite its source, check it with
+  `terra ./dev.yaml setup --dry-run`, then apply it with
+  `terra ./dev.yaml setup` (or its `terra.yaml` alias). A stored box name
+  without an alias reuses the old applied recipe. If Terra cannot read the old
+  recipe to check its writable mounts, review the source recipe and any alias.
+  Without a terminal, the dry run reports the approval requirement and exits
+  nonzero. After review, apply with `terra ./dev.yaml setup --trust-recipe`.
   Repeat `--state` or join states with commas to match any of them.
 - Filters work with every format, including `--json` and `--tsv`. No match
   prints nothing, or `[]` for JSON.
@@ -226,25 +238,31 @@ terra ls --all --state running --json
 
 Each boot uses the guest kernel and agent bundled with the `terra` that starts
 the box. After upgrading Terra, stop and start each running box to move it to
-the new release; `sync` needs this when the agent protocol changed. Existing
-boxes do not need rebuilding, and attaching to a running box changes nothing.
+the new release. If the agent protocol changed, attaching with `terra <box>`,
+`exec` and `sync` fail against the older running agent until you stop and start
+the box. `terra <box> logs --diagnostics` reads the saved guest diagnostics and
+remains available. Attaching to a running box does not upgrade it.
+
+Check the [release notes on GitHub](https://github.com/terrarium-sh/terrarium/releases)
+for recipe schema or setup input changes that require rebuilding existing boxes.
 Guest package updates never change the kernel.
 
 ## Stop, storage and removal
 
-- `terra <box> stop` shuts the box down in order, running `pre_stop`.
+- `terra <box> stop` shuts the box down in order, running `workload.pre_stop`.
 - `terra <box> rm` removes the box's storage, logs and sockets but keeps its
   applied recipe; `--purge` removes that too. `--force` removes a running box
   after trying a graceful stop.
-- `terra <box> storage show` lists the root filesystem and volumes. `export`
-  writes a set-up box to a file: its applied recipe, including inline `env:`
+- `terra <box> storage show` lists the box state, root filesystem and volumes.
+  `export` writes a set-up box to a file: its applied recipe, including inline `env:`
   values, and its images (a `lifetime: boot` volume is left out, since the next
   boot replaces it). `import` loads one into a stopped or new box, on this or
   another machine. It asks before applying the carried recipe, as setup does;
   without a terminal it prints the recipe and refuses, and `--trust-recipe`
-  applies it without asking. Its mounts and `env_file` resolve against the
-  importing project, so a file the recipe names must exist there first. The box
-  boots straight after an import.
+  applies it without asking. Its `workload.mounts` and `env_file` resolve
+  against the importing project, so those paths must exist there first. The box
+  boots straight after an import. The first build after import checks the
+  local setup mount targets and asks for approval.
   `prune` deletes images the recipe no longer names.
 
 Box state lives under `~/.terra/box/t-<project-slug>/<box>/`; the slug is a

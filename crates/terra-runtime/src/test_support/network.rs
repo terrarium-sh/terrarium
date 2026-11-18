@@ -1830,6 +1830,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn guest_status_reset_allows_a_fresh_network_control_session() {
+        use crate::test_support::virtio::{STATUS, STATUS_RESET};
+
+        let (backend, stop, broker) = create_dns_fallback_backend();
+        let (guest, _agent, running) = start_guest(
+            &crate::test_fixtures::trusted_artifacts(),
+            &crate::engine::device_engine().unwrap(),
+            backend,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut transport = guest.stream.guest;
+        transport
+            .device
+            .write(STATUS, &STATUS_RESET.to_le_bytes())
+            .unwrap();
+        transport.configure().unwrap();
+        let mut guest = GuestNetwork::new(GuestStream::new(transport))
+            .await
+            .unwrap();
+        guest.exercise_dns_fallback().await.unwrap();
+        guest.stream.guest.device.close_async().await.unwrap();
+        running.join().await.unwrap();
+        let _ = stop.send(());
+        broker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn broker_backed_socket_stream_exercises_dns_tcp_udp_published_and_reconnect() {
         let servers = TestServers::start().unwrap();
         let endpoints = servers.endpoints;

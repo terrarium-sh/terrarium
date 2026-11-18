@@ -380,10 +380,10 @@ def recipe(cpus: int, mem_mib: int, mount: Path) -> str:
   cpus: {cpus}
   mem_mib: {mem_mib}
 workload:
+  mounts:
+    - host: {mount}
+      guest: /bench
   run: 'while :; do sleep 60; done'
-mounts:
-  - host: {mount}
-    guest: /bench
 """
 
 
@@ -703,7 +703,7 @@ def main() -> None:
     args = parse_args()
     cases = benchmark_cases(args)
     report = {
-        "schema_version": 3,
+        "schema_version": 1,
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "host": {
             "system": platform.system(),

@@ -1,0 +1,6 @@
+network: {enabled: false}
+setup:
+  mounts:
+    - {host: ./suite, guest: /work, readonly: true}
+volumes:
+  - {name: cache, guest: /work/cache, size_mib: 8}

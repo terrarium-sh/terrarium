@@ -1,0 +1,4 @@
+hw: {cpus: 1, mem_mib: 256}
+network: {enabled: false}
+setup:
+  workdir: /etc/passwd

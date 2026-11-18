@@ -17,22 +17,20 @@ uses. The templated unit [`terra@.service`](terra@.service) is two steps, becaus
 only `setup` reads a recipe *path* and a boot takes a box *name*:
 
 ```
-systemctl start terra@pi-dev
-  # -> terra /var/lib/terra/.terra/pi-dev.yaml setup --trust-recipe
-  #    terra pi-dev --foreground
+systemctl start terra@example
+  # -> terra /var/lib/terra/.terra/example.yaml setup --trust-recipe
+  #    terra example --foreground
 ```
 
 The instance name is the recipe file's stem, so the box is named `%i` too. Setup
-runs on every start, which is what makes editing the recipe and restarting the
-service mean something; on an unchanged recipe it applies nothing and boots no
-setup VM.
+applies recipe edits on each service start. A successfully baked root is reused
+until a change to a recipe field that shapes the root causes a rebuild and
+reruns `setup.run`.
+`lifetime: box` volumes keep their data across rebuilds when their names stay
+the same. See [applying recipe changes](../docs/recipe.md#applying-changes).
 
-A box lives at `~/.terra/box/<slug of its project directory>/<name>`, so what the
-unit's `WorkingDirectory` decides is the slug — which is why it carries `%i`. Do
-not drop it: with a shared working directory both instances resolve to the *same*
-box, and because setup keeps an existing guest filesystem rather than replacing
-it, starting the second recipe would rewrite that box's recipe and then boot the
-filesystem the first one's workload had been writing to.
+A box lives at `~/.terra/box/<slug of its project directory>/<name>`. The unit's
+`WorkingDirectory` includes `%i` so each instance has its own project directory.
 
 ## What terra needs from the environment
 
@@ -54,6 +52,10 @@ independently of recipe policy; see [network](../docs/security.md#network).
 
 ## One-time host setup
 
+Write a [recipe](../docs/recipe.md) named `example.yaml` for your service first.
+Set `workload.run`: unset, the workload is an interactive shell, and under
+systemd nobody is attached to it.
+
 ```sh
 # Install the binary and the unit.
 install -m0755 dist/terra /usr/local/bin/terra
@@ -68,15 +70,14 @@ useradd --system --home-dir /var/lib/terra --shell /usr/sbin/nologin --groups kv
 # The recipe the instance boots. ~/.terra is terra's own directory, which no box
 # can share — which is what lets the unit pass --trust-recipe honestly.
 install -d -o terra -g terra -m0700 /var/lib/terra/.terra
-install -o terra -g terra -m0600 pi-dev.yaml /var/lib/terra/.terra/
+install -o terra -g terra -m0600 example.yaml /var/lib/terra/.terra/
 
 systemctl daemon-reload
-systemctl enable --now terra@pi-dev
-journalctl -u terra@pi-dev -f
+systemctl enable --now terra@example
+journalctl -u terra@example -f
 ```
 
-The recipe should set `workload.run`: unset, the workload is an interactive
-shell, and under systemd nobody is attached to it. Use recipe mounts for shared directories, and `terra sync`
+Use recipe mounts for shared directories, and `terra sync`
 or volumes for guest files.
 Linux binaries carry their seccomp allowlists compiled in; see the
 [host sandbox policy](../docs/sandbox-policy.md).
@@ -86,22 +87,22 @@ Linux binaries carry their seccomp allowlists compiled in; see the
 `systemctl stop` (SIGTERM) shuts the guest down orderly: terra writes one byte on
 the guest's control connection, the agent stops the workload (SIGTERM, then
 SIGKILL if it is still there 30 seconds later — an interactive shell ignores
-SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. The unit's
-`TimeoutStopSec` is 65 seconds; after that systemd escalates to SIGKILL. With
-`KillMode=mixed` the SIGTERM goes to the foreground CLI alone, while the
+SIGTERM) and runs the recipe's `workload.pre_stop` commands, then the VM exits.
+The unit's `TimeoutStopSec` is 65 seconds; after that systemd escalates to
+SIGKILL. With `KillMode=mixed` the SIGTERM goes to the foreground CLI alone, while the
 SIGKILL reaches the box's supervisor and VM worker too, since they stay in the
 service cgroup.
 
 ## Where the output goes
 
 The journal receives the attached workload's terminal output.
-`terra logs pi-dev --diagnostics` shows Terra and guest lifecycle diagnostics,
-including hook output and network denials. Kernel console collection is not implemented by
-the component backend.
+`terra logs example --diagnostics` shows Terra and guest lifecycle diagnostics,
+including lifecycle command output and network denials. Kernel console
+collection is not implemented by the component backend.
 
 The foreground CLI owns and waits for the VM worker. systemd keeps both in the
 service cgroup; orderly stop is forwarded to the worker. To send input, attach
-from another terminal with `terra pi-dev`; `Ctrl-\` detaches that client.
+from another terminal with `terra example`; `Ctrl-\` detaches that client.
 
 ## Native host builds
 

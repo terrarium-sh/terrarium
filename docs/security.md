@@ -24,15 +24,21 @@ It decides what the box can reach:
 
 | Recipe feature | What it grants |
 | --- | --- |
-| `mounts` | Access to that host directory. A writable mount lets the guest create, change and delete files there; `readonly` is enforced on the host. |
+| `setup.mounts` | Access to those host directories during setup's isolated VM. Writable by default; `readonly: true` protects host inputs from changes. |
+| `workload.mounts` | Access to those host directories during normal runs. Writable by default; `readonly: true` protects host inputs from changes. |
 | `network.allow` | Outbound access to that destination and port. `HOST_LOOPBACK` reaches services on the Terra host. |
 | `network.hosts` | DNS records only. A connection still needs a matching `allow` rule. |
 | `network.mode: unrestricted-public` | Any public address, including public addresses on your LAN. Host interface IPs and private, link-local and cloud-metadata ranges still need explicit rules. |
 | `network.ports` | A guest listener published on host loopback only. |
 | `network.enabled: false` | No external network and no broker. Terra can still control the box. |
-| `env`, `env_file` | Values passed to hooks and the workload. A guest can copy or keep any secret it receives. |
-| `hooks`, `sudo`, `terra exec --root` | Root inside that box only. |
+| `env`, `env_file` | Values passed to both phases and the workload. A guest can copy or keep any secret it receives. |
+| `setup.run`, `workload` lifecycle commands, `workload.sudo`, `terra exec --root` | Root inside that box only. |
 | `terra sync` | A file copy you start, between a host path you choose and the guest. |
+
+Both mount lists enforce `readonly` on the host. A writable mount lets the guest
+create, change and delete files in that directory.
+Setup mount targets are checked and approved at build time. See
+[Mounts](recipe.md#mounts).
 
 ### Where recipes live
 
@@ -43,9 +49,10 @@ mount of the same file does not help if a writable share also reaches it.
 If your workflow needs recipes in a writable share, Terra allows it but warns.
 `--trust-recipe` means you reviewed both files.
 
-The warning only checks the shares in the box's current recipe. Removing a share does not
-make the files the guest left there safe, and Terra will no longer warn about
-them. Treat files from a former share as untrusted.
+Terra checks writable shares in the recipes currently applied to boxes. If an
+applied recipe uses an unsupported format and Terra cannot determine who could
+have written the file, it asks for approval. Removing a share also removes it
+from future checks. Treat files from a former share as untrusted.
 
 ## Network
 
@@ -153,8 +160,9 @@ makes any boundary failure worse.
   host.
 - **Host changes during use.** Changing a mounted tree on the host while the
   box uses it is out of scope.
-- **Guest-internal users.** Guest users, guest root, `sudo` and hooks only
-  separate things inside the guest. They never give host root.
+- **Guest-internal users.** Guest users, guest root, `workload.sudo` and
+  lifecycle commands only separate things inside the guest. They never give
+  host root.
 - **Terminal output.** Attached output comes from the guest and can contain
   terminal control sequences.
 - **Bugs below Terra.** Component isolation runs inside one host process. It

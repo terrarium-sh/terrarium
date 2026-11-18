@@ -14,15 +14,16 @@
   const benefits: Benefit[] = [
     {
       title: 'Your harness, confined',
-      text: 'Run Claude Code, Codex or your own tools inside a VM. Your recipe grants the project folders and network destinations the harness can reach.',
+      text: 'Run Claude Code, Codex or your own tools inside a VM. Workload mounts share project folders during normal runs; setup mounts are separate. Both are writable unless you set readonly: true.',
       icon: 'M3 4h18v16H3ZM7 9l3 3-3 3M12 15h5',
       screen: '~/app',
       lines: [
         { kind: 'command', text: 'cat dev.yaml' },
-        { kind: 'key', text: 'mounts:' },
-        { text: '  - host: .' },
-        { text: '    guest: /work' },
-        { text: '    readonly: false' },
+        { kind: 'key', text: 'workload:' },
+        { text: '  mounts:' },
+        { text: '    - host: .' },
+        { text: '      guest: /work' },
+        { text: '      readonly: false' },
         { kind: 'key', text: 'network:' },
         { text: '  allow:' },
         { text: '    - api.anthropic.com:443' },

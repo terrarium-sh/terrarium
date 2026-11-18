@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use super::{MIN_MEM_MIB, Recipe, VolumeLifetime};
 use std::path::Path;
@@ -29,7 +29,6 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
 }
 
 pub(crate) fn validate(recipe: &Recipe) -> Result<()> {
-    validate_workdir(recipe)?;
     validate_shell_lines(recipe)?;
     validate_hw(recipe)?;
     recipe.components.memory_limits()?;
@@ -42,35 +41,22 @@ pub(crate) fn validate(recipe: &Recipe) -> Result<()> {
     Ok(())
 }
 
-fn validate_workdir(recipe: &Recipe) -> Result<()> {
-    if let Some(dir) = &recipe.workload.workdir
-        && !dir.as_os_str().to_string_lossy().starts_with('/')
-    {
-        bail!(
-            "workload.workdir must be absolute: '{}'",
-            crate::render::escape_printable_path(dir)
-        );
-    }
-    Ok(())
-}
-
 /// A NUL cannot cross into a process argument, so the agent could not start
 /// the line; refusing it here fails setup instead of the boot.
 fn validate_shell_lines(recipe: &Recipe) -> Result<()> {
-    let hooks = &recipe.hooks;
+    let workload = &recipe.workload;
     let lists = [
-        ("hooks.on_create", &hooks.on_create),
-        ("hooks.on_start", &hooks.on_start),
-        ("hooks.pre_stop", &hooks.pre_stop),
-        ("daemons", &recipe.daemons),
+        ("setup.run", &recipe.setup.run),
+        ("workload.on_start", &workload.on_start),
+        ("workload.pre_stop", &workload.pre_stop),
+        ("workload.daemons", &workload.daemons),
     ];
     for (field, lines) in lists {
         if let Some(index) = lines.iter().position(|line| line.contains('\0')) {
             bail!("{field}[{index}] cannot contain a NUL");
         }
     }
-    if recipe
-        .workload
+    if workload
         .run
         .as_ref()
         .is_some_and(|line| line.contains('\0'))
@@ -113,7 +99,7 @@ fn validate_hw(recipe: &Recipe) -> Result<()> {
 fn validate_sudo(recipe: &Recipe) -> Result<()> {
     // doas fails *closed* on a parse error, silently revoking every grant - so
     // anything that could break a rule out of its own line is refused here.
-    for c in &recipe.sudo {
+    for c in &recipe.workload.sudo {
         if c.is_empty() {
             bail!("sudo entries must be command names, not empty strings");
         }
@@ -180,14 +166,13 @@ fn validate_volumes(recipe: &Recipe) -> Result<()> {
 }
 
 pub(super) fn validate_storage_devices(recipe: &Recipe) -> Result<()> {
-    let count = recipe
-        .mounts
-        .len()
+    let mounts_per_phase = recipe.setup.mounts.len().max(recipe.workload.mounts.len());
+    let count = mounts_per_phase
         .checked_add(recipe.volumes.len())
         .ok_or_else(|| anyhow::anyhow!("too many volumes and host-directory mounts"))?;
     anyhow::ensure!(
         count <= crate::vm::MAX_GUEST_STORAGE_DEVICES,
-        "a box supports at most {} combined volumes and host-directory mounts; remove a volume or mount",
+        "a box supports at most {} combined volumes and host-directory mounts per phase; remove a volume or mount",
         crate::vm::MAX_GUEST_STORAGE_DEVICES
     );
     Ok(())
@@ -213,42 +198,52 @@ fn validate_network(recipe: &Recipe) -> Result<()> {
     Ok(())
 }
 
-/// Refuse two entries claiming one guest path. They are mounted in recipe
-/// order, so the later one silently wins and the earlier one is a line in the
-/// recipe that does nothing.
 fn validate_guest_paths(recipe: &Recipe) -> Result<()> {
-    let claims = recipe
-        .mounts
-        .iter()
-        .map(|m| {
+    for (phase, mounts) in [
+        ("setup", &recipe.setup.mounts),
+        ("workload", &recipe.workload.mounts),
+    ] {
+        let shares = mounts.iter().map(|mount| {
             (
-                m.guest.as_path(),
+                mount.guest.as_path(),
                 format!(
                     "mount from '{}'",
-                    crate::render::escape_printable_path(&m.host)
+                    crate::render::escape_printable_path(&mount.host)
                 ),
             )
-        })
-        .chain(recipe.volumes.iter().filter_map(|v| {
+        });
+        let volumes = recipe.volumes.iter().filter_map(|volume| {
             Some((
-                v.guest.as_deref()?,
-                format!("volume '{}'", crate::render::escape_printable(&v.name)),
+                volume.guest.as_deref()?,
+                format!("volume '{}'", crate::render::escape_printable(&volume.name)),
             ))
-        }));
-    let mut seen = HashMap::new();
+        });
+        validate_guest_path_claims(phase, shares.chain(volumes))?;
+    }
+    Ok(())
+}
+
+fn validate_guest_path_claims<'a>(
+    scope: &str,
+    claims: impl Iterator<Item = (&'a Path, String)>,
+) -> Result<()> {
+    let mut seen = Vec::<(&Path, String)>::new();
     for (guest, what) in claims {
         anyhow::ensure!(
             guest != Path::new("/"),
             "guest path '/' on {what} would hide the root filesystem; pick a subdirectory \
              (a volume takes a read-only root's writes with rootfs_overlay: true)"
         );
-        if let Some(earlier) = seen.insert(guest, what.clone()) {
-            bail!(
-                "guest path '{}' is claimed twice, by {earlier} and by {what} \
-                 (the later one would be mounted over the earlier)",
-                crate::render::escape_printable_path(guest)
+        for (earlier_guest, earlier) in &seen {
+            anyhow::ensure!(
+                !guest.starts_with(earlier_guest) && !earlier_guest.starts_with(guest),
+                "guest paths '{}' ({earlier}) and '{}' ({what}) overlap in {scope}; \
+                 mount at separate paths and use a guest symlink if needed",
+                crate::render::escape_printable_path(earlier_guest),
+                crate::render::escape_printable_path(guest),
             );
         }
+        seen.push((guest, what));
     }
     Ok(())
 }

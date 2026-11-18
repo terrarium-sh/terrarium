@@ -1,8 +1,8 @@
 //! Trusted TCP and UDP publication over frontend-initiated vsock streams.
 
 use super::{
-    Task, batches, deliver_opening, finish_flow, lock_network, message_bytes, register_flow,
-    reset_flow, run_before_deadline, shutdown_flow, spawn_task, tcp, udp, wait,
+    Task, batches, deliver_opening, finish_flow, lock_network, message_bytes, reset_flow,
+    run_before_deadline, shutdown_flow, spawn_abortable, spawn_task, tcp, udp, wait,
     wait_for_publication,
 };
 use crate::terra::network::broker::{self, Listener, Tcp, Udp};
@@ -13,7 +13,7 @@ use futures_util::future::{AbortHandle, AbortRegistration, Abortable, poll_fn};
 use std::{
     num::NonZeroU16,
     sync::atomic::{AtomicU32, Ordering},
-    task::Poll,
+    task::{Poll, Waker},
 };
 use terra_protocol::application::OPEN_TIMEOUT_SECS;
 use terra_protocol::network_control::Publication;
@@ -45,16 +45,7 @@ pub(super) fn start_listeners(ports: &[PublishedPort]) -> Vec<Task> {
                     }
                 }
                 Transport::Udp => {
-                    if let Some(connection) = connect_publication() {
-                        let registration = register_udp_flow(connection);
-                        listeners.push(spawn_task(serve_udp_listener(
-                            connection,
-                            registration,
-                            guest_port,
-                            host_port,
-                            ipv6,
-                        )));
-                    }
+                    listeners.push(spawn_task(serve_udp_listener(guest_port, host_port, ipv6)));
                 }
             }
         }
@@ -71,12 +62,6 @@ async fn serve_tcp_listener(listener: Listener, guest_port: NonZeroU16) {
         }
     }
     let _ = completion.await;
-}
-
-fn register_udp_flow(connection: ConnectionId) -> AbortRegistration {
-    let (abort, registration) = AbortHandle::new_pair();
-    register_flow(connection, Task(abort));
-    registration
 }
 
 async fn wait_retired(connection: ConnectionId) {
@@ -96,28 +81,15 @@ async fn wait_retired(connection: ConnectionId) {
     .await;
 }
 
-async fn wait_publication_capacity() -> ConnectionId {
-    poll_fn(|context| {
-        let mut state = lock_network();
-        if let Some(connection) = connect_publication() {
-            Poll::Ready(connection)
-        } else {
-            wait_for_publication(&mut state, context.waker());
-            Poll::Pending
-        }
-    })
-    .await
+async fn wait_publication_capacity() -> (ConnectionId, AbortRegistration) {
+    poll_fn(|context| connect_publication(Some(context.waker())).map_or(Poll::Pending, Poll::Ready))
+        .await
 }
 
-async fn serve_udp_listener(
-    mut connection: ConnectionId,
-    mut registration: AbortRegistration,
-    guest_port: NonZeroU16,
-    host_port: u16,
-    ipv6: bool,
-) {
+async fn serve_udp_listener(guest_port: NonZeroU16, host_port: u16, ipv6: bool) {
     let mut socket = None;
     loop {
+        let (connection, registration) = wait_publication_capacity().await;
         let relay = publish_udp(connection, guest_port, host_port, ipv6, socket.take());
         let _ = Abortable::new(relay, registration).await;
         wait_retired(connection).await;
@@ -131,24 +103,22 @@ async fn serve_udp_listener(
             return;
         };
         receiver.first_datagrams = Some(datagrams);
-        connection = wait_publication_capacity().await;
-        registration = register_udp_flow(connection);
         socket = Some((reopened, receiver));
     }
 }
 
 /// Open the guest stream for one accepted host connection; without capacity the host connection is dropped.
 fn accept(guest_port: NonZeroU16, socket: Tcp) {
-    let Some(connection) = connect_publication() else {
+    let Some((connection, registration)) = connect_publication(None) else {
         return;
     };
-    register_flow(
-        connection,
-        spawn_task(publish(connection, guest_port, socket)),
-    );
+    spawn_abortable(publish(connection, guest_port, socket), registration);
 }
 
-fn connect_publication() -> Option<ConnectionId> {
+fn connect_publication(
+    capacity_waker: Option<&Waker>,
+) -> Option<(ConnectionId, AbortRegistration)> {
+    let mut state = lock_network();
     let span = PUBLICATION_HOST_PORTS.end - PUBLICATION_HOST_PORTS.start;
     for _ in 0..MAX_HOST_PORT_ATTEMPTS {
         let host_port = NEXT_HOST_PORT.load(Ordering::Relaxed);
@@ -159,12 +129,18 @@ fn connect_publication() -> Option<ConnectionId> {
         let connected = switch().connect_publication(host_port);
         match connected {
             Ok(connection) => {
+                let (abort, registration) = AbortHandle::new_pair();
+                state.flow_tasks.insert(connection, Task(abort));
+                drop(state);
                 transport::schedule_receive_queue();
-                return Some(connection);
+                return Some((connection, registration));
             }
             Err(VsockError::Busy) => {}
-            Err(VsockError::Backpressure | VsockError::UnknownConnection) => return None,
+            Err(VsockError::Backpressure | VsockError::UnknownConnection) => break,
         }
+    }
+    if let Some(waker) = capacity_waker {
+        wait_for_publication(&mut state, waker);
     }
     None
 }
@@ -243,4 +219,86 @@ async fn publish_udp(
         Ok(Err(_)) | Err(_) => reset_flow(connection),
     }
     finish_flow(connection);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::{drain_flow_tasks, synchronize_flow_tasks};
+    use std::{future::Future as _, task::Context};
+    use terra_vsock_device::{VsockHeader, VsockSwitch};
+
+    #[test]
+    fn udp_listener_waits_for_publication_capacity_at_startup() {
+        let _guard = crate::SWITCH_TEST.lock().unwrap();
+        let mut device = VsockSwitch::with_network_socket_capacity(true, 1);
+        device
+            .connect_publication(PUBLICATION_HOST_PORTS.start)
+            .unwrap();
+        let previous = std::mem::replace(&mut *switch(), device);
+
+        let mut listener = std::pin::pin!(serve_udp_listener(
+            NonZeroU16::new(53).unwrap(),
+            5353,
+            false
+        ));
+        assert!(
+            listener
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let mut state = lock_network();
+        assert_eq!(state.publication_waiters.len(), 1);
+        state.publication_waiters.clear();
+        *switch() = previous;
+    }
+
+    #[test]
+    fn publication_task_waits_for_reply_drain_or_connection_retirement() {
+        let _guard = crate::SWITCH_TEST.lock().unwrap();
+        *switch() = VsockSwitch::new();
+        let (connection, registration) = connect_publication(None).unwrap();
+        assert!(switch().is_connecting(connection));
+        assert!(!synchronize_flow_tasks());
+        assert!(!registration.handle().is_aborted());
+
+        let request = switch().take_reply(usize::MAX).unwrap();
+        let response = VsockHeader {
+            src_cid: request.header.dst_cid,
+            dst_cid: request.header.src_cid,
+            src_port: connection.guest_port,
+            dst_port: connection.host_port,
+            op: 2,
+            ..request.header
+        };
+        switch().rx(&response, &[]);
+        shutdown_flow(connection);
+        finish_flow(connection);
+        assert!(!drain_flow_tasks());
+        let shutdown = switch().take_reply(usize::MAX).unwrap();
+        transport::set_test_pending_reply(Some(shutdown));
+        assert!(!drain_flow_tasks());
+        assert!(!registration.handle().is_aborted());
+        transport::set_test_pending_reply(None);
+        assert!(drain_flow_tasks());
+        assert!(registration.handle().is_aborted());
+        assert!(switch().is_retiring(connection));
+
+        let (refused, registration) = connect_publication(None).unwrap();
+        finish_flow(refused);
+        switch().rx(
+            &VsockHeader {
+                op: 3,
+                dst_port: refused.host_port,
+                ..response
+            },
+            &[],
+        );
+        assert!(synchronize_flow_tasks());
+        let state = lock_network();
+        assert!(state.flow_tasks.is_empty());
+        assert!(state.draining.is_empty());
+        assert!(registration.handle().is_aborted());
+    }
 }

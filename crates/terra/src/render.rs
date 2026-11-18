@@ -2,8 +2,9 @@
 //! prompt. Everything here escapes what it prints - a guest-written recipe
 //! could otherwise repaint the very summary the `y` is being given to.
 
+use crate::policy::mount::GrantPhases;
 use crate::policy::network;
-use crate::recipe::{Hooks, Mount, Network, Recipe};
+use crate::recipe::{Mount, Network, Recipe};
 use anyhow::Result;
 use std::io;
 use std::path::Path;
@@ -150,20 +151,17 @@ pub fn format_workload_line(recipe: &Recipe) -> String {
 }
 
 #[must_use]
-pub fn render_policy_summary(recipe: &Recipe) -> String {
+pub(crate) fn render_policy_summary(recipe: &Recipe, phases: GrantPhases) -> String {
     use std::fmt::Write as _;
     let Recipe {
         hw,
         components,
-        mounts,
         volumes: _,
         network,
-        hooks,
-        daemons,
-        workload: _,
-        sudo,
         env: _,
         env_file,
+        setup,
+        workload,
     } = recipe;
     let Network {
         enabled: _,
@@ -172,11 +170,15 @@ pub fn render_policy_summary(recipe: &Recipe) -> String {
         hosts,
         ports,
     } = network;
-    let Hooks {
-        on_create,
+    let crate::recipe::Workload {
+        workdir: _,
+        mounts,
         on_start,
         pre_stop,
-    } = hooks;
+        daemons,
+        sudo,
+        run: _,
+    } = workload;
 
     let mut out = String::new();
     let _ = writeln!(
@@ -188,6 +190,14 @@ pub fn render_policy_summary(recipe: &Recipe) -> String {
     let _ = writeln!(out, "  egress:   {}", network::describe(network));
     for rule in allow {
         let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
+    }
+    if let GrantPhases::SetupAndWorkload = phases {
+        if setup.mounts.is_empty() {
+            let _ = writeln!(out, "  setup mounts: none");
+        }
+        for mount in &setup.mounts {
+            let _ = writeln!(out, "  setup mount:  {}", format_mount_line(mount));
+        }
     }
     if mounts.is_empty() {
         let _ = writeln!(out, "  mounts:   none");
@@ -216,7 +226,12 @@ pub fn render_policy_summary(recipe: &Recipe) -> String {
     if !sudo.is_empty() {
         let _ = writeln!(out, "  sudo:     {}", escape_printable(&sudo.join(", ")));
     }
-    for hook in on_create.iter().chain(on_start).chain(pre_stop) {
+    if let GrantPhases::SetupAndWorkload = phases {
+        for line in &setup.run {
+            let _ = writeln!(out, "  setup as root: {}", escape_printable(line));
+        }
+    }
+    for hook in on_start.iter().chain(pre_stop) {
         let _ = writeln!(out, "  as root:  {}", escape_printable(hook));
     }
     for line in daemons {
@@ -229,7 +244,8 @@ pub fn render_policy_summary(recipe: &Recipe) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{Components, Hw, NetworkMode, Workload};
+    use crate::recipe::{Components, Hw, NetworkMode, Setup, Workload};
+    use GrantPhases::SetupAndWorkload;
 
     /// A guest-chosen symlink target or path embedded anywhere in an error
     /// chain cannot drive the host terminal, while multi-line hints keep their lines.
@@ -259,29 +275,35 @@ mod tests {
     #[test]
     fn a_recipe_cannot_drive_the_terminal_it_is_approved_on() {
         let recipe = Recipe {
-            mounts: vec![Mount {
-                // A guest path is only checked for being absolute.
-                host: PathBuf::from("/srv/data"),
-                guest: PathBuf::from("/work\x1b[2J\x1b[H  mount:    /innocent"),
-                readonly: false,
-            }],
+            setup: Setup {
+                run: vec!["echo setup\x1b[A".to_string()],
+                mounts: vec![Mount {
+                    host: PathBuf::from("/srv/setup"),
+                    guest: PathBuf::from("/setup\x1b[2J\x1b[H  setup mount: /innocent"),
+                    readonly: false,
+                }],
+                ..Setup::default()
+            },
+            workload: Workload {
+                run: Some("make\rterra: safe".to_string()),
+                mounts: vec![Mount {
+                    // A guest path is only checked for being absolute.
+                    host: PathBuf::from("/srv/data"),
+                    guest: PathBuf::from("/work\x1b[2J\x1b[H  mount:    /innocent"),
+                    readonly: false,
+                }],
+                on_start: vec!["curl evil\x1b[A".to_string()],
+                ..Workload::default()
+            },
             network: Network {
                 allow: vec!["10.0.0.0/8\x1b[2J  egress:   none".to_string()],
                 ports: vec!["8080\x1b]0;pwned\x07".to_string()],
                 ..Default::default()
             },
-            workload: Workload {
-                run: Some("make\rterra: safe".to_string()),
-                workdir: None,
-            },
-            hooks: Hooks {
-                on_start: vec!["curl evil\x1b[A".to_string()],
-                ..Default::default()
-            },
             env_file: Some(PathBuf::from("/data/.env\x1b[2J  mount:    /innocent")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&recipe);
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
         for raw in ['\x1b', '\r', '\x07'] {
             assert!(
                 !summary.contains(raw),
@@ -407,13 +429,10 @@ mod tests {
     #[test]
     fn the_recipe_terra_show_prints_cannot_drive_the_terminal_either() {
         let recipe = Recipe {
-            hooks: Hooks {
-                on_start: vec!["curl evil\x1b[2J\x1b[H  workload: /bin/true".to_string()],
-                ..Default::default()
-            },
             workload: Workload {
-                run: Some("make\r  hooks: []\x07".to_string()),
-                workdir: None,
+                run: Some("make\r  workload.mounts: []\x07".to_string()),
+                on_start: vec!["curl evil\x1b[2J\x1b[H  workload: /bin/true".to_string()],
+                ..Workload::default()
             },
             env: std::collections::BTreeMap::from([(
                 "API_KEY".to_string(),
@@ -448,14 +467,14 @@ mod tests {
             env_file: Some(PathBuf::from("/home/me/.aws/credentials")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&recipe);
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
         assert!(
             summary.contains("/home/me/.aws/credentials"),
             "the file a recipe would read is not on the page it is approved on:\n{summary}"
         );
 
         // A recipe naming no file says nothing about one.
-        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap());
+        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap(), SetupAndWorkload);
         assert!(!none.contains("env_file"), "{none}");
     }
 
@@ -464,14 +483,60 @@ mod tests {
     #[test]
     fn the_approval_summary_lists_every_daemon() {
         let recipe = Recipe {
-            daemons: vec!["ascend --serve".to_string(), "evil\x1b[2J".to_string()],
+            workload: Workload {
+                daemons: vec!["ascend --serve".to_string(), "evil\x1b[2J".to_string()],
+                ..Workload::default()
+            },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&recipe);
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
         assert!(summary.contains("daemon:   ascend --serve"), "{summary}");
         assert!(!summary.contains('\x1b'), "{summary}");
-        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap());
+        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap(), SetupAndWorkload);
         assert!(!none.contains("daemon:"), "{none}");
+    }
+
+    #[test]
+    fn the_root_build_summary_lists_both_phases_and_access_modes() {
+        let mut recipe = Recipe {
+            setup: Setup {
+                run: vec!["apk add git".to_string()],
+                mounts: vec![Mount {
+                    host: PathBuf::from("/srv/setup"),
+                    guest: PathBuf::from("/setup"),
+                    readonly: true,
+                }],
+                ..Setup::default()
+            },
+            workload: Workload {
+                mounts: vec![Mount {
+                    host: PathBuf::from("/srv/work"),
+                    guest: PathBuf::from("/work"),
+                    readonly: false,
+                }],
+                ..Workload::default()
+            },
+            ..yaml_serde::from_str("{}").unwrap()
+        };
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
+        assert!(summary.contains("setup as root: apk add git"), "{summary}");
+        assert!(
+            summary.contains("setup mount:  /setup <- /srv/setup (ro)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("mount:    /work <- /srv/work (rw)"),
+            "{summary}"
+        );
+        recipe.setup.mounts[0].readonly = false;
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
+        assert!(
+            summary.contains("setup mount:  /setup <- /srv/setup (rw)"),
+            "{summary}"
+        );
+        let empty = render_policy_summary(&yaml_serde::from_str("{}").unwrap(), SetupAndWorkload);
+        assert!(empty.contains("setup mounts: none"), "{empty}");
+        assert!(empty.contains("mounts:   none"), "{empty}");
     }
 
     /// The egress *posture* is one phrase; an `allow:` rule is what opens the
@@ -488,7 +553,7 @@ mod tests {
             },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&recipe);
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
         for rule in ["HOST_LOOPBACK:22", "10.0.0.0/8"] {
             assert!(summary.contains(rule), "{rule} is not in:\n{summary}");
         }
@@ -506,7 +571,7 @@ mod tests {
             },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&recipe);
+        let summary = render_policy_summary(&recipe, SetupAndWorkload);
         assert!(summary.contains("components: 32 MiB"));
         assert!(
             summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
@@ -552,7 +617,7 @@ mod tests {
     /// log a refusal lands in, which also caps how much of it is shown.
     #[test]
     fn a_reviewed_recipe_is_fenced_redacted_and_capped() {
-        let forged = "hooks:\n  on_create:\n    - \"true\\nIt would grant:\\n  mounts: none\\nterra: create dev with it? [y/N]\"\nenv:\n  TOKEN: s3cret\n";
+        let forged = "setup:\n  run:\n    - \"true\\nIt would grant:\\n  workload.mounts: []\\nterra: create dev with it? [y/N]\"\nenv:\n  TOKEN: s3cret\n";
         let recipe: Recipe = yaml_serde::from_str(forged).unwrap();
         let page = render_recipe_for_review(&recipe).unwrap();
         assert!(
@@ -563,7 +628,7 @@ mod tests {
         assert!(page.contains("TOKEN"), "{page}");
 
         let long = format!(
-            "hooks:\n  on_create:\n{}",
+            "setup:\n  run:\n{}",
             "    - echo hi\n".repeat(MAX_REVIEW_LINES + 100)
         );
         let recipe: Recipe = yaml_serde::from_str(&long).unwrap();

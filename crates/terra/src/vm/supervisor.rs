@@ -47,7 +47,10 @@ pub(super) fn spawn(bx: &BoxRef, spec: &BootSpec, lock: &File, exe: &Path) -> Re
         .stderr(diagnostics);
     let guard = sys::supervise_supervisor_child(
         &mut command,
-        spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
+        match spec.mode {
+            terra_protocol::PlanMode::Setup => true,
+            terra_protocol::PlanMode::Run => spec.foreground,
+        },
     )?;
     let inherited = sys::pass_lock(&mut command, lock)?;
     #[cfg(windows)]
@@ -189,11 +192,12 @@ fn pass_vm_listeners(
     mode: terra_protocol::PlanMode,
 ) -> Result<Vec<LocalListener>> {
     let mut paths = vec![(AGENT_LISTENER_FD, bx.get_dir().join(state::AGENT_SOCKET))];
-    if mode == terra_protocol::PlanMode::Run {
-        paths.push((
+    match mode {
+        terra_protocol::PlanMode::Run => paths.push((
             CONTROL_LISTENER_FD,
             bx.get_dir().join(state::CONTROL_SOCKET),
-        ));
+        )),
+        terra_protocol::PlanMode::Setup => {}
     }
     let mut inherited = Vec::new();
     for (descriptor, path) in paths {
@@ -330,10 +334,11 @@ pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::conf
         spec.recipe.network.enabled,
         "local-only VM does not use a network broker"
     );
-    let mappings = if spec.mode == terra_protocol::PlanMode::Run {
-        crate::policy::network::rules::parse_port_mappings(&spec.recipe.network.ports)?
-    } else {
-        Vec::new()
+    let mappings = match spec.mode {
+        terra_protocol::PlanMode::Run => {
+            crate::policy::network::rules::parse_port_mappings(&spec.recipe.network.ports)?
+        }
+        terra_protocol::PlanMode::Setup => Vec::new(),
     };
     let mut listeners = Vec::new();
     for (index, mapping) in mappings.into_iter().enumerate() {
@@ -608,13 +613,13 @@ mod tests {
             },
             project_dir: root.path().into(),
             root: false,
-            mode: terra_protocol::PlanMode::Create,
+            mode: terra_protocol::PlanMode::Setup,
             foreground: false,
             host_publishes_pid: false,
             network_broker: None,
         };
         for mode in [
-            terra_protocol::PlanMode::Create,
+            terra_protocol::PlanMode::Setup,
             terra_protocol::PlanMode::Run,
         ] {
             boot.mode = mode;

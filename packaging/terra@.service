@@ -1,5 +1,5 @@
-# terra box as a service: `systemctl start terra@pi-dev` sets up and boots the
-# recipe /var/lib/terra/.terra/pi-dev.yaml as box `pi-dev`.
+# terra box as a service: `systemctl start terra@example` sets up and boots the
+# recipe /var/lib/terra/.terra/example.yaml as box `example`.
 # Install and host setup: packaging/README.md.
 
 [Unit]

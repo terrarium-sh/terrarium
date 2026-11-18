@@ -6,6 +6,7 @@ use object::elf::{SHF_ALLOC, SHF_EXECINSTR};
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _, SectionFlags, SymbolKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use terra_build::EMBEDDED_ARTIFACT_SECTION;
 
 pub(super) struct Function {
     pub(super) name: String,
@@ -188,8 +189,13 @@ impl Image {
 
     #[cfg(test)]
     pub(super) fn add_data(&mut self, address: u64, bytes: &[u8]) {
+        self.add_data_section(".rodata", address, bytes);
+    }
+
+    #[cfg(test)]
+    pub(super) fn add_data_section(&mut self, name: &str, address: u64, bytes: &[u8]) {
         self.sections.push(Section {
-            name: ".rodata".to_owned(),
+            name: name.to_owned(),
             address,
             bytes: bytes.to_vec(),
             is_executable: false,
@@ -241,10 +247,11 @@ impl Image {
             .map(|section| (section.address, section.bytes.as_slice()))
     }
 
-    fn data_sections(&self) -> impl Iterator<Item = &Section> {
+    fn pointer_data_sections(&self) -> impl Iterator<Item = &Section> {
         self.sections
             .iter()
-            .filter(|section| !section.is_executable)
+            // Prebuilt AOT metadata cannot hold pointers into this host executable.
+            .filter(|section| !section.is_executable && section.name != EMBEDDED_ARTIFACT_SECTION)
     }
 
     /// For each function, the aligned data locations holding a 64-bit address inside it, past its
@@ -252,7 +259,7 @@ impl Image {
     /// naturally aligned, and an unaligned scan finds byte patterns that only look like addresses.
     pub(super) fn interior_pointers(&self) -> HashMap<usize, Vec<u64>> {
         let mut pointers: HashMap<usize, Vec<u64>> = HashMap::new();
-        for section in self.data_sections() {
+        for section in self.pointer_data_sections() {
             let skip = usize::try_from(section.address.next_multiple_of(8) - section.address)
                 .unwrap_or_default();
             let (slots, _) = section
@@ -283,7 +290,7 @@ impl Image {
             return locations;
         };
         let code = first.start..last.end;
-        for section in self.data_sections() {
+        for section in self.pointer_data_sections() {
             for (offset, window) in section.bytes.windows(8).enumerate() {
                 let value = u64::from_le_bytes(window.try_into().unwrap_or_default());
                 if code.contains(&value) && self.by_start.contains_key(&value) {

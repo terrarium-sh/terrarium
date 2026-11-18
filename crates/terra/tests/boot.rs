@@ -105,7 +105,7 @@ impl Suite {
     }
 
     /// Boot `recipe` in a fresh box named `name` under WORK: `setup` applies the
-    /// recipe and bakes `on_create` with its console on setup's stdout, then
+    /// recipe and runs setup with its console on setup's stdout, then
     /// the bare form boots it. The
     /// recipes live outside any share, so nothing is ever asked about.
     /// Foreground, because this harness has no terminal and wants the VM's
@@ -147,14 +147,18 @@ impl Suite {
         std::fs::create_dir_all(&prj).unwrap();
         let recipe = self.get_work_dir().join(format!("{name}.yaml"));
         let base = std::fs::read_to_string(assets_dir().join(format!("{name}.yaml"))).unwrap();
-        std::fs::write(
-            &recipe,
-            format!(
-                "{base}\nmounts:\n  - {{host: {}, guest: /work}}\n",
-                prj.display()
-            ),
-        )
-        .unwrap();
+        let mounts = format!(
+            "  mounts:\n    - {{host: {}, guest: /work}}\n",
+            prj.display()
+        );
+        let text = match base.find("workload:\n") {
+            Some(index) => {
+                let at = index + "workload:\n".len();
+                format!("{}{mounts}{}", &base[..at], &base[at..])
+            }
+            None => format!("{base}\nworkload:\n{mounts}"),
+        };
+        std::fs::write(&recipe, text).unwrap();
         (self.boot_recipe(&recipe, name, extra), prj)
     }
 
@@ -167,11 +171,15 @@ impl Suite {
     ) -> String {
         let recipe = self.get_work_dir().join(format!("{name}.yaml"));
         let script = script.replace('\n', "\n      ");
-        let readonly = if readonly { "    readonly: true\n" } else { "" };
+        let readonly = if readonly {
+            "      readonly: true\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &recipe,
             format!(
-                "network:\n  mode: unrestricted-public\nhooks:\n  on_create:\n    - apk add --no-cache git python3\nworkload:\n  run: |\n      set -e\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
+                "network:\n  mode: unrestricted-public\nsetup:\n  run:\n    - apk add --no-cache git python3\nworkload:\n  run: |\n      set -e\n      {script}\n  mounts:\n    - host: {}\n      guest: /work\n{readonly}",
                 host.display()
             ),
         )
@@ -345,7 +353,7 @@ fn pending_network_reads_do_not_block_other_downloads() {
     std::fs::write(
         &recipe,
         format!(
-            "network:\n  allow: [\"buffer.test:{port}\"]\n  hosts:\n    - {{name: buffer.test, addr: HOST_LOOPBACK}}\nworkload:\n  run: |\n      set -e\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [\"buffer.test:{port}\"]\n  hosts:\n    - {{name: buffer.test, addr: HOST_LOOPBACK}}\nworkload:\n  run: |\n      set -e\n      {script}\n  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
             payloads.display()
         ),
     )
@@ -464,8 +472,8 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     let recipe = suite.get_work_dir().join("raw-vsock-credit-lowat.yaml");
     let recipe_json = serde_json::json!({
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
-        "mounts": [{"host": directory, "guest": "/work", "readonly": false}],
         "workload": {
+            "mounts": [{"host": directory, "guest": "/work", "readonly": false}],
             "run": "exec /work/terra-vsock-probe receive-credit-lowat > /work/VSOCK_CREDIT_PROBE_LOG 2>&1",
         },
     });
@@ -504,7 +512,7 @@ fn static_vsock_endpoint_classes_reject_unknown_duplicate_and_malformed_connecti
         };
         let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
         std::fs::write(&recipe, format!(
-            "network:\n  enabled: {enabled}\nworkload:\n  run: exec /work/terra-vsock-probe {mode}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n", probe.parent().unwrap().display()
+            "network:\n  enabled: {enabled}\nworkload:\n  run: exec /work/terra-vsock-probe {mode}\n  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n", probe.parent().unwrap().display()
         )).unwrap();
         let output = suite.boot_recipe(&recipe, name, &["--root"]);
         assert!(
@@ -534,7 +542,7 @@ fn static_socket_selection_preserves_local_and_namespace_routes() {
         std::fs::write(
             &recipe,
             format!(
-                "network:\n  enabled: {enabled}\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+                "network:\n  enabled: {enabled}\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
                 render_socket_probe_workload(&[mode.into()]),
                 probe.parent().unwrap().display()
             ),
@@ -553,7 +561,7 @@ fn static_libc_dns_resolves_configured_names() {
     let probe = suite.compile_probe("socket");
     let recipe = suite.get_work_dir().join("socket-dns.yaml");
     let text = format!(
-        "network:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nworkload:\n  run: exec /work/terra-socket-probe --dns\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+        "network:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nworkload:\n  run: exec /work/terra-socket-probe --dns\n  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
         probe.parent().unwrap().display()
     );
     std::fs::write(&recipe, text).unwrap();
@@ -693,7 +701,7 @@ fn static_tcp_send_limits_preserve_user_overrides_and_queued_fin() {
         });
         let recipe = suite.get_work_dir().join("socket-send-limits.yaml");
         std::fs::write(&recipe, format!(
-            "network:\n  allow: [HOST_LOOPBACK:{port}, HOST_LOOPBACK:{refused_port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: false\n",
+            "network:\n  allow: [HOST_LOOPBACK:{port}, HOST_LOOPBACK:{refused_port}]\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: false\n",
             render_socket_probe_workload(&["--send-limits".into(), "100.96.0.1".into(), port.to_string(), refused_port.to_string()]),
             directory.display()
         )).unwrap();
@@ -725,7 +733,7 @@ fn static_udp_error_queue_consumption_resumes_buffered_reply() {
         threads.spawn(|| serve_socket_probe_udp(&socket, &stop, &reply_marker));
         let recipe = suite.get_work_dir().join("socket-udp-error-budget.yaml");
         std::fs::write(&recipe, format!(
-            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
             render_socket_probe_workload(&["--udp-error-budget".into(), "100.96.0.1".into(), port.to_string()]),
             probe.parent().unwrap().display()
         )).unwrap();
@@ -762,7 +770,7 @@ fn static_quic_socket_options_and_gso_preserve_udp_boundaries() {
         let ipv6_server = threads.spawn(|| serve_socket_probe_udp(&ipv6, &stop, &reply_marker));
         let recipe = suite.get_work_dir().join("socket-quic.yaml");
         std::fs::write(&recipe, format!(
-            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
             render_socket_probe_workload(&["--quic-socket".into(), "100.96.0.1".into(), port.to_string()]),
             probe.parent().unwrap().display()
         )).unwrap();
@@ -840,7 +848,7 @@ fn static_quic_gso_requests_credit_for_an_atomic_batch() {
         });
         let recipe = suite.get_work_dir().join("socket-quic-credit.yaml");
         std::fs::write(&recipe, format!(
-            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
             render_socket_probe_workload(&["--quic-credit".into(), "100.96.0.1".into(), port.to_string()]),
             directory.display()
         )).unwrap();
@@ -875,7 +883,7 @@ fn static_socket_calls_forward_tcp_and_udp_through_authorized_broker() {
         threads.spawn(|| serve_socket_probe_udp(&ipv6_udp, &stop, &reply_marker));
         let recipe = suite.get_work_dir().join("socket-external.yaml");
         std::fs::write(&recipe, format!(
-            "network:\n  allow: [HOST_LOOPBACK:{}, HOST_LOOPBACK:{}, HOST_LOOPBACK:{}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            "network:\n  allow: [HOST_LOOPBACK:{}, HOST_LOOPBACK:{}, HOST_LOOPBACK:{}]\n{}  mounts:\n    - host: {}\n      guest: /work\n      readonly: true\n",
             ports[0], ports[1], ports[2],
             render_socket_probe_workload(&["--external".into(), "100.96.0.1".into(), ports[0].to_string(), ports[1].to_string(), ports[2].to_string()]),
             probe.parent().unwrap().display()
@@ -920,13 +928,15 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
     let recipe = suite.get_work_dir().join("server.yaml");
     let recipe_json = serde_json::json!({
         "network": {"ports": [format!("{port}:18083/udp"), format!("{port}:18085/tcp"), format!("{local_port}:18084/udp")]},
-        "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
-        "daemons": [
-            "/work/terra-socket-probe --published-udp 18083 > /tmp/udp-published.log 2>&1",
-            "/work/terra-socket-probe --published-udp-loopback 18084 > /tmp/udp-loopback.log 2>&1",
-            "while true; do printf 'TCP_PUBLICATION' | busybox nc -l -p 18085; done",
-        ],
-        "workload": {"run": "exec /bin/sleep infinity"},
+        "workload": {
+            "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
+            "daemons": [
+                "/work/terra-socket-probe --published-udp 18083 > /tmp/udp-published.log 2>&1",
+                "/work/terra-socket-probe --published-udp-loopback 18084 > /tmp/udp-loopback.log 2>&1",
+                "while true; do printf 'TCP_PUBLICATION' | busybox nc -l -p 18085; done",
+            ],
+            "run": "exec /bin/sleep infinity",
+        },
     });
     std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let project = project.to_str().unwrap();
@@ -1134,8 +1144,10 @@ fn native_tcp_reset_after_fin_preserves_the_socket_error() {
     let recipe = suite.get_work_dir().join("socket-reset-after-fin.yaml");
     let recipe_json = serde_json::json!({
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
-        "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
-        "workload": {"run": format!("exec /work/terra-socket-probe --reset-after-fin 100.96.0.1 {port}")},
+        "workload": {
+            "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
+            "run": format!("exec /work/terra-socket-probe --reset-after-fin 100.96.0.1 {port}"),
+        },
     });
     std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let output = suite.boot_recipe(
@@ -1247,18 +1259,18 @@ fn run_boot_suite() {
         "wildcard reached the apex:\n{out}"
     );
 
-    // == on_create: runs once per fresh root; only a changed recipe rebuilds it ==
+    // == setup: runs once per fresh root; only a changed recipe rebuilds it ==
     let first = s.boot("bake", &[]);
     let second = s.boot("bake", &[]);
-    let when = |out: &str| {
+    let bake_id = |out: &str| {
         out.lines()
-            .find_map(|l| l.strip_prefix("WHEN=").map(str::to_owned))
+            .find_map(|l| l.strip_prefix("BAKE_ID=").map(str::to_owned))
     };
     assert!(
-        when(&first).is_some() && when(&first) == when(&second),
-        "on_create re-ran: {:?} vs {:?}",
-        when(&first),
-        when(&second)
+        bake_id(&first).is_some() && bake_id(&first) == bake_id(&second),
+        "setup re-ran: {:?} vs {:?}",
+        bake_id(&first),
+        bake_id(&second)
     );
     let edited_dir = s.create_project_dir("bake-edited");
     let edited = edited_dir.join("bake.yaml");
@@ -1276,8 +1288,8 @@ fn run_boot_suite() {
         assert!(out.status.success(), "{stderr}");
         stderr
     };
-    let boot_when = || {
-        when(&s.run_terra_command(&[
+    let read_bake_id = || {
+        bake_id(&s.run_terra_command(&[
             "bake",
             "--foreground",
             "--project",
@@ -1292,36 +1304,36 @@ fn run_boot_suite() {
         "unedited recipe rebuilt:\n{stderr}"
     );
     assert!(
-        boot_when() == when(&first),
-        "setup re-ran on_create for an unedited recipe"
+        read_bake_id() == bake_id(&first),
+        "setup re-ran for an unedited recipe"
     );
 
     let stderr = setup_with(&format!("# a comment\n{source}"));
     assert!(!stderr.contains(rebuilt), "a comment rebuilt:\n{stderr}");
     assert!(
-        boot_when() == when(&first),
-        "setup re-ran on_create after a comment-only edit"
+        read_bake_id() == bake_id(&first),
+        "setup re-ran after a comment-only edit"
     );
 
     let stderr =
         setup_with(&source.replace("mkdir -p /opt/baked", "mkdir -p /opt/baked /opt/baked2"));
     assert!(
         stderr.contains(rebuilt),
-        "a changed on_create went unreported:\n{stderr}"
+        "a changed setup went unreported:\n{stderr}"
     );
-    let rebuilt_when = boot_when();
+    let rebuilt_id = read_bake_id();
     assert!(
-        rebuilt_when.is_some() && rebuilt_when != when(&first),
-        "a changed recipe did not rerun on_create: {rebuilt_when:?} vs {:?}",
-        when(&first)
+        rebuilt_id.is_some() && rebuilt_id != bake_id(&first),
+        "a changed recipe did not rerun setup: {rebuilt_id:?} vs {:?}",
+        bake_id(&first)
     );
 
-    // == a setup whose on_create fails leaves an unstamped root; the next one replaces it ==
+    // == a setup whose run fails leaves an unstamped root; the next one replaces it ==
     let flaky_project = s.create_project_dir("flaky");
     let flaky = s.get_work_dir().join("flaky.yaml");
     std::fs::write(
         &flaky,
-        "hooks:\n  on_create:\n    - touch /leftover\n    - \"false\"\n",
+        "setup:\n  run:\n    - touch /leftover\n    - \"false\"\n",
     )
     .unwrap();
     let flaky_args = [
@@ -1333,14 +1345,14 @@ fn run_boot_suite() {
     assert_ne!(
         s.run_terra_status(&flaky_args).1,
         0,
-        "a failing on_create passed setup"
+        "a failing setup.run passed setup"
     );
     let flaky_files = s.get_box_files_path("flaky");
     assert!(flaky_files.join("rootfs.img").exists());
     assert!(!flaky_files.join("setup-finished").exists());
     std::fs::write(
         &flaky,
-        "hooks:\n  on_create:\n    - test ! -e /leftover\n    - echo cleaned > /baked\nworkload:\n  run: exec /bin/cat /baked\n",
+        "setup:\n  run:\n    - test ! -e /leftover\n    - echo cleaned > /baked\nworkload:\n  run: exec /bin/cat /baked\n",
     )
     .unwrap();
     assert_eq!(
@@ -1521,8 +1533,12 @@ fn run_boot_suite() {
     let daemon_recipe = s.get_work_dir().join("daemon.yaml");
     std::fs::write(
         &daemon_recipe,
-        "daemons:\n  - echo DAEMON_STARTED\n  - \"echo CRASH; exit 3\"\n\
-         workload:\n  run: 'sleep 4; echo WORKLOAD_DONE'\n",
+        "workload:
+  daemons:
+    - echo DAEMON_STARTED
+    - \"echo CRASH; exit 3\"
+  run: 'sleep 4; echo WORKLOAD_DONE'
+",
     )
     .unwrap();
     let daemon_project = s.create_project_dir("daemon");
@@ -1729,6 +1745,458 @@ echo REPOSITORY_READONLY_OK
     assert!(out.contains("REPOSITORY_READONLY_OK"), "{out}");
 }
 
+/// Setup shares default to writable and honor explicit read-only access.
+/// Each phase's shares are absent from the other; the same guest path can back
+/// both phases with different hosts, and setup copies into the root persist.
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn setup_and_workload_mounts_are_phase_scoped() {
+    let suite = Suite::new();
+    let setup_input = suite.get_work_dir().join("setup-input");
+    let runtime_input = suite.get_work_dir().join("runtime-input");
+    let setup_output = suite.get_work_dir().join("setup-output");
+    for directory in [&setup_input, &runtime_input, &setup_output] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    std::fs::write(setup_input.join("seed"), "SETUP_SEED").unwrap();
+    std::fs::write(runtime_input.join("seed"), "RUNTIME_SEED").unwrap();
+    std::fs::write(runtime_input.join("runtime-only"), "RUNTIME_ONLY").unwrap();
+    let recipe = suite.get_work_dir().join("phases.yaml");
+    std::fs::write(
+        &recipe,
+        format!(
+            "\
+hw: {{cpus: 1, mem_mib: 256}}
+setup:
+  workdir: /work
+  mounts:
+    - {{host: {}, guest: /work, readonly: true}}
+    - {{host: {}, guest: /setup-only, readonly: true}}
+    - {{host: {}, guest: /setup-writable}}
+  run:
+    - test \"$(pwd)\" = /work
+    - test \"$(cat /work/seed)\" = SETUP_SEED
+    - if touch /work/forbidden 2>/dev/null; then exit 1; fi
+    - test ! -e /work/runtime-only
+    - printf HOST_WRITE > /setup-writable/written
+    - printf SETUP_COPY > /setup-output
+    - echo SETUP_PHASE_OK
+workload:
+  workdir: /work/nested/deep
+  mounts:
+    - {{host: {}, guest: /work}}
+  on_start:
+    - test \"$(pwd)\" = /work/nested/deep && printf ON_START > /work/on-start
+  pre_stop:
+    - test \"$(pwd)\" = /work/nested/deep && printf PRE_STOP > /work/pre-stop
+  daemons:
+    - test \"$(pwd)\" = /work/nested/deep && printf DAEMON > /work/daemon && exec sleep 600
+  run: |
+    set -e
+    test \"$(pwd)\" = /work/nested/deep
+    test \"$(cat /work/seed)\" = RUNTIME_SEED
+    test -f /work/runtime-only
+    test ! -e /work/forbidden
+    test ! -e /setup-only/seed
+    test ! -e /setup-writable/written
+    test \"$(cat /setup-output)\" = SETUP_COPY
+    test \"$(cat /work/on-start)\" = ON_START
+    printf RUNTIME_PHASE_OK > /work/runtime
+    exec sleep 600
+",
+            setup_input.display(),
+            setup_input.display(),
+            setup_output.display(),
+            runtime_input.display(),
+        ),
+    )
+    .unwrap();
+    let project = suite.create_project_dir("phases");
+    let project = project.to_str().unwrap();
+    let (setup, code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(code, 0, "{setup}");
+    assert!(setup.contains("SETUP_PHASE_OK"), "{setup}");
+    assert_eq!(
+        std::fs::read(setup_output.join("written")).unwrap(),
+        b"HOST_WRITE"
+    );
+    assert!(
+        !setup_input.join("forbidden").exists(),
+        "a setup mount accepted a write"
+    );
+
+    let (start, code) = suite.run_terra_status(&["phases", "-d", "--project", project]);
+    assert_eq!(code, 0, "{start}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for (name, expected) in [("runtime", "RUNTIME_PHASE_OK"), ("daemon", "DAEMON")] {
+        let marker = runtime_input.join(name);
+        while !std::fs::read_to_string(&marker).is_ok_and(|contents| contents == expected) {
+            assert!(Instant::now() < deadline, "missing {name} marker");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let (stop, code) = suite.run_terra_status(&["phases", "stop", "--project", project]);
+    assert_eq!(code, 0, "{stop}");
+    assert_eq!(
+        std::fs::read(runtime_input.join("pre-stop")).unwrap(),
+        b"PRE_STOP"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn retargeting_a_setup_mount_takes_effect_on_an_approved_rebuild() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("retarget");
+    let source = project.join("sdk");
+    let recipe = suite.get_work_dir().join("retarget.yaml");
+    std::fs::write(
+        &recipe,
+        "network: {enabled: false}
+setup:
+  mounts: [{host: ./sdk, guest: /sdk, readonly: true}]
+  run: [cp /sdk/seed /baked-seed]
+workload: {run: cat /baked-seed}
+",
+    )
+    .unwrap();
+    let project = project.to_str().unwrap();
+    let set_source = |seed: &str| {
+        let directory = suite.get_work_dir().join(seed);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("seed"), seed).unwrap();
+        std::os::unix::fs::symlink(directory, &source).unwrap();
+    };
+    let assert_baked_seed = |seed: &str| {
+        let (output, code) =
+            suite.run_terra_status(&["retarget", "--foreground", "--project", project]);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains(seed), "{output}");
+    };
+    set_source("FIRST_SOURCE");
+    let (output, code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(code, 0, "{output}");
+
+    std::fs::remove_file(&source).unwrap();
+    set_source("SECOND_SOURCE");
+    let (output, code) = suite.run_terra_status(&["retarget", "setup", "--project", project]);
+    assert_eq!(code, 0, "{output}");
+    assert_baked_seed("FIRST_SOURCE");
+
+    let refused = suite.run_terra_output(&["retarget", "setup", "--rebuild", "--project", project]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let reason = String::from_utf8_lossy(&refused.stderr);
+    assert!(reason.contains("--trust-recipe"), "{reason}");
+    let (output, code) = suite.run_terra_status(&[
+        "retarget",
+        "setup",
+        "--rebuild",
+        "--trust-recipe",
+        "--project",
+        project,
+    ]);
+    assert_eq!(code, 0, "{output}");
+    assert_baked_seed("SECOND_SOURCE");
+}
+
+/// Volumes retain setup's writes without journal recovery, even when a leftover
+/// process holds a file open. Setup and runtime can enter volume workdirs with
+/// a read-only root image and separate read-only shares.
+/// Setup may unmount a volume itself and remove its mount point before cleanup.
+/// A symlink in the root image can provide a different layout for workload paths.
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn setup_leaves_volumes_clean_with_readonly_shares() {
+    for workdir in ["/cache/run/deep", "/data/run/deep", "/build/cache/run/deep"] {
+        assert_setup_leaves_clean_volumes(workdir);
+    }
+}
+
+fn assert_setup_leaves_clean_volumes(workdir: &str) {
+    let suite = Suite::new();
+    let source = suite.get_work_dir().join("setup-input");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("host-seed"), "HOST_SEED").unwrap();
+    let recipe = suite.get_work_dir().join("setup-volumes.yaml");
+    std::fs::write(
+        &recipe,
+        format!(
+            "\
+hw: {{cpus: 1, mem_mib: 256, rootfs_readonly: true}}
+network: {{enabled: false}}
+volumes:
+  - {{name: cache, guest: /cache, size_mib: 8}}
+  - {{name: data, guest: /data, size_mib: 8}}
+setup:
+  workdir: /cache/setup/deep
+  mounts:
+    - {{host: {}, guest: /work, readonly: true}}
+  run:
+    - mkdir -p /build && ln -s /cache /build/cache
+    - printf VOLUME_SEED > /cache/seed
+    - printf DETACHED_SEED > /data/seed
+    - umount /data
+    - if test {workdir} = /data/run/deep; then rmdir /data; fi
+    - if touch /work/forbidden 2>/dev/null; then exit 1; fi
+    - setsid sh -c 'exec 3>>/cache/held; touch /run/volume-writer-ready; exec sleep 1000' </dev/null >/dev/null 2>&1 &
+    - while test ! -e /run/volume-writer-ready; do sleep 0.01; done
+workload:
+  workdir: {workdir}
+  mounts:
+    - {{host: {}, guest: /work, readonly: true}}
+  run: |
+    set -e
+    test \"$(cat /cache/seed)\" = VOLUME_SEED
+    test \"$(cat /data/seed)\" = DETACHED_SEED
+    test \"$(cat /work/host-seed)\" = HOST_SEED
+    test \"$(id -u)\" != 0
+    printf RUNTIME_WRITE > runtime-output
+    echo SETUP_VOLUMES_OK
+",
+            source.display(),
+            source.display(),
+        ),
+    )
+    .unwrap();
+    let project = suite.create_project_dir("setup-volumes");
+    let project = project.to_str().unwrap();
+    let (setup, code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(code, 0, "{setup}");
+    let files = suite.get_box_files_path("setup-volumes");
+    for image in ["rootfs.img", "vol-cache.img", "vol-data.img"] {
+        assert_clean_ext4_image(&files.join(image));
+    }
+    let (boot, code) =
+        suite.run_terra_status(&["setup-volumes", "--foreground", "--project", project]);
+    assert_eq!(code, 0, "{boot}");
+    assert!(boot.contains("SETUP_VOLUMES_OK"), "{boot}");
+    assert_eq!(
+        std::fs::read(source.join("host-seed")).unwrap(),
+        b"HOST_SEED"
+    );
+    assert!(!source.join("seed").exists());
+    assert!(!source.join("run").exists());
+    assert!(!source.join("forbidden").exists());
+}
+
+fn assert_clean_ext4_image(image: &std::path::Path) {
+    use std::io::{Read as _, Seek as _};
+    const SUPERBLOCK_INCOMPAT_OFFSET: u64 = 1024 + 0x60;
+    const INCOMPAT_RECOVER: u32 = 0x4;
+    let mut file = std::fs::File::open(image).unwrap();
+    file.seek(std::io::SeekFrom::Start(SUPERBLOCK_INCOMPAT_OFFSET))
+        .unwrap();
+    let mut incompat = [0; 4];
+    file.read_exact(&mut incompat).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(incompat) & INCOMPAT_RECOVER,
+        0,
+        "{} still needs journal recovery after setup",
+        image.display()
+    );
+}
+
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn a_busy_setup_volume_still_leaves_the_root_and_other_volume_clean() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("busy-volume");
+    let recipe = project.join("busy-volume.yaml");
+    std::fs::write(
+        &recipe,
+        "network: {enabled: false}
+volumes:
+  - {name: free, guest: /free, size_mib: 8}
+  - {name: busy, guest: /busy, size_mib: 8}
+setup:
+  run:
+    - mkdir /busy/nested && mount -t tmpfs tmpfs /busy/nested
+    - echo VOLUME_BUSY
+",
+    )
+    .unwrap();
+    let output = suite.run_terra_output(&[
+        recipe.to_str().unwrap(),
+        "setup",
+        "--project",
+        project.to_str().unwrap(),
+    ]);
+    let setup = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{setup}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("VOLUME_BUSY"),
+        "{setup}"
+    );
+    assert!(
+        setup
+            .lines()
+            .any(|line| line.contains("unmounting setup volume /busy:")
+                && line.contains("os error 16")),
+        "{setup}"
+    );
+    let files = suite.get_box_files_path("busy-volume");
+    assert!(!files.join("setup-finished").exists());
+    assert_clean_ext4_image(&files.join("vol-free.img"));
+    assert_clean_ext4_image(&files.join("rootfs.img"));
+}
+
+/// A setup share and a tmpfs stacked over it must both be detached before the
+/// root's per-boot links and nested workload mount point can be restored.
+/// Setup can detach another input itself before finalization.
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn setup_detaches_shares_before_restoring_per_boot_links() {
+    let suite = Suite::new();
+    let source = suite.get_work_dir().join("setup-input");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("README.md"), "HOST_INPUT").unwrap();
+    let recipe = suite.get_work_dir().join("per-boot-links.yaml");
+    std::fs::write(
+        &recipe,
+        format!(
+            "\
+hw: {{cpus: 1, mem_mib: 256, rootfs_readonly: true}}
+network: {{enabled: false}}
+setup:
+  workdir: /terra
+  mounts:
+    - {{host: {}, guest: /terra, readonly: true}}
+    - {{host: {}, guest: /detached, readonly: true}}
+  run:
+    - test \"$(cat README.md)\" = HOST_INPUT
+    - test \"$(cat /detached/README.md)\" = HOST_INPUT && umount /detached
+    - mount -t tmpfs tmpfs /terra
+workload:
+  mounts:
+    - {{host: {}, guest: /terra/input, readonly: true}}
+  run: |
+    set -e
+    test -L /terra/README.md
+    test \"$(cat /terra/README.md)\" != HOST_INPUT
+    test \"$(cat /terra/input/README.md)\" = HOST_INPUT
+    test ! -e /detached/README.md
+    echo PER_BOOT_LINKS_OK
+",
+            source.display(),
+            source.display(),
+            source.display(),
+        ),
+    )
+    .unwrap();
+    let project = suite.create_project_dir("per-boot-links");
+    let project = project.to_str().unwrap();
+    let (setup, code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(code, 0, "{setup}");
+    let (boot, code) =
+        suite.run_terra_status(&["per-boot-links", "--foreground", "--project", project]);
+    assert_eq!(code, 0, "{boot}");
+    assert!(boot.contains("PER_BOOT_LINKS_OK"), "{boot}");
+    assert_eq!(
+        std::fs::read(source.join("README.md")).unwrap(),
+        b"HOST_INPUT"
+    );
+}
+
+/// Setup's workdir is created inside the root image and its copies persist.
+/// Setup can remove the runtime workdir, which is restored before a read-only
+/// runtime boot enters it. An existing shared setup/workload workdir keeps root ownership.
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn setup_workdir_is_prepared_in_the_root() {
+    for (setup_cleanup, expected_owner) in [
+        ("test -d /prepared/deep", "0"),
+        ("rm -rf /prepared/deep", "$(id -u)"),
+    ] {
+        let suite = Suite::new();
+        let recipe = suite.get_work_dir().join("setup-workdir.yaml");
+        std::fs::write(
+            &recipe,
+            format!(
+                "\
+hw: {{cpus: 1, mem_mib: 256, rootfs_readonly: true}}
+setup:
+  workdir: /prepared/deep
+  run:
+    - test \"$(pwd)\" = /prepared/deep
+    - printf ROOT_WORKDIR > /prepared/value
+    - {setup_cleanup}
+workload:
+  workdir: /prepared/deep
+  run: |
+    set -e
+    test \"$(pwd)\" = /prepared/deep
+    test \"$(stat -c %u .)\" = \"{expected_owner}\"
+    test \"$(cat /prepared/value)\" = ROOT_WORKDIR
+    echo SETUP_WORKDIR_OK
+"
+            ),
+        )
+        .unwrap();
+        let project = suite.create_project_dir("setup-workdir");
+        let project = project.to_str().unwrap();
+        let (setup, code) =
+            suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+        assert_eq!(code, 0, "{setup}");
+        let (boot, code) =
+            suite.run_terra_status(&["setup-workdir", "--foreground", "--project", project]);
+        assert_eq!(code, 0, "{boot}");
+        assert!(boot.contains("SETUP_WORKDIR_OK"), "{boot}");
+    }
+}
+
+#[test]
+#[ignore = "requires a native hypervisor"]
+fn setup_reports_mount_and_workdir_failures_on_the_console_and_in_diagnostics() {
+    for (name, setup, cause) in [
+        (
+            "setup-bad-workdir",
+            "workdir: /etc/passwd",
+            "creating setup workdir /etc/passwd",
+        ),
+        (
+            "setup-bad-mount",
+            "mounts: [{host: ., guest: /etc/passwd, readonly: true}]",
+            "creating mount point /etc/passwd",
+        ),
+    ] {
+        let suite = Suite::new();
+        let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
+        std::fs::write(
+            &recipe,
+            format!(
+                "hw: {{cpus: 1, mem_mib: 256}}\nnetwork: {{enabled: false}}\nsetup:\n  {setup}\n"
+            ),
+        )
+        .unwrap();
+        let project = suite.create_project_dir(name);
+        let output = suite.run_terra_output(&[
+            recipe.to_str().unwrap(),
+            "setup",
+            "--project",
+            project.to_str().unwrap(),
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stdout.contains(cause), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains(cause), "{stderr}");
+        assert!(stderr.contains("setup failed - fix the recipe"), "{stderr}");
+        assert!(stderr.contains(&format!("terra {name} setup")), "{stderr}");
+        assert!(
+            !suite
+                .get_box_files_path(name)
+                .join("setup-finished")
+                .exists()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn console_input() -> (std::fs::File, std::fs::File) {
@@ -1845,7 +2313,7 @@ fn attached_console_streams_hooks_before_workload_and_exit() {
     let recipe = suite.get_work_dir().join("hooks.yaml");
     std::fs::write(
         &recipe,
-        "hw: {cpus: 2, mem_mib: 512}\nhooks:\n  on_start:\n    - printf 'HOOK_START\\n'; sleep 2; printf 'HOOK_STDERR\\n' >&2\n  pre_stop:\n    - printf 'HOOK_STOP\\n'; printf 'STOP_STDERR\\n' >&2; exit 9\nworkload:\n  run: \"printf 'WORKLOAD_READY\\n'; exit 7\"\n",
+        "hw: {cpus: 2, mem_mib: 512}\nworkload:\n  on_start:\n    - printf 'HOOK_START\\n'; sleep 2; printf 'HOOK_STDERR\\n' >&2\n  pre_stop:\n    - printf 'HOOK_STOP\\n'; printf 'STOP_STDERR\\n' >&2; exit 9\n  run: \"printf 'WORKLOAD_READY\\n'; exit 7\"\n",
     )
     .unwrap();
     let (_, setup_code) = suite.run_terra_status(&[
@@ -1953,13 +2421,18 @@ fn capacity_machine_vcpus_and_storage_devices() {
     let mounts = host_dirs
         .iter()
         .enumerate()
-        .map(|(index, host)| format!("  - host: {}\n    guest: /mount-{index}", host.display()))
+        .map(|(index, host)| {
+            format!(
+                "    - host: {}\n      guest: /mount-{index}",
+                host.display()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(
         &recipe,
         format!(
-            "hw: {{cpus: {cpus}, mem_mib: 512}}\nvolumes:\n{volumes}\nmounts:\n{mounts}\nworkload:\n  run: |\n      set -e\n      test \"$(nproc)\" = {cpus}\n      test \"$(cat /sys/devices/system/cpu/online)\" = 0-{last_cpu}\n      grep -Eq '0x0*5' /sys/bus/virtio/devices/*/device\n      for target in {targets}; do\n        (\n          i=0\n          while test \"$i\" -lt 16; do\n            value=\"$target:$i\"\n            printf '%s' \"$value\" > \"$target/roundtrip\"\n            test \"$(cat \"$target/roundtrip\")\" = \"$value\"\n            i=$((i + 1))\n          done\n        ) &\n      done\n      wait\n      for index in $(seq 0 {last_mount}); do test \"$(cat /mount-$index/host-seed)\" = host-$index; done\n      echo CAPACITY_OK\n"
+            "hw: {{cpus: {cpus}, mem_mib: 512}}\nvolumes:\n{volumes}\nworkload:\n  mounts:\n{mounts}\n  run: |\n      set -e\n      test \"$(nproc)\" = {cpus}\n      test \"$(cat /sys/devices/system/cpu/online)\" = 0-{last_cpu}\n      grep -Eq '0x0*5' /sys/bus/virtio/devices/*/device\n      for target in {targets}; do\n        (\n          i=0\n          while test \"$i\" -lt 16; do\n            value=\"$target:$i\"\n            printf '%s' \"$value\" > \"$target/roundtrip\"\n            test \"$(cat \"$target/roundtrip\")\" = \"$value\"\n            i=$((i + 1))\n          done\n        ) &\n      done\n      wait\n      for index in $(seq 0 {last_mount}); do test \"$(cat /mount-$index/host-seed)\" = host-$index; done\n      echo CAPACITY_OK\n"
         ),
     )
     .unwrap();
@@ -2117,7 +2590,7 @@ fn agent_readiness_precedes_long_bake_and_start_hooks() {
     std::fs::create_dir(&share).unwrap();
     let recipe = suite.get_work_dir().join("server.yaml");
     std::fs::write(&recipe, format!(
-        "hw: {{cpus: 2, mem_mib: 512}}\nhooks:\n  on_create:\n    - sleep 65; touch /baked\n  on_start:\n    - while [ ! -e /work/release ]; do sleep 1; done; touch /work/finished\nworkload:\n  run: exec /bin/sleep infinity\nmounts:\n  - host: {}\n    guest: /work\n",
+        "hw: {{cpus: 2, mem_mib: 512}}\nsetup:\n  run:\n    - sleep 65; touch /baked\nworkload:\n  on_start:\n    - while [ ! -e /work/release ]; do sleep 1; done; touch /work/finished\n  run: exec /bin/sleep infinity\n  mounts:\n    - host: {}\n      guest: /work\n",
         share.display(),
     )).unwrap();
     let project = project.to_str().unwrap();
@@ -2481,11 +2954,11 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
 
     impl ReadOnlyBox {
         fn new() -> Self {
-            Self::with_on_create(&[])
+            Self::with_setup(&[])
         }
 
-        fn with_on_create(on_create: &[&str]) -> Self {
-            Self::build("readonly", READONLY_VOLUMES, WORKLOAD_SCRIPT, on_create)
+        fn with_setup(setup_run: &[&str]) -> Self {
+            Self::build("readonly", READONLY_VOLUMES, WORKLOAD_SCRIPT, setup_run)
         }
 
         fn overlay() -> Self {
@@ -2501,16 +2974,18 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
             name: &'static str,
             volumes: &str,
             workload_script: &str,
-            on_create: &[&str],
+            setup_run: &[&str],
         ) -> Self {
             use std::fmt::Write as _;
-            let mut hooks = String::new();
-            if !on_create.is_empty() {
-                hooks.push_str("  on_create:\n");
-                for line in on_create {
-                    writeln!(hooks, "    - {line:?}").unwrap();
+            let setup = if setup_run.is_empty() {
+                String::new()
+            } else {
+                let mut setup = String::from("setup:\n  run:\n");
+                for line in setup_run {
+                    writeln!(setup, "    - {line:?}").unwrap();
                 }
-            }
+                setup
+            };
             let suite = Suite::new();
             let project = suite.create_project_dir(name);
             let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
@@ -2518,7 +2993,7 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
             std::fs::write(
                 &recipe,
                 format!(
-                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n{volumes}mounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  run: |\n      {script}\n",
+                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n{volumes}{setup}workload:\n  mounts:\n    - {{host: {}, guest: /work}}\n  on_start:\n    - touch /etc/x 2> /kept/onstart || true\n  sudo: [touch]\n  run: |\n      {script}\n",
                     project.display()
                 ),
             )
@@ -2674,12 +3149,12 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
         );
     }
 
-    /// A process that `on_create` leaves holding a root file open for writing is killed before
+    /// A process that setup leaves holding a root file open for writing is killed before
     /// setup ends, so the image is left clean and the next read-only boot can mount it.
     #[test]
     #[ignore = "boots a real VM and requires a native hypervisor"]
     fn setup_kills_a_leftover_root_writer_so_the_read_only_boot_mounts() {
-        let readonly = ReadOnlyBox::with_on_create(&[
+        let readonly = ReadOnlyBox::with_setup(&[
             "setsid sh -c 'exec 3>>/var/lib/terra-writer; exec sleep 1000' </dev/null >/dev/null 2>&1 &",
         ]);
         readonly.setup(&[]);
@@ -2946,9 +3421,9 @@ mod containers {
 }
 
 /// The root image ships the workload identity and links its per-boot files
-/// into tmpfs: `on_create` already sees `terri`, the home belongs to it, the
+/// into tmpfs: setup already sees `terri`, the home belongs to it, the
 /// sudo list is the whole doas policy, and a rule dropped into `/etc/doas.d`
-/// is gone after a restart instead of persisting in the image. `on_create`
+/// is gone after a restart instead of persisting in the image. Setup
 /// replaces two links with a regular file and a directory (a `sed -i` edit),
 /// and setup puts the links back, so neither rule outlives setup.
 #[test]
@@ -2960,7 +3435,7 @@ fn the_image_ships_the_identity_and_regenerates_per_boot_files() {
     let recipe = suite.get_work_dir().join("identity.yaml");
     std::fs::write(
         &recipe,
-        "hooks:\n  on_create:\n    - echo \"CREATE_TERRI=$(id -u terri)\"\n    - sed -i 's/^#.*/permit nopass terri/' /etc/doas.conf\n    - rm /etc/doas.d && mkdir /etc/doas.d && echo 'permit nopass terri' > /etc/doas.d/x.conf\nsudo: [id]\nworkload:\n  run: exec /bin/sleep infinity\n",
+        "setup:\n  run:\n    - echo \"CREATE_TERRI=$(id -u terri)\"\n    - sed -i 's/^#.*/permit nopass terri/' /etc/doas.conf\n    - rm /etc/doas.d && mkdir /etc/doas.d && echo 'permit nopass terri' > /etc/doas.d/x.conf\nworkload:\n  sudo: [id]\n  run: exec /bin/sleep infinity\n",
     )
     .unwrap();
     let (setup, code) =

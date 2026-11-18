@@ -160,8 +160,6 @@ async fn boot_and_report() -> bool {
             },
         )) => {
             let outcome = run_agent(&plan, &control, diagnostic, clients).await;
-            let cleanup = bootstrap::leave_filesystems_clean(&plan);
-            let outcome = outcome.and_then(|code| cleanup.map(|()| code));
             if let Ok(flags) = rustix::fs::fcntl_getfl(&control) {
                 let _ = rustix::fs::fcntl_setfl(&control, flags & !rustix::fs::OFlags::NONBLOCK);
             }
@@ -197,12 +195,24 @@ async fn run_agent(
     diagnostic: File,
     clients: tokio::sync::mpsc::Receiver<File>,
 ) -> Result<i32> {
-    let agent = Agent::init(control, diagnostic)?;
-    let outcome = match plan.mode {
-        PlanMode::Create => agent.setup(plan, clients).await,
-        PlanMode::Run => agent.run(plan, clients).await,
+    let (outcome, diagnostics) = match Agent::init(control, diagnostic) {
+        Ok(agent) => {
+            let outcome = match plan.mode {
+                PlanMode::Setup => agent.setup(plan, clients).await,
+                PlanMode::Run => agent.run(plan, clients).await,
+            };
+            (outcome, Some(agent.close().await))
+        }
+        Err(error) => (Err(error), None),
     };
-    agent.close(&outcome).await;
+    let cleanup = bootstrap::leave_filesystems_clean(plan);
+    let outcome = outcome.and_then(|code| cleanup.map(|()| code));
+    if let Some(diagnostics) = diagnostics {
+        if let Err(error) = &outcome {
+            diagnostics.record(format!("terra-agent: init failed: {error:#}").as_bytes());
+        }
+        diagnostics.finish().await;
+    }
     outcome
 }
 
