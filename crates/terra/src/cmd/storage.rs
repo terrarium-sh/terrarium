@@ -745,7 +745,7 @@ mod tests {
 
             import(&into, &artifact).unwrap();
             assert!(into.is_set_up());
-            run_setup("dev").await.unwrap();
+            assert_eq!(run_setup("dev").await.unwrap(), ExitCode::SUCCESS);
             assert_eq!(
                 into.load_pinned_paths().unwrap().unwrap().setup_mounts,
                 Vec::<std::path::PathBuf>::new()

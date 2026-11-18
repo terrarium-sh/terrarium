@@ -137,16 +137,19 @@ mod tests {
             .join(format!(".removing.{}.0", std::process::id()));
         std::fs::create_dir(&stale).unwrap();
         std::fs::write(stale.join("old"), "leftover").unwrap();
-        run(
-            &crate::cli::RmArgs {
-                purge: false,
-                force: false,
-                timeout: 0,
-            },
-            Some("dev"),
-            project.path(),
-        )
-        .unwrap();
+        assert_eq!(
+            run(
+                &crate::cli::RmArgs {
+                    purge: false,
+                    force: false,
+                    timeout: 0,
+                },
+                Some("dev"),
+                project.path(),
+            )
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(!stale.exists());
         assert!(bx.get_dir().join(state::RECIPE_FILE).exists());
     }
@@ -321,7 +324,10 @@ mod tests {
             timeout: 30,
         };
         build();
-        run(&rm(false), Some("dev"), dir.path()).unwrap();
+        assert_eq!(
+            run(&rm(false), Some("dev"), dir.path()).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(
             bx.get_dir().join(state::RECIPE_FILE).exists(),
             "the recipe should have been kept"
@@ -340,7 +346,10 @@ mod tests {
         );
 
         build();
-        run(&rm(true), Some("dev"), dir.path()).unwrap();
+        assert_eq!(
+            run(&rm(true), Some("dev"), dir.path()).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(
             !bx.get_dir().exists(),
             "--purge should leave nothing at all"
@@ -372,7 +381,10 @@ mod tests {
         // which is what lenient resolution is for - is still removed.
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
-        run(&rm, Some("dev"), dir.path()).unwrap();
+        assert_eq!(
+            run(&rm, Some("dev"), dir.path()).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(!bx.get_dir().exists());
     }
 }

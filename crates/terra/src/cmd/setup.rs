@@ -483,8 +483,8 @@ mod tests {
             run(args, Some("./dev.yaml"), &project, &project, false).await
         };
         crate::sys::remove_directory_symlink(&source).unwrap();
-        setup(&keep).await.unwrap();
-        setup(&preview).await.unwrap();
+        assert_eq!(setup(&keep).await.unwrap(), ExitCode::SUCCESS);
+        assert_eq!(setup(&preview).await.unwrap(), ExitCode::SUCCESS);
         let error = setup(&rebuild).await.unwrap_err().to_string();
         assert!(error.contains("resolving mount host path"), "{error}");
         assert!(error.contains("sdk"), "{error}");
@@ -497,7 +497,7 @@ mod tests {
 
         let runtime_edit = format!("{text}workload: {{run: 'true'}}\n");
         std::fs::write(&recipe_path, &runtime_edit).unwrap();
-        setup(&keep).await.unwrap();
+        assert_eq!(setup(&keep).await.unwrap(), ExitCode::SUCCESS);
         assert_eq!(
             std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap(),
             runtime_edit
@@ -505,7 +505,7 @@ mod tests {
         assert!(bx.is_set_up());
 
         crate::sys::symlink_dir(&second, &source).unwrap();
-        setup(&keep).await.unwrap();
+        assert_eq!(setup(&keep).await.unwrap(), ExitCode::SUCCESS);
         let error = setup(&rebuild).await.unwrap_err().to_string();
         assert!(
             error.contains("target changed since the last setup"),
@@ -515,7 +515,7 @@ mod tests {
 
         crate::sys::remove_directory_symlink(&source).unwrap();
         crate::sys::symlink_dir(bx.get_dir(), &source).unwrap();
-        setup(&preview).await.unwrap();
+        assert_eq!(setup(&preview).await.unwrap(), ExitCode::SUCCESS);
         std::fs::write(&recipe_path, setup_edit).unwrap();
         let error = setup(&preview).await.unwrap_err().to_string();
         assert!(error.contains("this box's own state"), "{error}");
@@ -1037,9 +1037,12 @@ mod tests {
 
         // A recipe a setup would take: reported, and nothing is built.
         std::fs::write(project.join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        run(&dry_run, Some("./dev.yaml"), &project, &project, false)
-            .await
-            .unwrap();
+        assert_eq!(
+            run(&dry_run, Some("./dev.yaml"), &project, &project, false)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(
             !bx.get_dir().join(state::ROOTFS_FILE).exists(),
             "a dry run built the guest filesystem"
@@ -1102,8 +1105,11 @@ mod tests {
         assert!(err.contains("locked by another terra command"), "{err}");
         drop(held);
 
-        run(&dry_run, Some("./dev.yaml"), &project, &project, false)
-            .await
-            .unwrap();
+        assert_eq!(
+            run(&dry_run, Some("./dev.yaml"), &project, &project, false)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 }

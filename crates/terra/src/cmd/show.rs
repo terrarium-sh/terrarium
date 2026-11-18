@@ -145,8 +145,11 @@ mod tests {
             with_env_values: false,
             json: false,
         };
-        run(&show, Some("./dev.yaml"), &project, &project)
-            .expect("a recipe naming a dotenv nobody has created yet must still print");
+        assert_eq!(
+            run(&show, Some("./dev.yaml"), &project, &project)
+                .expect("a recipe naming a dotenv nobody has created yet must still print"),
+            ExitCode::SUCCESS
+        );
 
         let err = crate::cmd::setup::run(
             &crate::cli::SetupArgs {

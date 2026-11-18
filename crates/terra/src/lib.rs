@@ -33,7 +33,6 @@ use cli::Cmd;
 use std::process::ExitCode;
 
 /// The process exit code for a command's result: a closed stdout pipe is a quiet success.
-#[must_use]
 pub fn exit_code_of(result: Result<ExitCode>) -> ExitCode {
     match result {
         Ok(code) => code,

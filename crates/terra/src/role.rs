@@ -45,17 +45,14 @@ pub fn from_argument(argument: &OsStr) -> Option<fn() -> ExitCode> {
     }
 }
 
-#[must_use]
 pub fn supervisor() -> ExitCode {
     exit_code_of(run_supervisor())
 }
 
-#[must_use]
 pub fn network() -> ExitCode {
     exit_code_of(run_network())
 }
 
-#[must_use]
 pub fn vm() -> ExitCode {
     exit_code_of(
         prepare_vm().and_then(|dir| {

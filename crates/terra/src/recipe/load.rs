@@ -74,16 +74,19 @@ mod tests {
         crate::sys::remove_directory_symlink(project.join("setup")).unwrap();
         std::fs::remove_dir(&setup_source).unwrap();
         target().load_applied_recipe().unwrap();
-        crate::cmd::show::run(
-            &crate::cli::ShowArgs {
-                with_env_values: false,
-                json: false,
-            },
-            Some("dev"),
-            &project,
-            &project,
-        )
-        .unwrap();
+        assert_eq!(
+            crate::cmd::show::run(
+                &crate::cli::ShowArgs {
+                    with_env_values: false,
+                    json: false,
+                },
+                Some("dev"),
+                &project,
+                &project,
+            )
+            .unwrap(),
+            std::process::ExitCode::SUCCESS
+        );
         assert!(approve_build().is_err());
 
         crate::sys::symlink_dir(&replacement, project.join("setup")).unwrap();

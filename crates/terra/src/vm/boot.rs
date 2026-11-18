@@ -616,7 +616,7 @@ fn read_log_tail(path: &Path) -> String {
     let Ok(mut f) = crate::logs::open_box_log(path) else {
         return String::new();
     };
-    let len = f.metadata().map(|m| m.len()).unwrap_or_default();
+    let len = f.metadata().map_or_default(|metadata| metadata.len());
     let omitted = len.saturating_sub(REPLAY_LOG_TAIL_BYTES);
     let mut tail = Vec::new();
     if f.seek(SeekFrom::Start(omitted)).is_err()

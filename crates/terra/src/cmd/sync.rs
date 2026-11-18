@@ -516,9 +516,12 @@ mod tests {
         std::fs::create_dir(destination.join("safe")).unwrap();
         std::os::unix::fs::symlink("nested/alias", destination.join("outside")).unwrap();
         std::os::unix::fs::symlink("../safe", destination.join("nested/alias")).unwrap();
-        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
-            .await
-            .unwrap();
+        assert_eq!(
+            sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             std::fs::read_link(destination.join("link")).unwrap(),
             Path::new("outside/secret")
@@ -555,14 +558,20 @@ mod tests {
             SyncReply::ScanComplete,
             SyncReply::Success,
         ];
-        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
-            .await
-            .unwrap();
+        assert_eq!(
+            sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(!destination.exists());
         args.dry_run = false;
-        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
-            .await
-            .unwrap();
+        assert_eq!(
+            sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(destination.is_dir());
         assert_eq!(
             meta_mtime_secs(&std::fs::metadata(&destination).unwrap()),
@@ -617,9 +626,12 @@ mod tests {
             SyncReply::Success,
             SyncReply::Success,
         ];
-        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
-            .await
-            .unwrap();
+        assert_eq!(
+            sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             std::fs::read(destination.join("extra")).unwrap(),
             b"keep until successful transfer"
@@ -646,9 +658,12 @@ mod tests {
         );
 
         args.dry_run = false;
-        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
-            .await
-            .unwrap();
+        assert_eq!(
+            sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             std::fs::read(destination.join("日本語/café.txt")).unwrap(),
             b""
