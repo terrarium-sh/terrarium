@@ -76,7 +76,8 @@ its `run.sh --terra ./terra` or `run.ps1 -Terra .\terra.exe`.
 From a checkout, run `make dist && sh acceptance/run.sh --terra dist/terra` (on
 Windows: `powershell -File acceptance/run.ps1 -Terra dist/terra.exe`). The
 runner prints a timed summary of all steps. When a step fails, the runner prints
-that step's log and keeps its working directory under `/tmp/terra-acceptance.*`.
+that step's log and keeps its working directory, `/tmp/terraa*` (Windows:
+`%TEMP%\terraa*`).
 A new user-facing feature gets a step in both `run.sh` and `run.ps1`.
 
 ## Code layout

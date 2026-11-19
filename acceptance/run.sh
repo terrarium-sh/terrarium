@@ -77,15 +77,15 @@ fi
 # --- A private home and project, removed again unless a step fails.
 
 # /tmp rather than TMPDIR: box control sockets must fit the local-socket path limit.
-work=$(mktemp -d /tmp/terra-acceptance.XXXXXX)
+work=$(mktemp -d /tmp/terraaXXXXXXXX)
 project="$work/project"
 log="$work/step.log"
 step=
 step_started=
 results=
 suite_started=$(date +%s)
-mkdir "$work/home"
-HOME="$work/home"
+mkdir "$work/h"
+HOME="$work/h"
 export HOME
 
 finish() {

@@ -49,7 +49,7 @@ function Get-Sha256([string]$Path) {
 if (-not $Suite) {
     $version = Get-TerraVersion
     if ($version -eq "dev") { throw "terra is a development build; pass -Suite <checkout>/acceptance" }
-    $download = Join-Path ([IO.Path]::GetTempPath()) ("terra-acceptance-" + [guid]::NewGuid().ToString("N"))
+    $download = Join-Path ([IO.Path]::GetTempPath()) ("terraa" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path (Join-Path $download "suite") | Out-Null
     try {
         $base = "https://github.com/$repo/releases/download/v$version"
@@ -79,17 +79,18 @@ if (-not $Suite) {
 
 # --- A private home and project, removed again unless a step fails.
 
-$work = Join-Path ([IO.Path]::GetTempPath()) ("terra-acceptance-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+# Short names: box control sockets under TEMP must fit the local-socket path limit.
+$work = Join-Path ([IO.Path]::GetTempPath()) ("terraa" + [guid]::NewGuid().ToString("N").Substring(0, 8))
 $project = Join-Path $work "project"
 $log = Join-Path $work "step.log"
 $step = $null
 $stepWatch = $null
 $results = New-Object System.Collections.Generic.List[object]
 $suiteWatch = [Diagnostics.Stopwatch]::StartNew()
-New-Item -ItemType Directory -Path (Join-Path $work "home") | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $work "h") | Out-Null
 $savedHome = $env:HOME
 $savedProfile = $env:USERPROFILE
-$env:HOME = Join-Path $work "home"
+$env:HOME = Join-Path $work "h"
 $env:USERPROFILE = $env:HOME
 
 # --- Step helpers. Every command's output goes to the step log, which is

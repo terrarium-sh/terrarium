@@ -16,7 +16,9 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, TerminateProcess,
 };
 
-pub const MAX_SOCK_PATH: usize = 108;
+/// Max usable `AF_UNIX` socket path length: `uds_windows` refuses a path that
+/// fills `sun_path`'s 108 bytes, as Unix does.
+pub const MAX_SOCK_PATH: usize = 107;
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
