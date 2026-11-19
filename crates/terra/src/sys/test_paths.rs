@@ -13,7 +13,12 @@ pub(crate) struct TestHome(tempfile::TempDir);
 
 impl TestHome {
     pub(crate) fn new() -> Self {
-        let dir = tempfile::tempdir().expect("a temporary home for this test");
+        // macOS's `$TMPDIR` is long enough to push box sockets past `MAX_SOCK_PATH`.
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp");
+        #[cfg(not(unix))]
+        let dir = tempfile::tempdir();
+        let dir = dir.expect("a temporary home for this test");
         TEST.with_borrow_mut(|t| {
             *t = Some(dir.path().to_path_buf());
         });
