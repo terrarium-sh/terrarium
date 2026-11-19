@@ -394,7 +394,10 @@ mod tests {
             input.extend(terra_protocol::encode_frame(&ClientInput::Keys(stdin.to_vec())).unwrap());
         }
         input.extend(terra_protocol::encode_frame(&ClientInput::Eof).unwrap());
-        client.write_all(&input).unwrap();
+        // A start that fails sends its exit and closes before reading input.
+        if let Err(error) = client.write_all(&input) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+        }
         let result = read_exec_output(&mut client);
         if result.2 != NO_EXIT {
             agent.await.unwrap();
