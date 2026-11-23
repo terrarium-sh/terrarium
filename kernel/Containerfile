@@ -1,8 +1,8 @@
 FROM docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
     printf '%s\n' \
-      'deb http://snapshot.debian.org/archive/debian/20261116T112626Z/ trixie main' \
-      'deb http://snapshot.debian.org/archive/debian-security/20261116T134226Z/ trixie-security main' \
+      'deb http://snapshot.debian.org/archive/debian/20261123T145639Z/ trixie main' \
+      'deb http://snapshot.debian.org/archive/debian-security/20261123T154646Z/ trixie-security main' \
       > /etc/apt/sources.list && \
     apt-get -o Acquire::Check-Valid-Until=false update && \
     apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
