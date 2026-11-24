@@ -27,7 +27,7 @@ target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
-wasmtime = { version = "=50.0.1", default-features = false, features = ["component-model-async", "component-model-bytes", "std"] }
+wasmtime = { version = "=51.0.0", default-features = false, features = ["component-model-async", "component-model-bytes", "std"] }
 wasmtime-internal-jit-icache-coherence = "=50.0.1"
 wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p3"] }
 
@@ -45,7 +45,7 @@ object = { version = "0.41", default-features = false, features = ["read_core", 
 terra-runtime = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 # Core-Wasm spike tests compile WAT and components; release builds do not.
-wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "wat"] }
+wasmtime = { version = "=51.0.0", default-features = false, features = ["cranelift", "wat"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
